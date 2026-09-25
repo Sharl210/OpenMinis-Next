@@ -33,9 +33,17 @@ class AgentRetryPolicy(
             )
         }
 
-        // -1 is the explicit always/unlimited mode: it intentionally ignores
-        // retryability hints and stop keywords, matching the caller's request
-        // to keep trying until success or cancellation.
+        // -1 is the explicit always/unlimited mode: it retries every failure
+        // except an explicit stop-retry signal. Cancellation is handled by the
+        // caller and never reaches this policy.
+        if (isExplicitStopRetry(failure)) {
+            return RetryDecision(
+                shouldRetry = false,
+                nextAttempt = null,
+                delayMillis = 0L,
+                reason = RetryDecisionReason.NON_RETRYABLE_FAILURE,
+            )
+        }
         if (config.maxAttempts != -1 && !isRetryable(failure)) {
             return RetryDecision(
                 shouldRetry = false,
@@ -72,6 +80,10 @@ class AgentRetryPolicy(
         )
     }
 
+    private fun isExplicitStopRetry(failure: RuntimeFailure): Boolean {
+        val text = "${failure.code} ${failure.message}".lowercase()
+        return config.stopRetryKeywords.any { text.contains(it.lowercase()) }
+    }
     private fun Double.pow(exponent: Int): Double {
         var result = 1.0
         repeat(exponent) { result *= this }

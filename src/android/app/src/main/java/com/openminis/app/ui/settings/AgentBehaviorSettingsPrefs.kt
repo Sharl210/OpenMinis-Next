@@ -58,7 +58,7 @@ class AgentBehaviorSettingsPrefs(context: Context) {
         const val DEFAULT_PARALLEL_AGENT_LIMIT = 5
         const val DEFAULT_COMPACT_THRESHOLD_TOKENS = 150
         const val DEFAULT_AUTO_RETRY_ENABLED = true
-        const val DEFAULT_MAX_RETRY_ATTEMPTS = 10
+        const val DEFAULT_MAX_RETRY_ATTEMPTS = -1
 
         const val MIN_RECURSION_DEPTH = 0
         const val MAX_RECURSION_DEPTH = 2

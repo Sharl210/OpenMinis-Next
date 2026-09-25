@@ -17,17 +17,27 @@ class RuntimeStateMachineTest {
     }
 
     @Test
-    fun `negative one always retries even non retryable failure`() {
+    fun `negative one always retries ordinary non retryable failure`() {
         val policy = AgentRetryPolicy(AgentRuntimeConfig(maxAttempts = -1, jitterRatio = 0.0))
         val decision = policy.decide(
             attempt = 100,
-            failure = RuntimeFailure("auth", "invalid API key; do not retry", retryable = false),
+            failure = RuntimeFailure("provider", "unexpected response", retryable = false),
         )
         assertTrue(decision.shouldRetry)
         assertEquals(101, decision.nextAttempt)
         assertEquals(RetryDecisionReason.RETRY_SCHEDULED, decision.reason)
     }
 
+    @Test
+    fun `unlimited mode still stops on explicit stop error`() {
+        val policy = AgentRetryPolicy(AgentRuntimeConfig(maxAttempts = -1, jitterRatio = 0.0))
+        val decision = policy.decide(
+            attempt = 100,
+            failure = RuntimeFailure("auth", "invalid API key; do not retry", retryable = false),
+        )
+        assertFalse(decision.shouldRetry)
+        assertEquals(RetryDecisionReason.NON_RETRYABLE_FAILURE, decision.reason)
+    }
     @Test
     fun `zero disables automatic retries`() {
         val policy = AgentRetryPolicy(AgentRuntimeConfig(maxAttempts = 0))

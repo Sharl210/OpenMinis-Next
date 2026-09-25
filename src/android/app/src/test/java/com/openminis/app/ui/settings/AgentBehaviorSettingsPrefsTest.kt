@@ -8,6 +8,13 @@ import org.junit.Test
 
 class AgentBehaviorSettingsPrefsTest {
     @Test
+    fun `default retry settings are unlimited and enabled`() {
+        val loaded = AgentBehaviorSettingsPrefs(TestContext()).load()
+        assertEquals(true, loaded.autoRetryEnabled)
+        assertEquals(-1, loaded.maxRetryAttempts)
+        assertEquals(-1, AgentBehaviorSettingsPrefs.DEFAULT_MAX_RETRY_ATTEMPTS)
+    }
+    @Test
     fun `retry budget keeps unlimited disabled and bounded meanings`() {
         assertEquals(-1, AgentBehaviorSettingsPrefs.normalizeMaxRetryAttempts(-1))
         assertEquals(0, AgentBehaviorSettingsPrefs.normalizeMaxRetryAttempts(0))
