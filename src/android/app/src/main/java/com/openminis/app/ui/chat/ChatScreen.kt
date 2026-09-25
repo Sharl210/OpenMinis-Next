@@ -56,6 +56,8 @@ import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import androidx.compose.runtime.withFrameNanos
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.ExperimentalFoundationApi
@@ -876,6 +878,7 @@ fun ChatScreen(
     var showAttachMenu by remember { mutableStateOf(false) }
     var showChatMenu by remember { mutableStateOf(false) }
     var showConversationMap by remember { mutableStateOf(false) }
+    var showAgentTopology by remember { mutableStateOf(false) }
     var pendingConversationMapMessageId by remember { mutableStateOf<String?>(null) }
     var showSkillsSheet by remember { mutableStateOf(false) }
     // [T-mcp-integration-android] MCPs-in-Session sheet visibility.
@@ -3083,6 +3086,17 @@ fun ChatScreen(
                                  onClick = {
                                      showChatMenu = false
                                      showConversationMap = true
+                                 },
+                                 leadingIcon = {
+                                     Icon(Icons.Default.AccountTree, contentDescription = null)
+                                 },
+                             )
+                             MinisMenuDivider()
+                             DropdownMenuItem(
+                                 text = { Text(stringResource(R.string.agent_topology_open)) },
+                                 onClick = {
+                                     showChatMenu = false
+                                     showAgentTopology = true
                                  },
                                  leadingIcon = {
                                      Icon(Icons.Default.AccountTree, contentDescription = null)
@@ -6982,6 +6996,23 @@ fun ChatScreen(
                     )
                 )
         )
+        }
+    }
+
+    // Native Compose window keeps topology above the split/chat content while retaining the current screen.
+    if (showAgentTopology) {
+        Dialog(
+            onDismissRequest = { showAgentTopology = false },
+            properties = DialogProperties(usePlatformDefaultWidth = false),
+        ) {
+            AgentTopologyRoute(
+                sessionId = sessionId,
+                sessionTitle = sessionTitle,
+                currentSummary = messages.lastOrNull { it.role == "assistant" }?.content.orEmpty(),
+                chatRepository = chatRepository,
+                onDismiss = { showAgentTopology = false },
+                modifier = Modifier.fillMaxSize(),
+            )
         }
     }
 

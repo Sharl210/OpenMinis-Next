@@ -1,7 +1,68 @@
 package com.openminis.app.ui.chat
 
+import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.Canvas as AndroidCanvas
+import android.graphics.Paint
+import android.graphics.Path
+import android.graphics.RectF
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.detectTransformGestures
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.offset
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.Download
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.FloatingActionButton
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Text
+import androidx.compose.material3.TopAppBar
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.unit.dp
+import androidx.core.graphics.toColorInt
+import com.openminis.app.R
+import com.openminis.app.feature.runtime.RuntimeTreeStore
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.ByteArrayOutputStream
 import java.util.ArrayDeque
 import java.util.Locale
+import java.util.zip.CRC32
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
@@ -15,6 +76,10 @@ data class AgentTopologyNode(
     val parentId: String? = null,
     val width: Float = DEFAULT_NODE_WIDTH,
     val height: Float = DEFAULT_NODE_HEIGHT,
+    val depth: Int = 0,
+    val createdAtMillis: Long = 0L,
+    val globalOrder: Int = 0,
+    val status: String = "INACTIVE",
 ) {
     init {
         require(id.isNotBlank()) { "node id must not be blank" }
@@ -423,6 +488,324 @@ private fun agentTopologySegmentIntersectsRect(
         tMin <= tMax
 }
 
+
+
+/** Options for the real topology raster export. */
+data class AgentTopologyExportOptions(
+    val transparentBackground: Boolean = AgentTopologyPrefs.DEFAULT_POSTER_EXPORT_TRANSPARENT_BACKGROUND,
+    val dpi: Int = AgentTopologyPrefs.DEFAULT_POSTER_EXPORT_DPI,
+    val maxPixels: Long = AgentTopologyPrefs.DEFAULT_MAX_EXPORT_PIXELS,
+    val maxDimensionPx: Int = AgentTopologyPrefs.DEFAULT_MAX_EXPORT_DIMENSION_PX,
+) {
+    init {
+        require(dpi > 0) { "dpi must be positive" }
+    }
+}
+
+private const val TOPOLOGY_EXPORT_PADDING = 32f
+
+/**
+ * Rasterises the actual layout into a PNG. The bitmap bounds follow the layout
+ * content rather than a fixed business canvas size; [AgentTopologyPrefs] only
+ * applies the crash-safety pixel budget.
+ */
+fun renderAgentTopologyPng(
+    layout: AgentTopologyLayout,
+    options: AgentTopologyExportOptions = AgentTopologyExportOptions(),
+): ByteArray {
+    val bounds = agentTopologyContentBounds(layout, TOPOLOGY_EXPORT_PADDING)
+    val size = AgentTopologyPrefs.safeExportSize(
+        contentWidthPx = max(1, kotlin.math.ceil(bounds.width).toInt()),
+        contentHeightPx = max(1, kotlin.math.ceil(bounds.height).toInt()),
+        maxPixels = options.maxPixels,
+        maxDimensionPx = options.maxDimensionPx,
+        dpi = options.dpi,
+    )
+    val bitmap = Bitmap.createBitmap(size.width, size.height, Bitmap.Config.ARGB_8888)
+    try {
+        val canvas = AndroidCanvas(bitmap)
+        if (!options.transparentBackground) canvas.drawColor(android.graphics.Color.WHITE)
+        val scaleX = size.width / bounds.width.coerceAtLeast(1f)
+        val scaleY = size.height / bounds.height.coerceAtLeast(1f)
+        canvas.save()
+        canvas.scale(scaleX, scaleY)
+        canvas.translate(-bounds.left, -bounds.top)
+        drawAgentTopologyAndroid(canvas, layout)
+        canvas.restore()
+        return encodePngWithDpi(bitmap, size.dpi)
+    } finally {
+        bitmap.recycle()
+    }
+}
+
+private fun agentTopologyContentBounds(
+    layout: AgentTopologyLayout,
+    padding: Float,
+): AgentTopologyRect {
+    val points = buildList {
+        layout.nodes.forEach { node ->
+            add(AgentTopologyPoint(node.rect.left, node.rect.top))
+            add(AgentTopologyPoint(node.rect.right, node.rect.bottom))
+        }
+        layout.edges.forEach { edge -> addAll(edge.points) }
+    }
+    if (points.isEmpty()) return AgentTopologyRect(0f, 0f, padding * 2f, padding * 2f)
+    val minX = points.minOf { it.x } - padding
+    val minY = points.minOf { it.y } - padding
+    val maxX = points.maxOf { it.x } + padding
+    val maxY = points.maxOf { it.y } + padding
+    return AgentTopologyRect(minX, minY, (maxX - minX).coerceAtLeast(1f), (maxY - minY).coerceAtLeast(1f))
+}
+
+private fun drawAgentTopologyAndroid(canvas: AndroidCanvas, layout: AgentTopologyLayout) {
+    val edgePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 3f
+        color = android.graphics.Color.rgb(64, 130, 190)
+    }
+    val nodePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        color = android.graphics.Color.rgb(245, 247, 250)
+    }
+    val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 2f
+        color = android.graphics.Color.rgb(72, 83, 102)
+    }
+    val titlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = android.graphics.Color.rgb(28, 35, 48)
+        textSize = 16f
+        typeface = android.graphics.Typeface.DEFAULT_BOLD
+    }
+    val bodyPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = android.graphics.Color.rgb(72, 83, 102)
+        textSize = 12f
+    }
+    layout.edges.forEach { edge ->
+        if (edge.points.size < 2) return@forEach
+        val path = Path().apply {
+            moveTo(edge.points.first().x, edge.points.first().y)
+            edge.points.drop(1).forEach { lineTo(it.x, it.y) }
+        }
+        canvas.drawPath(path, edgePaint)
+        val before = edge.points[edge.points.lastIndex - 1]
+        val tip = edge.points.last()
+        val angle = kotlin.math.atan2((tip.y - before.y).toDouble(), (tip.x - before.x).toDouble()).toFloat()
+        canvas.save()
+        canvas.rotate(Math.toDegrees(angle.toDouble()).toFloat(), tip.x, tip.y)
+        val arrow = Path().apply {
+            moveTo(tip.x, tip.y)
+            lineTo(tip.x - 10f, tip.y - 5f)
+            moveTo(tip.x, tip.y)
+            lineTo(tip.x - 10f, tip.y + 5f)
+        }
+        canvas.drawPath(arrow, edgePaint)
+        canvas.restore()
+    }
+    layout.nodes.forEach { node ->
+        val rect = RectF(node.rect.left, node.rect.top, node.rect.right, node.rect.bottom)
+        canvas.drawRoundRect(rect, 12f, 12f, nodePaint)
+        canvas.drawRoundRect(rect, 12f, 12f, borderPaint)
+        val left = node.rect.left + 10f
+        var y = node.rect.top + 20f
+        canvas.drawText("${node.node.title} · ${node.tokenLabel}", left, y, titlePaint)
+        y += 18f
+        node.summaryLines.forEach { line ->
+            if (y <= node.rect.bottom - 6f) canvas.drawText(line, left, y, bodyPaint)
+            y += 15f
+        }
+    }
+}
+
+/**
+ * Inserts a PNG pHYs chunk after IHDR. Android's Bitmap.compress does not
+ * expose density metadata, so this keeps the user-selected DPI in the actual
+ * exported file without changing pixel dimensions.
+ */
+fun encodePngWithDpi(bitmap: Bitmap, dpi: Int): ByteArray {
+    require(dpi > 0) { "dpi must be positive" }
+    val raw = ByteArrayOutputStream().also { stream ->
+        check(bitmap.compress(Bitmap.CompressFormat.PNG, 100, stream)) { "PNG compression failed" }
+    }.toByteArray()
+    if (raw.size < 33 || raw.copyOfRange(0, 8).contentEquals(PNG_SIGNATURE).not()) return raw
+    val pixelsPerMeter = kotlin.math.round(dpi / 0.0254).toLong().coerceIn(1L, 0xFFFF_FFFFL)
+    val chunkData = ByteArray(9)
+    writeIntBigEndian(chunkData, 0, pixelsPerMeter.toInt())
+    writeIntBigEndian(chunkData, 4, pixelsPerMeter.toInt())
+    chunkData[8] = 1
+    val chunk = pngChunk("pHYs", chunkData)
+    val insertion = 8 + 4 + 4 + 13 + 4
+    return raw.copyOfRange(0, insertion) + chunk + raw.copyOfRange(insertion, raw.size)
+}
+
+private val PNG_SIGNATURE = byteArrayOf(
+    137.toByte(), 80, 78, 71, 13, 10, 26, 10,
+)
+
+private fun pngChunk(type: String, data: ByteArray): ByteArray {
+    val typeBytes = type.toByteArray(Charsets.US_ASCII)
+    val output = ByteArrayOutputStream(12 + data.size)
+    writeIntBigEndian(output, data.size)
+    output.write(typeBytes)
+    output.write(data)
+    val crc = CRC32().apply {
+        update(typeBytes)
+        update(data)
+    }
+    writeIntBigEndian(output, crc.value.toInt())
+    return output.toByteArray()
+}
+
+private fun writeIntBigEndian(output: ByteArrayOutputStream, value: Int) {
+    output.write((value ushr 24) and 0xff)
+    output.write((value ushr 16) and 0xff)
+    output.write((value ushr 8) and 0xff)
+    output.write(value and 0xff)
+}
+
+private fun writeIntBigEndian(target: ByteArray, offset: Int, value: Int) {
+    target[offset] = (value ushr 24).toByte()
+    target[offset + 1] = (value ushr 16).toByte()
+    target[offset + 2] = (value ushr 8).toByte()
+    target[offset + 3] = value.toByte()
+}
+
+data class AgentTopologyGraph(
+    val nodes: List<AgentTopologyNode>,
+    val relations: List<AgentTopologyRelation>,
+    val currentNodeId: String,
+)
+
+/** Builds the display graph from the durable runtime tree without changing its schema. */
+fun agentTopologyGraphFromRuntimeJson(
+    runtimeJson: String,
+    sessionId: String,
+    sessionTitle: String,
+    currentSummary: String,
+    currentTokens: Long = 0L,
+): AgentTopologyGraph {
+    require(sessionId.isNotBlank())
+    val runtimeNodes = runCatching {
+        val array = JSONObject(runtimeJson).optJSONArray("nodes") ?: JSONArray()
+        buildList {
+            for (index in 0 until array.length()) {
+                val json = array.optJSONObject(index) ?: continue
+                val id = json.optString("id").takeIf(String::isNotBlank) ?: continue
+                add(
+                    RuntimeTopologyItem(
+                        id = id,
+                        parentId = json.optString("parentId").takeUnless { it.isBlank() || it == "null" },
+                        rootId = json.optString("rootId"),
+                        depth = json.optInt("depth"),
+                        status = json.optString("status", "INACTIVE"),
+                        createdAtMillis = json.optLong("createdAtMillis"),
+                        model = json.optJSONObject("model")?.optString("model").orEmpty(),
+                        note = json.optJSONObject("model")?.optString("note").orEmpty(),
+                        order = index,
+                    ),
+                )
+            }
+        }
+    }.getOrDefault(emptyList())
+    val root = runtimeNodes
+        .filter { it.parentId == null && (it.id == sessionId || it.id.startsWith("$sessionId#run-")) }
+        .maxByOrNull(RuntimeTopologyItem::createdAtMillis)
+    if (root == null) {
+        val node = AgentTopologyNode(
+            id = sessionId,
+            title = sessionTitle.ifBlank { "Session" },
+            summary = currentSummary,
+            tokens = currentTokens,
+            globalOrder = 0,
+            status = "RUNNING",
+        )
+        return AgentTopologyGraph(listOf(node), emptyList(), sessionId)
+    }
+    val included = LinkedHashSet<String>().apply { add(root.id) }
+    val queue = ArrayDeque<String>().apply { add(root.id) }
+    while (queue.isNotEmpty()) {
+        val parentId = queue.removeFirst()
+        runtimeNodes.filter { it.parentId == parentId }.forEach { child ->
+            if (included.add(child.id)) queue.addLast(child.id)
+        }
+    }
+    val graphItems = runtimeNodes.filter { it.id in included }
+    val displayNodes = graphItems.map { item ->
+        AgentTopologyNode(
+            id = item.id,
+            title = if (item.id == root.id) sessionTitle.ifBlank { "Session" }
+                else item.model.ifBlank { "Agent ${item.depth}" },
+            summary = if (item.id == root.id && currentSummary.isNotBlank()) currentSummary else item.note,
+            tokens = if (item.id == root.id) currentTokens else 0L,
+            parentId = item.parentId,
+            depth = item.depth,
+            createdAtMillis = item.createdAtMillis,
+            globalOrder = item.order,
+            status = item.status,
+        )
+    }
+    val ids = displayNodes.mapTo(HashSet()) { it.id }
+    val relations = displayNodes.mapNotNull { item ->
+        item.parentId?.takeIf(ids::contains)?.let { AgentTopologyRelation(it, item.id, "parent") }
+    }
+    return AgentTopologyGraph(displayNodes, relations, root.id)
+}
+
+private data class RuntimeTopologyItem(
+    val id: String,
+    val parentId: String?,
+    val rootId: String,
+    val depth: Int,
+    val status: String,
+    val createdAtMillis: Long,
+    val model: String,
+    val note: String,
+    val order: Int,
+)
+
+@Composable
+fun AgentTopologyRoute(
+    sessionId: String,
+    sessionTitle: String,
+    currentSummary: String,
+    chatRepository: com.openminis.app.data.repository.ChatRepository,
+    onDismiss: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val context = LocalContext.current
+    var graph by remember(sessionId) {
+        mutableStateOf(AgentTopologyGraph(emptyList(), emptyList(), sessionId))
+    }
+    LaunchedEffect(sessionId, sessionTitle, currentSummary) {
+        graph = withContext(Dispatchers.IO) {
+            val runtimeJson = runCatching {
+                RuntimeTreeStore.open(context.applicationContext).snapshot().toJson()
+            }.getOrDefault("{}")
+            val tokenCount = runCatching {
+                chatRepository.sessionTokenUsages(sessionId).sumOf { raw ->
+                    val json = JSONObject(raw)
+                    json.optLong("inputTokens") + json.optLong("outputTokens")
+                }
+            }.getOrDefault(0L)
+            agentTopologyGraphFromRuntimeJson(
+                runtimeJson = runtimeJson,
+                sessionId = sessionId,
+                sessionTitle = sessionTitle,
+                currentSummary = currentSummary,
+                currentTokens = tokenCount,
+            )
+        }
+    }
+    AgentTopologyScreen(
+        nodes = graph.nodes,
+        relations = graph.relations,
+        currentNodeId = graph.currentNodeId,
+        onDismiss = onDismiss,
+        modifier = modifier,
+    )
+}
+
+/** Full-screen topology canvas. Nodes are rendered, never draggable. */
 private fun simplifyAgentTopologyPath(path: List<AgentTopologyPoint>): List<AgentTopologyPoint> {
     if (path.size < 3) return path
     val result = ArrayList<AgentTopologyPoint>(path.size)
@@ -438,4 +821,153 @@ private fun simplifyAgentTopologyPath(path: List<AgentTopologyPoint>): List<Agen
         }
     }
     return result
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun AgentTopologyScreen(
+    nodes: List<AgentTopologyNode>,
+    relations: List<AgentTopologyRelation>,
+    currentNodeId: String?,
+    onDismiss: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val context = LocalContext.current
+    val prefs = remember(context) { AgentTopologyPrefs(context) }
+    var zoom by remember { mutableStateOf(prefs.loadZoom()) }
+    var pan by remember { mutableStateOf(Offset.Zero) }
+    var viewport by remember { mutableStateOf(IntSize.Zero) }
+    var transparent by remember { mutableStateOf(false) }
+    val layout = remember(nodes, relations) { layoutAgentTopology(nodes, relations) }
+    val exportLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("image/png"),
+    ) { uri ->
+        if (uri != null) {
+            runCatching {
+                context.contentResolver.openOutputStream(uri)?.use { stream ->
+                    stream.write(renderAgentTopologyPng(layout, AgentTopologyExportOptions(transparentBackground = transparent)))
+                }
+            }
+        }
+    }
+    LaunchedEffect(viewport, currentNodeId, layout.nodes.size) {
+        val current = layout.nodes.firstOrNull { it.node.id == currentNodeId } ?: layout.nodes.firstOrNull()
+        if (current != null && viewport != IntSize.Zero) {
+            val center = Offset(current.rect.center.x, current.rect.center.y)
+            pan = Offset(viewport.width / 2f - center.x * zoom, viewport.height / 2f - center.y * zoom)
+        }
+    }
+    val surfaceColor = MaterialTheme.colorScheme.surfaceVariant
+    val outlineColor = MaterialTheme.colorScheme.outline
+    Scaffold(
+        modifier = modifier,
+        topBar = {
+            TopAppBar(
+                title = { Text(stringResource(R.string.agent_topology_title)) },
+                navigationIcon = {
+                    IconButton(onClick = onDismiss) {
+                        Icon(Icons.Default.ArrowBack, contentDescription = stringResource(R.string.common_back))
+                    }
+                },
+                actions = {
+                    IconButton(onClick = { exportLauncher.launch("agent-topology.png") }) {
+                        Icon(Icons.Default.Download, contentDescription = stringResource(R.string.agent_topology_export))
+                    }
+                },
+            )
+        },
+    ) { padding ->
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(padding)
+                .background(MaterialTheme.colorScheme.background)
+                .onSizeChanged { viewport = it }
+                .pointerInput(Unit) {
+                    detectTransformGestures { _, panChange, zoomChange, _ ->
+                        zoom = prefs.saveZoom((zoom * zoomChange).coerceIn(AgentTopologyPrefs.MIN_GLOBAL_ZOOM, AgentTopologyPrefs.MAX_GLOBAL_ZOOM))
+                        pan += panChange
+                    }
+                },
+        ) {
+            Canvas(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .graphicsLayer {
+                        translationX = pan.x
+                        translationY = pan.y
+                        scaleX = zoom
+                        scaleY = zoom
+                    },
+            ) {
+                layout.edges.forEach { edge ->
+                    if (edge.points.size >= 2) {
+                        val points = edge.points
+                        for (index in 0 until points.lastIndex) {
+                            drawLine(
+                                color = Color(0xFF4082BE),
+                                start = Offset(points[index].x, points[index].y),
+                                end = Offset(points[index + 1].x, points[index + 1].y),
+                                strokeWidth = 3f,
+                            )
+                        }
+                    }
+                }
+                layout.nodes.forEach { item ->
+                    val topLeft = Offset(item.rect.left, item.rect.top)
+                    drawRoundRect(
+                        color = surfaceColor,
+                        topLeft = topLeft,
+                        size = androidx.compose.ui.geometry.Size(item.rect.width, item.rect.height),
+                        cornerRadius = androidx.compose.ui.geometry.CornerRadius(12f, 12f),
+                    )
+                    drawRoundRect(
+                        color = outlineColor,
+                        topLeft = topLeft,
+                        size = androidx.compose.ui.geometry.Size(item.rect.width, item.rect.height),
+                        cornerRadius = androidx.compose.ui.geometry.CornerRadius(12f, 12f),
+                        style = Stroke(width = 2f),
+                    )
+                    val native = drawContext.canvas.nativeCanvas
+                    val titlePaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+                        color = android.graphics.Color.rgb(28, 35, 48)
+                        textSize = 16f
+                        typeface = android.graphics.Typeface.DEFAULT_BOLD
+                    }
+                    val bodyPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+                        color = android.graphics.Color.rgb(72, 83, 102)
+                        textSize = 12f
+                    }
+                    var textY = item.rect.top + 20f
+                    native.drawText("${item.node.title} · ${item.tokenLabel}", item.rect.left + 10f, textY, titlePaint)
+                    textY += 18f
+                    item.summaryLines.forEach { line ->
+                        if (textY <= item.rect.bottom - 6f) native.drawText(line, item.rect.left + 10f, textY, bodyPaint)
+                        textY += 15f
+                    }
+                }
+            }
+            if (layout.nodes.isEmpty()) {
+                Text(
+                    text = stringResource(R.string.agent_topology_empty),
+                    modifier = Modifier.align(Alignment.Center),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Row(
+                modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                androidx.compose.material3.FilterChip(
+                    selected = transparent,
+                    onClick = { transparent = !transparent },
+                    label = { Text(stringResource(R.string.agent_topology_transparent)) },
+                )
+                FloatingActionButton(onClick = { exportLauncher.launch("agent-topology.png") }) {
+                    Icon(Icons.Default.Download, contentDescription = stringResource(R.string.agent_topology_export))
+                }
+            }
+        }
+    }
 }

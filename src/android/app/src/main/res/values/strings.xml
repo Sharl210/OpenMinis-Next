@@ -1999,4 +1999,7 @@
     <string name="agent_topology_export_transparent">Transparent background</string>
     <string name="agent_topology_export_solid">Solid background</string>
     <string name="agent_topology_export_poster_description">Default export uses poster-grade PNG quality at 300 DPI.</string>
+    <string name="agent_topology_open">Agent topology</string>
+    <string name="agent_topology_transparent">Transparent background</string>
+    <string name="agent_topology_empty">No agent nodes yet</string>
 </resources>

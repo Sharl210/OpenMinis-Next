@@ -1823,4 +1823,7 @@
     <string name="agent_topology_export_transparent">透明背景</string>
     <string name="agent_topology_export_solid">纯色背景</string>
     <string name="agent_topology_export_poster_description">默认使用 300 DPI 海报级 PNG 画质导出。</string>
+    <string name="agent_topology_open">代理拓扑图</string>
+    <string name="agent_topology_transparent">透明背景</string>
+    <string name="agent_topology_empty">暂无 Agent 节点</string>
 </resources>

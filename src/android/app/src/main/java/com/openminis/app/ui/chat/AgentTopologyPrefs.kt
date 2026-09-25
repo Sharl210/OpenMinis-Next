@@ -57,6 +57,7 @@ class AgentTopologyPrefs(context: Context) {
             contentHeightPx: Int,
             maxPixels: Long = DEFAULT_MAX_EXPORT_PIXELS,
             maxDimensionPx: Int = DEFAULT_MAX_EXPORT_DIMENSION_PX,
+            dpi: Int = DEFAULT_POSTER_EXPORT_DPI,
         ): ExportPixelSize {
             val width = contentWidthPx.coerceAtLeast(1)
             val height = contentHeightPx.coerceAtLeast(1)
@@ -71,7 +72,7 @@ class AgentTopologyPrefs(context: Context) {
             return ExportPixelSize(
                 width = max(1, (width * scale).toInt()),
                 height = max(1, (height * scale).toInt()),
-                dpi = DEFAULT_POSTER_EXPORT_DPI,
+                dpi = dpi.coerceAtLeast(1),
             )
         }
 
