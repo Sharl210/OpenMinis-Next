@@ -8406,7 +8406,7 @@ class ChatViewModel(
                             maxAttempts = if (retrySettings.autoRetryEnabled) {
                                 retrySettings.maxRetryAttempts
                             } else {
-                                1
+                                0
                             },
                             initialRetryDelayMillis = 1_000L,
                             maxRetryDelayMillis = 30_000L,
