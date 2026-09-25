@@ -92,14 +92,27 @@ class RuntimeDelegationTest {
         assertTrue(restored.receipts().size >= 2)
     }
     @Test
-    fun `traditional mode rejects peer delivery`() {
-        val tree = RuntimeSessionTree(clock = { 10L })
+    fun `notify requires authorization can be claimed and receipt survives restore`() {
+        val tree = RuntimeSessionTree(clock = { 30L })
         val root = tree.createRoot("root", RuntimeModelSnapshot("p", "m"))
         val child = tree.createChild(root.id, "child", RuntimeModelSnapshot("p", "m")).getOrThrow()
-        tree.start(root.id)
-        tree.start(child.id)
-        val receipt = tree.send(root.id, child.id, "peer", RuntimeDelivery.TEAM_PEER)
-        assertFalse(receipt.accepted)
-        assertNull(tree.claimNextStep(child.id))
+        tree.start(root.id); tree.start(child.id)
+
+        val rejected = tree.send(child.id, root.id, "unauthorized", RuntimeDelivery.NOTIFY)
+        assertFalse(rejected.accepted)
+        assertTrue(tree.receipts().last().status == RuntimeReceiptStatus.REJECTED)
+
+        val subscription = tree.addSubscription(child.id, root.id, setOf(RuntimeEdgePermission.NOTIFY))
+        assertTrue(subscription.accepted)
+        val accepted = tree.send(root.id, child.id, "notice", RuntimeDelivery.NOTIFY)
+        assertTrue(accepted.accepted)
+        assertEquals(RuntimeReceiptStatus.ENQUEUED, tree.receipts().last().status)
+        assertEquals("notice", tree.claimNextNotification(child.id)?.payload)
+        assertEquals(RuntimeReceiptStatus.CLAIMED, tree.receipts().last().status)
+
+        val restored = RuntimeSessionTree(clock = { 31L })
+        assertTrue(restored.restoreJson(tree.toJson()))
+        assertEquals(RuntimeReceiptStatus.CLAIMED, restored.receipts().last().status)
+        assertTrue(restored.claimNextNotification(child.id) == null)
     }
 }

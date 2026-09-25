@@ -549,6 +549,9 @@ class RuntimeSessionTree(
     fun claimNextStep(nodeId: String): RuntimeEnvelope? = claim(nodeId) { it.delivery == RuntimeDelivery.STEER || it.delivery == RuntimeDelivery.TEAM_PEER }
 
     @Synchronized
+    fun claimNextNotification(nodeId: String): RuntimeEnvelope? = claim(nodeId) { it.delivery == RuntimeDelivery.NOTIFY }
+
+    @Synchronized
     fun claimNextTurn(nodeId: String): RuntimeEnvelope? = claim(nodeId) { it.delivery == RuntimeDelivery.QUEUE }
 
     @Synchronized
@@ -821,6 +824,13 @@ class RuntimeSessionTree(
         if (index < 0) return null
         val claimed = inbox[index].copy(claimed = true)
         inbox[index] = claimed
+        val receiptIndex = deliveryReceipts.indexOfLast { it.messageId == claimed.id }
+        if (receiptIndex >= 0) {
+            deliveryReceipts[receiptIndex] = deliveryReceipts[receiptIndex].copy(
+                status = RuntimeReceiptStatus.CLAIMED,
+                reason = "message claimed",
+            )
+        }
         record(nodeId, "message_claimed", clock(), claimed.id)
         return claimed
     }
@@ -892,6 +902,7 @@ class RuntimeSessionTree(
         put("fromNodeId", receipt.fromNodeId); put("toNodeId", receipt.toNodeId)
         put("delivery", receipt.delivery?.name); put("accepted", receipt.accepted)
         put("createdAtMillis", receipt.createdAtMillis); put("reason", receipt.reason)
+        put("status", receipt.status.name)
     }
 
     private fun transcriptJson(message: RuntimeTranscriptMessage) = JSONObject().apply {
@@ -952,6 +963,8 @@ class RuntimeSessionTree(
         accepted = json.optBoolean("accepted"),
         createdAtMillis = json.optLong("createdAtMillis"),
         reason = json.optString("reason").takeIf { it.isNotBlank() && it != "null" },
+        status = runCatching { RuntimeReceiptStatus.valueOf(json.optString("status")) }
+            .getOrDefault(if (json.optBoolean("accepted")) RuntimeReceiptStatus.ENQUEUED else RuntimeReceiptStatus.REJECTED),
     )
 
     private fun parseTranscript(json: JSONObject) = RuntimeTranscriptMessage(
