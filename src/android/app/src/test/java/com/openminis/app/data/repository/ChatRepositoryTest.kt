@@ -1,6 +1,9 @@
 package com.openminis.app.data.repository
 
+import com.openminis.app.data.model.MessagePartsCodec
+import com.openminis.app.data.model.MessageProvenance
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
@@ -28,10 +31,6 @@ class ChatRepositoryTest {
             keep this content
         """.trimIndent()
         val cleaned = ChatRepository.stripSystemReminders(raw)
-        // trimIndent strips the leading 12 spaces from every line, so the
-        // pre/post-reminder lines have no indent. After the regex strips the
-        // entire <system-reminder>...</system-reminder> block (DOTALL match),
-        // what's left is "User asked a question\n\nkeep this content".
         assertEquals("User asked a question\n\nkeep this content", cleaned)
     }
 
@@ -44,8 +43,6 @@ class ChatRepositoryTest {
     @Test
     fun `stripSystemReminders strips multiple back-to-back reminders independently`() {
         val raw = "a<system-reminder>x</system-reminder>b<system-reminder>y</system-reminder>c"
-        // Reluctant quantifier prevents the two blocks merging into one match
-        // that would also swallow the "b" between them.
         assertEquals("abc", ChatRepository.stripSystemReminders(raw))
     }
 
@@ -59,5 +56,16 @@ class ChatRepositoryTest {
     fun `stripSystemReminders leaves markdown unchanged`() {
         val raw = "# Heading\n**bold** and `code` and a [link](https://example.com)"
         assertEquals(raw, ChatRepository.stripSystemReminders(raw))
+    }
+
+    @Test
+    fun `truncated parts preserve provenance marker`() {
+        val original = MessagePartsCodec.withProvenance(
+            "[{\"type\":\"text\",\"value\":\"${"x".repeat(ChatRepository.MAX_MESSAGE_PARTS_JSON_LENGTH + 100)}\"}]",
+            MessageProvenance.TOOL_INJECTION,
+        )
+        val truncated = ChatRepository.buildTruncatedPartsJson(original)
+        assertEquals(MessageProvenance.TOOL_INJECTION, MessagePartsCodec.provenanceOf(truncated))
+        assertTrue(truncated.contains("Content truncated"))
     }
 }

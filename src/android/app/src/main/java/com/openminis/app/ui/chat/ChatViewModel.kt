@@ -34,6 +34,8 @@ import com.openminis.app.data.model.LLMMessage
 import com.openminis.app.data.model.LLMModel
 import com.openminis.app.data.model.LLMStreamChunk
 import com.openminis.app.data.model.LLMUsage
+import com.openminis.app.data.model.MessagePartsCodec
+import com.openminis.app.data.model.MessageProvenance
 import com.openminis.app.data.model.ModelGroup
 import com.openminis.app.data.model.RoutingStrategy
 import com.openminis.app.data.model.hasImageInput
@@ -1182,13 +1184,14 @@ class ChatViewModel(
         val parentSession = ensureSession()
         val userParts = "[{\"type\":\"text\",\"value\":${escapeJson(input.trim())}}]"
         val parentUser = withContext(Dispatchers.IO) {
-            chatRepository.appendMessage(parentSession, "user", userParts)
+            chatRepository.appendMessage(parentSession, "user", userParts, provenance = MessageProvenance.MANUAL_USER)
         }
         withContext(Dispatchers.Main) {
             _messages.value = _messages.value + ChatMessage(
                 id = parentUser.id,
                 role = "user",
                 content = input.trim(),
+                provenance = MessageProvenance.MANUAL_USER,
                 sourceDbIds = listOf(parentUser.id),
             )
         }
@@ -1218,6 +1221,7 @@ class ChatViewModel(
                     "assistant",
                     assistantParts,
                     modelSnapshot = snapshot,
+                    provenance = MessageProvenance.ASSISTANT,
                 )
             }
             withContext(Dispatchers.Main) {
@@ -1225,6 +1229,7 @@ class ChatViewModel(
                     id = persisted.id,
                     role = "assistant",
                     content = output,
+                    provenance = MessageProvenance.ASSISTANT,
                     error = if (result.isFailure) output else null,
                     sourceDbIds = listOf(persisted.id),
                 )
@@ -2091,6 +2096,7 @@ class ChatViewModel(
             role = "system",
             content = "",
             toolBlocks = listOf(block),
+            provenance = MessageProvenance.SYSTEM_CARD,
         )
     }
 
@@ -4693,6 +4699,7 @@ class ChatViewModel(
             role = "system",
             content = "",
             toolBlocks = listOf(dividerBlock),
+            provenance = MessageProvenance.SYSTEM_CARD,
         )
         val withDivider = grayed.toMutableList()
         withDivider.add(insertIdx.coerceIn(0, withDivider.size), dividerMsg)
@@ -5384,7 +5391,11 @@ class ChatViewModel(
                     // thisRow.sortOrder + 1 drops the following tool_result row
                     // + all later turns while keeping (then overwriting) this one.
                     chatRepository.deleteMessagesAfter(sid, row.sortOrder + 1)
-                    chatRepository.updateMessageParts(row.id, keptArr.toString())
+                    val keptPartsJson = MessagePartsCodec.withProvenance(
+                        keptArr.toString(),
+                        MessagePartsCodec.provenanceOf(row.partsJson),
+                    )
+                    chatRepository.updateMessageParts(row.id, keptPartsJson)
                     Log.i(TAG, "rerunFromToolBlock sub-message cut tuId=${targetToolUseId.take(12)} keepCount=${row.sortOrder + 1} partIdx=$cutPartIdx trimmedRow=${row.id.take(8)}")
                 }
 
@@ -6085,6 +6096,7 @@ class ChatViewModel(
             attachmentUris = attachmentUris,
             isQueued = true,
             queuedPromptId = prompt.id,
+             provenance = MessageProvenance.TOOL_INJECTION,
         )
         _messages.value = _messages.value + chatMsg
         clearAttachments()
@@ -6221,7 +6233,12 @@ class ChatViewModel(
             prepared.attachedFilesXml,
             bodyPartsJson = queuedPaste?.partsJson,
         )
-        val userEntity = chatRepository.appendMessage(sid, "user", userPartsJson)
+        val userEntity = chatRepository.appendMessage(
+            sid,
+            "user",
+            userPartsJson,
+            provenance = MessageProvenance.TOOL_INJECTION,
+        )
         agentHistory.add(
             LLMMessage(
                 role = LLMMessage.Role.USER,
@@ -6271,6 +6288,7 @@ class ChatViewModel(
                 imageUris = prepared.imageUris,
                 attachmentNames = prepared.attachmentNames,
                 attachmentUris = prepared.nonImageUris,
+                 provenance = MessageProvenance.TOOL_INJECTION,
             )
             val nextAssistantMsg = ChatMessage(
                 id = newAssistantId,
@@ -6279,6 +6297,7 @@ class ChatViewModel(
                 isStreaming = true,
                 isAwaitingModelResponse = true,
                 thinkingLevel = _thinkingLevel.value,
+                 provenance = MessageProvenance.ASSISTANT,
             )
             _messages.value = _messages.value + queuedUserMsg + nextAssistantMsg
             // Note: ChatScreen's `lastUserAppendMs` (the trailing-row
@@ -6367,7 +6386,7 @@ class ChatViewModel(
                 prepared.attachedFilesXml,
                 bodyPartsJson = drainPaste?.partsJson,
             )
-            chatRepository.appendMessage(sid, "user", userPartsJson)
+            chatRepository.appendMessage(sid, "user", userPartsJson, provenance = MessageProvenance.TOOL_INJECTION)
 
             agentHistory.add(LLMMessage(
                 role = LLMMessage.Role.USER,
@@ -6550,7 +6569,12 @@ class ChatViewModel(
                 prepared.attachedFilesXml,
                 bodyPartsJson = pasted?.partsJson,
             )
-            val persistedUser = chatRepository.appendMessage(activeSessionId, "user", userPartsJson)
+            val persistedUser = chatRepository.appendMessage(
+                activeSessionId,
+                "user",
+                userPartsJson,
+                provenance = MessageProvenance.MANUAL_USER,
+            )
 
             val userMsg = ChatMessage(
                 id = persistedUser.id,
@@ -6573,6 +6597,7 @@ class ChatViewModel(
                 // ChatMessage.attachmentNames depends on.
                 attachmentNames = prepared.attachmentNames + (pasted?.uiNames ?: emptyList()),
                 attachmentUris = prepared.nonImageUris + (pasted?.uiUris ?: emptyList()),
+                 provenance = MessageProvenance.MANUAL_USER,
             )
             _messages.value = _messages.value + userMsg
             val imageParts = prepared.imageParts
@@ -7618,6 +7643,7 @@ class ChatViewModel(
                 id = assistantId, role = "assistant", content = "", isStreaming = true,
                 isAwaitingModelResponse = true,
                 thinkingLevel = turnThinkingLevel,
+                 provenance = MessageProvenance.ASSISTANT,
             )
         }
 
@@ -7755,6 +7781,7 @@ class ChatViewModel(
                             isStreaming = true,
                             isAwaitingModelResponse = true,
                             thinkingLevel = turnThinkingLevel,
+                 provenance = MessageProvenance.ASSISTANT,
                         )
                     }
                     clearStreamFlushState(sealedId)
@@ -10387,6 +10414,7 @@ class ChatViewModel(
             // [T-token-attribution-snapshot] From the live request context, not
             // the session row — see currentModelSnapshot().
             modelSnapshot = currentModelSnapshot(),
+            provenance = MessageProvenance.ASSISTANT,
         )
         return entity.id
     }
@@ -10433,6 +10461,7 @@ class ChatViewModel(
             realSessionId.ifEmpty { sessionId }, "assistant", partsJson, tokenJson,
             reasoningContent = reasoningContent,
             modelSnapshot = currentModelSnapshot(),
+            provenance = MessageProvenance.ASSISTANT,
         )
     }
 
@@ -10449,7 +10478,12 @@ class ChatViewModel(
             }
             append("]")
         }
-        val entity = chatRepository.appendMessage(realSessionId.ifEmpty { sessionId }, "user", partsJson)
+        val entity = chatRepository.appendMessage(
+            realSessionId.ifEmpty { sessionId },
+            "user",
+            partsJson,
+            provenance = MessageProvenance.TOOL_INJECTION,
+        )
         return entity.id
     }
 
@@ -12006,7 +12040,12 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
             )
             viewModelScope.launch(Dispatchers.IO) {
                 val partsJson = buildAssistantPartsJson(parts)
-                chatRepository.appendMessage(activeSessionId, "assistant", partsJson)
+                chatRepository.appendMessage(
+                    activeSessionId,
+                    "assistant",
+                    partsJson,
+                    provenance = MessageProvenance.ASSISTANT,
+                )
             }
             // [T-android-group-pause-badge-restamp] A LIVE interruption just
             // happened: this is a real entry into the paused state, so the
@@ -12097,7 +12136,12 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
             )
             viewModelScope.launch(Dispatchers.IO) {
                 val partsJson = """[{"type":"text","value":${escapeJson(reminder)}}]"""
-                chatRepository.appendMessage(activeSessionId, "user", partsJson)
+                chatRepository.appendMessage(
+                    activeSessionId,
+                    "user",
+                    partsJson,
+                    provenance = MessageProvenance.TOOL_INJECTION,
+                )
             }
         }
 
@@ -12317,6 +12361,7 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
         // Second pass: convert messages, merging tool results into blocks
         // Filter out user messages that only contain toolResult parts (no visible text)
         return mapNotNull { entity ->
+            val provenance = MessagePartsCodec.provenanceOf(entity.partsJson)
             var text = ""
             val blocks = mutableListOf<AssistantBlock>()
             // T128: media attachments persisted under user messages as `mediaRef`
@@ -12494,6 +12539,7 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
                 attachmentNames = restoredImageNames + restoredFileNames,
                 attachmentUris = restoredAttachmentUris,
                 toolBlocks = blocks,
+                provenance = provenance,
                 sourceDbIds = listOf(entity.id),
                 // [T-error-persist-android] Restore the persisted terminal error
                 // so the inline error banner + Retry button survive a reload.
@@ -12556,8 +12602,9 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
         val imageParts = mutableListOf<LLMMessage.ImagePart>()
         var textContent = ""
 
+        val wirePartsJson = MessagePartsCodec.withoutProvenance(partsJson)
         try {
-            val array = org.json.JSONArray(partsJson)
+            val array = org.json.JSONArray(wirePartsJson)
             for (i in 0 until array.length()) {
                 val obj = array.getJSONObject(i)
                 when (obj.optString("type")) {
@@ -12683,8 +12730,8 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
                 }
             }
         } catch (_: Exception) {
-            textContent = partsJson
-            contentParts.add(AgentContentPart.Text(partsJson))
+            textContent = wirePartsJson
+            contentParts.add(AgentContentPart.Text(wirePartsJson))
         }
 
         return LLMMessage(

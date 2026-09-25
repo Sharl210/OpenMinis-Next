@@ -1280,7 +1280,7 @@ fun ChatScreen(
     }
 
     val userMessageIds = remember(messages) {
-        messages.filter { it.role == "user" }.map { it.id }
+        messages.filter { it.isManualHumanUser() }.map { it.id }
     }
 
     val atVisualTop = remember(listState) {
@@ -1384,7 +1384,7 @@ fun ChatScreen(
                 ?.takeIf { it >= 0 }
                 ?: 0
             messages.take(topMessageIndex + 1)
-                .lastOrNull { it.role == "user" }
+                .lastOrNull { it.isManualHumanUser() }
                 ?.id
                 ?: userMessageIds.firstOrNull()
         }
@@ -1507,7 +1507,7 @@ fun ChatScreen(
         if (visible.isEmpty()) return@scrollToPreviousUserTurn
         // Ordered oldest → newest list of user-message ids, matching the order
         // the user reads the conversation in.
-        val userIds = messages.filter { it.role == "user" }.map { it.id }
+        val userIds = messages.filter { it.isManualHumanUser() }.map { it.id }
         if (userIds.isEmpty()) {
             // No user turns (rare) — fall back to the oldest item (the HIGHEST
             // index; see the orientation note below) so the button is never a
@@ -1559,7 +1559,7 @@ fun ChatScreen(
             ?: 0
         // The current turn's anchor = nearest user message AT OR ABOVE the top
         // row (searching backwards through the conversation).
-        val currentAnchor = messages.take(topMsgIdx + 1).lastOrNull { it.role == "user" }?.id
+        val currentAnchor = messages.take(topMsgIdx + 1).lastOrNull { it.isManualHumanUser() }?.id
             ?: userIds.first()
         // Decide the target — the rule from iOS `scrollToPreviousUserTurn`: if
         // the viewport is already at the anchor we last jumped to (the user has
@@ -1742,7 +1742,7 @@ fun ChatScreen(
         val info = listState.layoutInfo
         val visible = info.visibleItemsInfo
         if (visible.isEmpty()) return@scrollToNextUserTurn
-        val userIds = messages.filter { it.role == "user" }.map { it.id }
+        val userIds = messages.filter { it.isManualHumanUser() }.map { it.id }
         if (userIds.isEmpty()) return@scrollToNextUserTurn
 
         val topKey = visible.minByOrNull { it.index }?.key as? String
@@ -1755,7 +1755,7 @@ fun ChatScreen(
             ?.takeIf { it >= 0 }
             ?: 0
         val currentAnchor = messages.take(topMsgIdx + 1)
-            .lastOrNull { it.role == "user" }
+            .lastOrNull { it.isManualHumanUser() }
             ?.id
             ?: userIds.first()
         val walkFrom = lastNextUserId?.takeIf { it in userIds } ?: currentAnchor

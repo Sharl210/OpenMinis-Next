@@ -6,6 +6,8 @@ import com.openminis.app.data.db.ChatSessionEntity
 import com.openminis.app.data.db.FolderEntity
 import com.openminis.app.data.db.MessageEntity
 import com.openminis.app.agent.SoulIcon
+import com.openminis.app.data.model.MessagePartsCodec
+import com.openminis.app.data.model.MessageProvenance
 import com.openminis.app.data.model.ModelAttributionSnapshot
 import kotlinx.coroutines.flow.Flow
 import java.util.UUID
@@ -389,6 +391,7 @@ class ChatRepository(internal val dao: ChatDao) {
         tokenUsage: String? = null,
         reasoningContent: String? = null,
         modelSnapshot: ModelAttributionSnapshot? = null,
+        provenance: MessageProvenance = MessageProvenance.UNKNOWN,
     ): MessageEntity {
         val sortOrder = dao.nextSortOrder(sessionId)
         val now = System.currentTimeMillis()
@@ -403,11 +406,17 @@ class ChatRepository(internal val dao: ChatDao) {
         } else {
             partsJson
         }
+        val source = if (provenance == MessageProvenance.UNKNOWN) {
+            MessagePartsCodec.provenanceOf(partsJson)
+        } else {
+            provenance
+        }
+        val persistedParts = MessagePartsCodec.withProvenance(capped, source)
         val message = MessageEntity(
             id = UUID.randomUUID().toString(),
             sessionId = sessionId,
             role = role,
-            partsJson = capped,
+            partsJson = persistedParts,
             createdAt = now,
             tokenUsage = tokenUsage,
             sortOrder = sortOrder,
@@ -915,17 +924,20 @@ class ChatRepository(internal val dao: ChatDao) {
         internal const val MAX_MESSAGE_PARTS_JSON_LENGTH = 500_000
 
         internal fun buildTruncatedPartsJson(original: String): String {
+            val source = MessagePartsCodec.provenanceOf(original)
             val keep = original.take(MAX_MESSAGE_PARTS_JSON_LENGTH)
             val marker = "\n\n[Content truncated at " +
                 "${MAX_MESSAGE_PARTS_JSON_LENGTH / 1000} KB — original length " +
                 "${original.length} chars]"
             val combined = keep + marker
             // Wrap in a single text part so JSONArray parsers (preview
-            // extractor, search, exporter) see a well-formed payload.
-            val textObj = org.json.JSONObject()
-                .put("type", "text")
-                .put("value", combined)
-            return org.json.JSONArray().put(textObj).toString()
+            // extractor, search, exporter) see a well-formed payload. Re-add
+            // the source marker separately because truncating raw JSON must not
+            // silently turn a known row back into UNKNOWN.
+            val truncated = org.json.JSONArray().put(
+                org.json.JSONObject().put("type", "text").put("value", combined),
+            ).toString()
+            return MessagePartsCodec.withProvenance(truncated, source)
         }
     }
 }

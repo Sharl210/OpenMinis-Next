@@ -38,6 +38,7 @@ import com.openminis.app.data.model.LLMMessage
 import com.openminis.app.data.model.LLMModel
 import com.openminis.app.data.model.LLMStreamChunk
 import com.openminis.app.data.model.LLMUsage
+import com.openminis.app.data.model.MessageProvenance
 import com.openminis.app.data.model.ModelGroup
 import com.openminis.app.data.model.ThinkingLevel
 import com.openminis.app.R
@@ -162,6 +163,9 @@ data class ChatMessage(
     // can still scroll/read it while seeing it's no longer in the model's
     // active context window.
     val isCompactedHistory: Boolean = false,
+    // Explicit UI provenance is independent from the API role. Rows written by
+    // older builds have no marker and therefore remain UNKNOWN.
+    val provenance: MessageProvenance = MessageProvenance.UNKNOWN,
     // Every DB row id this UI message represents — usually a single id,
     // but consecutive assistant turns get merged in `loadSessionMessages`
     // and the merged bubble carries every source row's id here. Phase
@@ -245,6 +249,10 @@ data class ChatMessage(
         }
     }
 }
+
+/** Only a explicitly marked human-authored user row may drive turn navigation. */
+internal fun ChatMessage.isManualHumanUser(): Boolean =
+    role == "user" && provenance == MessageProvenance.MANUAL_USER
 
 /** A user prompt queued while the agent loop is still running. Mirrors iOS QueuedPrompt. */
 data class QueuedPrompt(
