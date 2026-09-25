@@ -19,6 +19,22 @@ what converge on the product.**
 
 Official website: **[openminis.app](https://openminis.app)**
 
+## Independent second development
+
+This repository is an independent second development based on
+[OpenMinis/OpenMinis](https://github.com/OpenMinis/OpenMinis). It is maintained as a
+standalone project rather than as a GitHub fork, because its runtime, Android
+experience and release direction have diverged substantially from upstream.
+Upstream features may be studied and independently adapted when useful; this
+repository does not imply an upstream sync or endorsement relationship.
+
+We sincerely thank the OpenMinis maintainers and contributors for the original
+project, its architecture, and the open-source work that made this development
+possible. OpenMinis remains the upstream reference and is credited here with
+respect. This project continues to preserve the applicable GPLv3 and third-party
+license notices; see [LICENSE](LICENSE) and
+[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).
+
 <a href="https://apps.apple.com/app/id6759188481">
   <img alt="Download on the App Store" height="48" src="assets/badge-appstore.svg" />
 </a>
