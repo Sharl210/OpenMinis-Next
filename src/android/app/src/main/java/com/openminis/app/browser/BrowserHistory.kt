@@ -59,11 +59,12 @@ class BrowserHistoryStore internal constructor(private val context: Context) {
 
     @Synchronized
     fun record(url: String, title: String) {
-        if (url.isEmpty()) return
-        // Deduplicate consecutive visits to same URL.
-        if (entries.lastOrNull()?.url == url) return
+        val normalized = BrowserUrlNormalizer.normalize(url)
+        if (normalized.isEmpty()) return
+        // Deduplicate consecutive visits to same canonical URL.
+        if (entries.lastOrNull()?.url == normalized) return
 
-        entries.add(Entry(url = url, title = title))
+        entries.add(Entry(url = normalized, title = title))
         pruneOld()
         save()
     }
@@ -119,7 +120,8 @@ class BrowserHistoryStore internal constructor(private val context: Context) {
     /** Delete history entries matching a URL. */
     @Synchronized
     fun deleteHistoryForUrl(url: String): Boolean {
-        val removed = entries.removeAll { it.url == url }
+        val normalized = BrowserUrlNormalizer.normalize(url)
+        val removed = entries.removeAll { it.url == normalized }
         if (removed) save()
         return removed
     }
@@ -145,19 +147,23 @@ class BrowserHistoryStore internal constructor(private val context: Context) {
     }
 
     @Synchronized
-    fun isBookmarked(url: String): Boolean = url.isNotBlank() && bookmarks.any { it.url == url }
+    fun isBookmarked(url: String): Boolean {
+        val normalized = BrowserUrlNormalizer.normalize(url)
+        return normalized.isNotBlank() && bookmarks.any { it.url == normalized }
+    }
 
     @Synchronized
     fun findBookmark(idOrUrl: String?): Bookmark? {
         val value = idOrUrl?.trim().orEmpty()
         if (value.isEmpty()) return null
-        return bookmarks.firstOrNull { it.id == value || it.url == value }
+        val normalized = BrowserUrlNormalizer.normalize(value)
+        return bookmarks.firstOrNull { it.id == value || it.url == normalized }
     }
 
     /** Create a bookmark, or update its title when the URL is already saved. */
     @Synchronized
     fun addBookmark(url: String, title: String): Bookmark? {
-        val normalized = url.trim()
+        val normalized = BrowserUrlNormalizer.normalize(url)
         if (normalized.isEmpty()) return null
         val existingIndex = bookmarks.indexOfFirst { it.url == normalized }
         if (existingIndex >= 0) {
@@ -181,13 +187,14 @@ class BrowserHistoryStore internal constructor(private val context: Context) {
     /** Add when absent, remove when present; returns the new bookmarked state. */
     @Synchronized
     fun toggleBookmark(url: String, title: String): Boolean {
-        val existing = bookmarks.firstOrNull { it.url == url }
+        val normalized = BrowserUrlNormalizer.normalize(url)
+        val existing = bookmarks.firstOrNull { it.url == normalized }
         return if (existing != null) {
             bookmarks.remove(existing)
             save()
             false
         } else {
-            addBookmark(url, title) != null
+            addBookmark(normalized, title) != null
         }
     }
 
@@ -197,7 +204,7 @@ class BrowserHistoryStore internal constructor(private val context: Context) {
         val index = bookmarks.indexOfFirst { it.id == id }
         if (index < 0) return null
         val current = bookmarks[index]
-        val nextUrl = url?.trim()?.takeIf { it.isNotEmpty() } ?: current.url
+        val nextUrl = url?.let(BrowserUrlNormalizer::normalize)?.takeIf { it.isNotEmpty() } ?: current.url
         val duplicate = bookmarks.any { it.id != id && it.url == nextUrl }
         if (duplicate) return null
         val updated = current.copy(
@@ -220,7 +227,8 @@ class BrowserHistoryStore internal constructor(private val context: Context) {
     /** Remove a bookmark by URL; useful for the toolbar toggle. */
     @Synchronized
     fun removeBookmarkForUrl(url: String): Boolean {
-        val removed = bookmarks.removeAll { it.url == url }
+        val normalized = BrowserUrlNormalizer.normalize(url)
+        val removed = bookmarks.removeAll { it.url == normalized }
         if (removed) save()
         return removed
     }
@@ -328,7 +336,8 @@ class BrowserHistoryStore internal constructor(private val context: Context) {
     private fun parseHistoryArray(array: JSONArray, target: MutableList<Entry>) {
         for (i in 0 until array.length()) {
             val obj = array.optJSONObject(i) ?: continue
-            val url = obj.optString("url", "")
+            val rawUrl = obj.optString("url", "")
+            val url = BrowserUrlNormalizer.normalize(rawUrl)
             if (url.isEmpty()) continue
             target.add(
                 Entry(
@@ -345,7 +354,8 @@ class BrowserHistoryStore internal constructor(private val context: Context) {
     private fun parseBookmarkArray(array: JSONArray, target: MutableList<Bookmark>) {
         for (i in 0 until array.length()) {
             val obj = array.optJSONObject(i) ?: continue
-            val url = obj.optString("url", "")
+            val rawUrl = obj.optString("url", "")
+            val url = BrowserUrlNormalizer.normalize(rawUrl)
             if (url.isEmpty()) continue
             target.add(
                 Bookmark(

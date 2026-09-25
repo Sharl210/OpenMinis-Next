@@ -57,7 +57,7 @@ enum class BrowserAction(val value: String) {
 
     companion object {
         private val map = entries.associateBy { it.value }
-        fun fromString(s: String): BrowserAction? = map[s]
+        fun fromString(s: String): BrowserAction? = map[s.trim().lowercase()]
 
         /** Actions that visually change the page and warrant an auto-snapshot. */
         val visualChangeActions: Set<BrowserAction> = setOf(

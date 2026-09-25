@@ -4789,7 +4789,7 @@ fun ChatScreen(
                         ) {
                             Icon(
                                 imageVector = Icons.Default.KeyboardArrowDown,
-                                contentDescription = "Scroll to next user message",
+                                contentDescription = stringResource(R.string.chat_scroll_to_next_user),
                                 modifier = Modifier.size(20.dp),
                             )
                         }
