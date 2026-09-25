@@ -45,29 +45,37 @@ class SessionTreeRuntimeTest {
         source.start("root-a")
         source.start("child-a")
         source.start("child-b")
+        source.addSubscription("child-a", "root-a", setOf(RuntimeEdgePermission.NOTIFY))
+        source.appendTranscript("root-a", "user", "inspect the child", createdAtMillis = 2_001L)
+        source.appendTranscript("child-a", "assistant", "child transcript body", metadata = "tool-result", createdAtMillis = 2_002L)
 
         val restored = RuntimeSessionTree(clock = { 3_000L })
         assertTrue(restored.restoreJson(source.toJson()))
         assertEquals(setOf("root-a", "root-b"), restored.aggregate().rootIds)
         assertEquals(listOf("child-a"), restored.descendants("root-a").map { it.id })
         assertEquals(listOf("child-b"), restored.descendants("root-b").map { it.id })
+        assertEquals(1, restored.topology().subscriptions.size)
+        assertEquals("child transcript body", restored.transcript("child-a").single().content)
+        assertTrue(restored.events().any { it.kind == "transcript_appended" })
 
         val text = String(restored.export("text").bytes, StandardCharsets.UTF_8)
         assertTrue(text.contains("root-a"))
         assertTrue(text.contains("root-b"))
-
         val zip = ZipInputStream(ByteArrayInputStream(restored.exportZip("json").bytes))
-        val entries = buildSet {
+        val entries = linkedMapOf<String, String>()
+        zip.use { input ->
             while (true) {
-                val entry = zip.nextEntry ?: break
-                add(entry.name)
+                val entry = input.nextEntry ?: break
+                entries[entry.name] = input.readBytes().toString(StandardCharsets.UTF_8)
             }
         }
-        assertTrue(entries.contains("session-tree.json"))
-        assertTrue(entries.contains("children/root-a/root-a/node.json"))
-        assertTrue(entries.contains("children/root-a/child-a/node.json"))
-        assertTrue(entries.contains("children/root-b/root-b/node.json"))
-        assertTrue(entries.contains("children/root-b/child-b/node.json"))
+        assertTrue(entries.keys.contains("session-tree.json"))
+        assertTrue(entries.keys.contains("root-a/node.json"))
+        assertTrue(entries.keys.contains("root-a/children/child-a/node.json"))
+        val childJson = JSONObject(entries.getValue("root-a/children/child-a/node.json"))
+        assertEquals("child transcript body", childJson.getJSONArray("transcript").getJSONObject(0).getString("content"))
+        assertTrue(childJson.getJSONArray("events").length() > 0)
+        assertTrue(childJson.getJSONArray("inbox").length() >= 0)
     }
 
     @Test
@@ -80,5 +88,28 @@ class SessionTreeRuntimeTest {
         assertTrue(restored.restoreJson(json))
         assertEquals(setOf("legacy-root"), restored.aggregate().rootIds)
         assertNotNull(restored.node("legacy-root"))
+    }
+    @Test
+    fun `send attaches authoritative sender and receiver snapshots with config revision`() {
+        val tree = RuntimeSessionTree(clock = { 5_000L })
+        val root = tree.createRoot("root", model, task = "supervise")
+        val child = tree.createChild(root.id, "child", model, task = "delegated task").getOrThrow()
+        tree.start(root.id); tree.start(child.id)
+        val first = tree.send(root.id, child.id, "inspect", RuntimeDelivery.QUEUE, taskIntent = "inspect tree")
+        assertTrue(first.accepted)
+        val firstJson = JSONObject(tree.toJson())
+        val firstEnvelope = firstJson.getJSONArray("inbox").getJSONObject(0)
+        assertEquals("root", firstEnvelope.getJSONObject("senderCapabilitySnapshot").getString("nodeId"))
+        assertEquals("child", firstEnvelope.getJSONObject("capabilitySnapshot").getString("nodeId"))
+        assertEquals("inspect tree", firstEnvelope.getString("taskIntent"))
+        val revision = tree.configurationRevision()
+        assertTrue(tree.updateConfig(maxDepth = 3, maxParallelSubagents = 7, leaseMillis = 99_000L))
+        assertTrue(tree.configurationRevision() > revision)
+        val second = tree.send(root.id, child.id, "inspect again", RuntimeDelivery.QUEUE)
+        assertTrue(second.accepted)
+        val inbox = JSONObject(tree.toJson()).getJSONArray("inbox")
+        assertEquals(tree.configurationRevision(), inbox.getJSONObject(1)
+            .getJSONObject("capabilitySnapshot").getLong("configRevision"))
+        assertEquals(3, inbox.getJSONObject(1).getJSONObject("capabilitySnapshot").getInt("maxDepth"))
     }
 }

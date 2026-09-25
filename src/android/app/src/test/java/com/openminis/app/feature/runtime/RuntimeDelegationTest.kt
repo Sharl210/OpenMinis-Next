@@ -54,6 +54,12 @@ class RuntimeDelegationTest {
         tree.start(childA.id)
         tree.start(childB.id)
 
+        val authorization = tree.addTeamPeerEdge(
+            childA.id,
+            childB.id,
+            setOf(RuntimeEdgePermission.SEND, RuntimeEdgePermission.STEER),
+        )
+        assertTrue(authorization.accepted)
         val peer = tree.send(childA.id, childB.id, "hello", RuntimeDelivery.TEAM_PEER)
         assertTrue(peer.accepted)
         assertEquals(RuntimeDelivery.TEAM_PEER, peer.effectiveDelivery)
@@ -66,6 +72,25 @@ class RuntimeDelegationTest {
         assertEquals("next", tree.claimNextTurn(childB.id)?.payload)
     }
 
+    @Test
+    fun `team peer authorization revocation is recorded and blocks future delivery`() {
+        val tree = RuntimeSessionTree(clock = { 20L })
+        val root = tree.createRoot("root", RuntimeModelSnapshot("p", "m"), DelegationMode.TEAM)
+        val a = tree.createChild(root.id, "a", RuntimeModelSnapshot("p", "a")).getOrThrow()
+        val b = tree.createChild(root.id, "b", RuntimeModelSnapshot("p", "b")).getOrThrow()
+        tree.start(root.id); tree.start(a.id); tree.start(b.id)
+        val edge = tree.addTeamPeerEdge(a.id, b.id)
+        assertTrue(edge.accepted)
+        assertTrue(tree.send(a.id, b.id, "before", RuntimeDelivery.TEAM_PEER).accepted)
+        assertTrue(tree.revokeTopologyEdge(edge.edgeId!!).accepted)
+        val blocked = tree.send(a.id, b.id, "after", RuntimeDelivery.TEAM_PEER)
+        assertFalse(blocked.accepted)
+        assertTrue(tree.receipts().any { !it.accepted && it.reason?.contains("not authorized") == true })
+        val restored = RuntimeSessionTree(clock = { 21L })
+        assertTrue(restored.restoreJson(tree.toJson()))
+        assertFalse(restored.topology().activeEdges.any { it.id == edge.edgeId })
+        assertTrue(restored.receipts().size >= 2)
+    }
     @Test
     fun `traditional mode rejects peer delivery`() {
         val tree = RuntimeSessionTree(clock = { 10L })
