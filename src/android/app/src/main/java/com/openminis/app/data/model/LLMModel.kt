@@ -37,6 +37,10 @@ data class LLMModel(
     // Mirrors iOS ModelModality flags. When null, treat as text-in/text-out only.
     val inputModalities: List<String>? = null,
     val outputModalities: List<String>? = null,
+    // models.dev `tool_call` is an explicit nullable declaration. Keep null as
+    // "unknown" so older/provider payloads remain permissive instead of being
+    // mistaken for a negative capability.
+    val supportsTools: Boolean? = null,
 ) {
     companion object {
         // Anthropic — mirrors iOS LLMTypes.swift allAnthropic.

@@ -1766,4 +1766,33 @@
     <string name="selection_copy_as_rich_text">Kopyahin bilang Rich Text</string>
     <string name="selection_copy_as_plain_text">Kopyahin bilang Plain Text</string>
     <string name="chat_input_placeholder_hint_5">Puwedeng ipadala o mag-bagong linya ang Enter</string>
+    <!-- Routing strategy labels and descriptions. -->
+    <string name="model_group_detail_no_fallback">Walang fallback</string>
+    <string name="model_group_detail_no_fallback_footer">Palaging gamitin ang napiling modelo. Huwag lumipat sa ibang miyembro.</string>
+    <string name="model_group_detail_fallback_footer">Subukan ang mga modelo ayon sa pagkakasunod at lumipat sa susunod kapag nabigo.</string>
+    <string name="model_group_detail_load_balance_footer">Ipamahagi ang mga session sa mga modelo ng grupo.</string>
+    <string name="model_group_detail_no_models">Walang modelo sa grupong ito.</string>
+    <string name="model_group_strategy_no_fallback_short">WALA</string>
+    <string name="model_group_strategy_fallback_short">FB</string>
+    <string name="model_group_strategy_load_balance_short">LB</string>
+    <string name="settings_round_injection">Round injection</string>
+    <string name="settings_round_injection_subtitle">Magdagdag ng prompt sa bawat pangunahing session at sub-agent</string>
+    <string name="round_injection_title">Round injection</string>
+    <string name="round_injection_section_general">Pangkalahatan</string>
+    <string name="round_injection_footer">Nalalapat sa lahat ng OpenMinis session, kasama ang mga nested sub-agent.</string>
+    <string name="round_injection_enabled">Naka-enable</string>
+    <string name="round_injection_enabled_description">Ilapat ang round injection sa lahat ng session</string>
+    <string name="round_injection_section_start">Sa simula ng session</string>
+    <string name="round_injection_start_enabled">Mag-inject sa simula</string>
+    <string name="round_injection_start_enabled_description">Idagdag ang start prompt bago ang unang model call.</string>
+    <string name="round_injection_start_prompt">Start prompt</string>
+    <string name="round_injection_start_prompt_placeholder">Prompt na idaragdag sa simula ng session</string>
+    <string name="round_injection_section_periodic">Periodic injection</string>
+    <string name="round_injection_periodic_enabled">Mag-inject nang pana-panahon</string>
+    <string name="round_injection_periodic_enabled_description">Idagdag ang prompt na ito pagkatapos ng nakatakdang bilang ng model calls.</string>
+    <string name="round_injection_periodic_prompt">Periodic prompt</string>
+    <string name="round_injection_periodic_prompt_placeholder">Prompt na idaragdag nang pana-panahon</string>
+    <string name="round_injection_interval">Trigger interval</string>
+    <string name="round_injection_interval_description">Bilang ng model calls sa pagitan ng periodic injection</string>
+    <string name="round_injection_interval_suffix">calls</string>
 </resources>

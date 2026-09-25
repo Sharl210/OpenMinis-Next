@@ -191,10 +191,19 @@ fun ModelGroupDetailScreen(
                 SettingsSection(
                     header = stringResource(R.string.model_group_detail_routing_strategy),
                     footer = when (strategy) {
-                        RoutingStrategy.fallback -> "Try models in order. If one fails, advance to the next."
-                        RoutingStrategy.loadBalance -> "Distribute sessions across models in the group."
+                        RoutingStrategy.none -> stringResource(R.string.model_group_detail_no_fallback_footer)
+                        RoutingStrategy.fallback -> stringResource(R.string.model_group_detail_fallback_footer)
+                        RoutingStrategy.loadBalance -> stringResource(R.string.model_group_detail_load_balance_footer)
                     },
                 ) {
+                    SettingsChoiceRow(
+                        title = stringResource(R.string.model_group_detail_no_fallback),
+                        selected = strategy == RoutingStrategy.none,
+                        onSelect = {
+                            strategy = RoutingStrategy.none
+                            providerRepository.updateGroup(group.copy(strategy = RoutingStrategy.none))
+                        },
+                    )
                     SettingsChoiceRow(
                         title = stringResource(R.string.model_group_detail_fallback),
                         selected = strategy == RoutingStrategy.fallback,
@@ -266,7 +275,7 @@ fun ModelGroupDetailScreen(
                             .padding(horizontal = 16.dp),
                     ) {
                         Text(
-                            "No models in this group.",
+                            stringResource(R.string.model_group_detail_no_models),
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier.padding(vertical = 12.dp),

@@ -592,6 +592,7 @@ internal object ProviderMutationMethods {
     }
 
     private fun parseStrategy(s: String): RoutingStrategy = when (s) {
+        "none", "noFallback", "no_fallback" -> RoutingStrategy.none
         "loadBalance" -> RoutingStrategy.loadBalance
         else -> RoutingStrategy.fallback
     }

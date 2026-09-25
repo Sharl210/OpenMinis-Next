@@ -1776,4 +1776,33 @@
     <string name="chat_input_placeholder_hint_5">Minis может назначить клавише ↩︎ отправку или перенос строки</string>
     <string name="compact_progress">Сжатие… прошло %1$d с</string>
     <string name="compact_progress_split">Сжатие… %1$d с · сводка по частям (%2$d/%3$d)</string>
+    <!-- Routing strategy labels and descriptions. -->
+    <string name="model_group_detail_no_fallback">Без резервного перехода</string>
+    <string name="model_group_detail_no_fallback_footer">Всегда использовать выбранную модель. Не переключаться на другого участника.</string>
+    <string name="model_group_detail_fallback_footer">Пробовать модели по порядку и переходить к следующей при сбое.</string>
+    <string name="model_group_detail_load_balance_footer">Распределять сеансы между моделями группы.</string>
+    <string name="model_group_detail_no_models">В этой группе нет моделей.</string>
+    <string name="model_group_strategy_no_fallback_short">НЕТ</string>
+    <string name="model_group_strategy_fallback_short">РЕЗ</string>
+    <string name="model_group_strategy_load_balance_short">БАЛ</string>
+    <string name="settings_round_injection">Инъекция по раундам</string>
+    <string name="settings_round_injection_subtitle">Добавлять промпты в основные сессии и сессии субагентов</string>
+    <string name="round_injection_title">Инъекция по раундам</string>
+    <string name="round_injection_section_general">Общие</string>
+    <string name="round_injection_footer">Применяется ко всем сессиям OpenMinis, включая вложенных субагентов.</string>
+    <string name="round_injection_enabled">Включено</string>
+    <string name="round_injection_enabled_description">Применять инъекцию ко всем сессиям</string>
+    <string name="round_injection_section_start">В начале сессии</string>
+    <string name="round_injection_start_enabled">Вставлять при старте</string>
+    <string name="round_injection_start_enabled_description">Добавлять стартовый промпт перед первым вызовом модели.</string>
+    <string name="round_injection_start_prompt">Стартовый промпт</string>
+    <string name="round_injection_start_prompt_placeholder">Промпт для добавления в начале сессии</string>
+    <string name="round_injection_section_periodic">Периодическая инъекция</string>
+    <string name="round_injection_periodic_enabled">Вставлять периодически</string>
+    <string name="round_injection_periodic_enabled_description">Добавлять этот промпт после заданного числа вызовов модели.</string>
+    <string name="round_injection_periodic_prompt">Периодический промпт</string>
+    <string name="round_injection_periodic_prompt_placeholder">Промпт для периодического добавления</string>
+    <string name="round_injection_interval">Интервал срабатывания</string>
+    <string name="round_injection_interval_description">Число вызовов модели между периодическими инъекциями</string>
+    <string name="round_injection_interval_suffix">вызовов</string>
 </resources>

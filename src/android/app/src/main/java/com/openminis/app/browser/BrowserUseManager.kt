@@ -675,8 +675,19 @@ class BrowserUseManager(
                 input.scrollCount, input.itemSelector, input.keywords,
             )
             BrowserAction.WAIT_FOR_DOM_STABLE -> return waitForDomStable(input.timeoutMs)
-            BrowserAction.NEW_TAB, BrowserAction.CLOSE_TAB, BrowserAction.LIST_TABS ->
-                return BrowserActionResult.error("Tab management actions must be routed through BrowserTabPool")
+                         BrowserAction.NEW_TAB, BrowserAction.CLOSE_TAB, BrowserAction.LIST_TABS,
+             BrowserAction.GET_HISTORY,
+             BrowserAction.LIST_BOOKMARKS, BrowserAction.GET_BOOKMARKS, BrowserAction.GET_FAVORITES,
+             BrowserAction.ADD_BOOKMARK, BrowserAction.BOOKMARK, BrowserAction.ADD_FAVORITE,
+             BrowserAction.REMOVE_BOOKMARK, BrowserAction.UNBOOKMARK,
+             BrowserAction.REMOVE_FAVORITE, BrowserAction.UNFAVORITE,
+             BrowserAction.DELETE_HISTORY, BrowserAction.CLEAR_HISTORY,
+             BrowserAction.DELETE_BOOKMARK, BrowserAction.CLEAR_BOOKMARKS,
+             BrowserAction.DELETE_FAVORITE, BrowserAction.CLEAR_FAVORITES,
+             BrowserAction.OPEN_BOOKMARK, BrowserAction.OPEN_FAVORITE ->
+                 return BrowserActionResult.error("Library and tab management actions must be routed through BrowserTabPool")
+
+
         }
 
         // Auto-capture screenshot after visual-change actions

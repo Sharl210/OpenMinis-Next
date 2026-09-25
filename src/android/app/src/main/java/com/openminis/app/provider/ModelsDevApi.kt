@@ -147,6 +147,7 @@ object ModelsDevApi {
             interleavedReasoningField = devModel.interleavedField ?: model.interleavedReasoningField,
             inputModalities = devModel.inputModalities ?: model.inputModalities,
             outputModalities = devModel.outputModalities ?: model.outputModalities,
+            supportsTools = devModel.toolCall ?: model.supportsTools,
             reasoningEffortValues = devModel.reasoningEffortValues ?: model.reasoningEffortValues,
             // [OpenMinis#163] Only carry the AFFIRMATIVE answer forward, so
             // enriching against an entry the catalog is silent about cannot
@@ -171,6 +172,7 @@ object ModelsDevApi {
                 interleavedReasoningField = model.interleavedField,
                 inputModalities = model.inputModalities,
                 outputModalities = model.outputModalities,
+                supportsTools = model.toolCall,
                 reasoningEffortValues = model.reasoningEffortValues,
                 // [OpenMinis#163] null (not false) when the catalog is silent,
                 // so "unknown" stays distinguishable from "declared none".
@@ -343,6 +345,13 @@ object ModelsDevApi {
         // Parse reasoning
         val reasoning = if (obj.has("reasoning")) obj.optBoolean("reasoning") else null
 
+        // Parse tool-call support. `tool_call` is nullable by contract: absent
+        // or explicit JSON null means unknown, while false is a real negative.
+        val toolCall = when (val raw = obj.opt("tool_call")) {
+            is Boolean -> raw
+            else -> null
+        }
+
         // Parse interleaved (can be bool or object {"field": "reasoning_content"})
         var interleavedField: String? = null
         if (obj.has("interleaved")) {
@@ -407,6 +416,7 @@ object ModelsDevApi {
             contextWindow = contextWindow,
             maxOutputTokens = maxOutputTokens,
             reasoning = reasoning,
+            toolCall = toolCall,
             interleavedField = interleavedField,
             inputModalities = inputModalities,
             outputModalities = outputModalities,
@@ -480,6 +490,9 @@ object ModelsDevApi {
         val contextWindow: Int?,
         val maxOutputTokens: Int?,
         val reasoning: Boolean?,
+        // models.dev `tool_call`: null = unknown, false = explicitly unsupported,
+        // true = explicitly supported.
+        val toolCall: Boolean? = null,
         val interleavedField: String?,
         // modalities.input / modalities.output from models.dev (e.g. ["text","image"]).
         val inputModalities: List<String>?,

@@ -1764,4 +1764,33 @@
     <string name="chat_input_placeholder_hint_5">Minis 可以把 ↩︎ 鍵設為傳送或換行</string>
     <string name="compact_progress">正在壓縮… 已進行 %1$d 秒</string>
     <string name="compact_progress_split">正在壓縮… %1$d 秒 · 分段摘要中（%2$d/%3$d）</string>
+    <!-- Routing strategy labels and descriptions. -->
+    <string name="model_group_detail_no_fallback">不回退</string>
+    <string name="model_group_detail_no_fallback_footer">始終使用選取的模型，不輪換也不切換到其他成員。</string>
+    <string name="model_group_detail_fallback_footer">依序嘗試模型，失敗後切換到下一個。</string>
+    <string name="model_group_detail_load_balance_footer">在群組內的模型之間分配工作階段。</string>
+    <string name="model_group_detail_no_models">此群組目前沒有模型。</string>
+    <string name="model_group_strategy_no_fallback_short">無</string>
+    <string name="model_group_strategy_fallback_short">回退</string>
+    <string name="model_group_strategy_load_balance_short">均衡</string>
+    <string name="settings_round_injection">輪次注入</string>
+    <string name="settings_round_injection_subtitle">向所有主會話和子會話注入額外提示詞</string>
+    <string name="round_injection_title">輪次注入</string>
+    <string name="round_injection_section_general">一般</string>
+    <string name="round_injection_footer">向所有 OpenMinis 會話（包括多層子代理）注入提示詞。</string>
+    <string name="round_injection_enabled">啟用</string>
+    <string name="round_injection_enabled_description">對所有會話啟用輪次注入</string>
+    <string name="round_injection_section_start">會話開始時</string>
+    <string name="round_injection_start_enabled">開始時注入</string>
+    <string name="round_injection_start_enabled_description">在第一次模型呼叫前加入開始提示詞。</string>
+    <string name="round_injection_start_prompt">開始提示詞</string>
+    <string name="round_injection_start_prompt_placeholder">會話開始時要加入的提示詞</string>
+    <string name="round_injection_section_periodic">週期性注入</string>
+    <string name="round_injection_periodic_enabled">週期性注入</string>
+    <string name="round_injection_periodic_enabled_description">按設定的模型呼叫次數加入此提示詞。</string>
+    <string name="round_injection_periodic_prompt">週期提示詞</string>
+    <string name="round_injection_periodic_prompt_placeholder">週期性加入的提示詞</string>
+    <string name="round_injection_interval">觸發輪次</string>
+    <string name="round_injection_interval_description">週期注入之間的模型呼叫次數</string>
+    <string name="round_injection_interval_suffix">次</string>
 </resources>

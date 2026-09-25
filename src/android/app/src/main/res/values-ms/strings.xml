@@ -1766,4 +1766,33 @@
     <string name="selection_copy_as_rich_text">Salin sebagai Teks Berformat</string>
     <string name="selection_copy_as_plain_text">Salin sebagai Teks Biasa</string>
     <string name="chat_input_placeholder_hint_5">Kekunci Enter boleh hantar atau baris baharu</string>
+    <!-- Routing strategy labels and descriptions. -->
+    <string name="model_group_detail_no_fallback">Tiada sandaran</string>
+    <string name="model_group_detail_no_fallback_footer">Sentiasa gunakan model yang dipilih. Jangan beralih kepada ahli lain.</string>
+    <string name="model_group_detail_fallback_footer">Cuba model mengikut turutan dan beralih ke model seterusnya jika gagal.</string>
+    <string name="model_group_detail_load_balance_footer">Agihkan sesi antara model dalam kumpulan.</string>
+    <string name="model_group_detail_no_models">Tiada model dalam kumpulan ini.</string>
+    <string name="model_group_strategy_no_fallback_short">TIADA</string>
+    <string name="model_group_strategy_fallback_short">FB</string>
+    <string name="model_group_strategy_load_balance_short">LB</string>
+    <string name="settings_round_injection">Suntikan pusingan</string>
+    <string name="settings_round_injection_subtitle">Tambah gesaan pada setiap sesi utama dan sub-ejen</string>
+    <string name="round_injection_title">Suntikan pusingan</string>
+    <string name="round_injection_section_general">Umum</string>
+    <string name="round_injection_footer">Digunakan pada semua sesi OpenMinis termasuk sub-ejen bersarang.</string>
+    <string name="round_injection_enabled">Didayakan</string>
+    <string name="round_injection_enabled_description">Gunakan suntikan pusingan pada semua sesi</string>
+    <string name="round_injection_section_start">Pada permulaan sesi</string>
+    <string name="round_injection_start_enabled">Suntik semasa mula</string>
+    <string name="round_injection_start_enabled_description">Tambah gesaan mula sebelum panggilan model pertama.</string>
+    <string name="round_injection_start_prompt">Gesaan mula</string>
+    <string name="round_injection_start_prompt_placeholder">Gesaan yang ditambah pada permulaan sesi</string>
+    <string name="round_injection_section_periodic">Suntikan berkala</string>
+    <string name="round_injection_periodic_enabled">Suntik secara berkala</string>
+    <string name="round_injection_periodic_enabled_description">Tambah gesaan ini selepas bilangan panggilan model yang dikonfigurasi.</string>
+    <string name="round_injection_periodic_prompt">Gesaan berkala</string>
+    <string name="round_injection_periodic_prompt_placeholder">Gesaan yang ditambah secara berkala</string>
+    <string name="round_injection_interval">Selang pencetus</string>
+    <string name="round_injection_interval_description">Bilangan panggilan model antara suntikan berkala</string>
+    <string name="round_injection_interval_suffix">panggilan</string>
 </resources>

@@ -1766,4 +1766,33 @@
     <string name="selection_copy_as_rich_text">Zengin Metin Olarak Kopyala</string>
     <string name="selection_copy_as_plain_text">Düz Metin Olarak Kopyala</string>
     <string name="chat_input_placeholder_hint_5">Enter tuşu gönderebilir ya da satır ekler</string>
+    <!-- Routing strategy labels and descriptions. -->
+    <string name="model_group_detail_no_fallback">Yedekleme yok</string>
+    <string name="model_group_detail_no_fallback_footer">Her zaman seçilen modeli kullan. Başka bir üyeye geçme.</string>
+    <string name="model_group_detail_fallback_footer">Modelleri sırayla dene; biri başarısız olursa sonrakine geç.</string>
+    <string name="model_group_detail_load_balance_footer">Oturumları gruptaki modellere dağıt.</string>
+    <string name="model_group_detail_no_models">Bu grupta model yok.</string>
+    <string name="model_group_strategy_no_fallback_short">YOK</string>
+    <string name="model_group_strategy_fallback_short">FB</string>
+    <string name="model_group_strategy_load_balance_short">LB</string>
+    <string name="settings_round_injection">Tur enjeksiyonu</string>
+    <string name="settings_round_injection_subtitle">Tüm ana ve alt aracı oturumlarına ek istemler ekleyin</string>
+    <string name="round_injection_title">Tur enjeksiyonu</string>
+    <string name="round_injection_section_general">Genel</string>
+    <string name="round_injection_footer">İç içe alt aracılar dahil tüm OpenMinis oturumlarına uygulanır.</string>
+    <string name="round_injection_enabled">Etkin</string>
+    <string name="round_injection_enabled_description">Tur enjeksiyonunu tüm oturumlara uygula</string>
+    <string name="round_injection_section_start">Oturum başlangıcında</string>
+    <string name="round_injection_start_enabled">Başlangıçta enjekte et</string>
+    <string name="round_injection_start_enabled_description">İlk model çağrısından önce başlangıç istemini ekler.</string>
+    <string name="round_injection_start_prompt">Başlangıç istemi</string>
+    <string name="round_injection_start_prompt_placeholder">Oturum başlangıcında eklenecek istem</string>
+    <string name="round_injection_section_periodic">Periyodik enjeksiyon</string>
+    <string name="round_injection_periodic_enabled">Periyodik olarak enjekte et</string>
+    <string name="round_injection_periodic_enabled_description">Bu istemi yapılandırılan model çağrısı sayısından sonra ekler.</string>
+    <string name="round_injection_periodic_prompt">Periyodik istem</string>
+    <string name="round_injection_periodic_prompt_placeholder">Periyodik olarak eklenecek istem</string>
+    <string name="round_injection_interval">Tetikleme aralığı</string>
+    <string name="round_injection_interval_description">Periyodik enjeksiyonlar arasındaki model çağrısı sayısı</string>
+    <string name="round_injection_interval_suffix">çağrı</string>
 </resources>

@@ -163,21 +163,18 @@ class AgentForegroundService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // [T-STALL-DIAG] Revival probe. `intent == null` means the SYSTEM
-        // re-created this service under START_STICKY after the process died —
-        // the suspected "dirty shell" path behind "killing the app doesn't
-        // help". Log the call ordinal, whether this is a revival, and the
-        // in-memory tracker state, which is what a revived process CANNOT have
-        // restored (SessionActivityTracker is a plain object + StateFlow).
-        //
-        // Reading `activeSessions` empty on a revival is the smoking gun: the
-        // service is being kept alive for streams that no longer exist.
+        // Runtime work is the source of truth. A sticky revival with no restored
+        // runtime activity is stale and must not leave a permanent RUNNING row.
         val call = onStartCommandCalls.incrementAndGet()
+        val runtimeAtStart = SessionActivityTracker.runtimeActivity.value
         val active = SessionActivityTracker.activeSessions.value
         println(
             "[T-STALL-DIAG] FGS onStartCommand#$call pid=${android.os.Process.myPid()} " +
                 "revival=${intent == null} flags=$flags startId=$startId " +
                 "activeSessions=${active.size}[${active.joinToString(",")}] " +
+                "runtimeSessions=${runtimeAtStart.runtimeSessionCount} " +
+                "runtimeActive=${runtimeAtStart.hasRuntimeActivity} " +
+                "waiting=${runtimeAtStart.waitingForChildren} " +
                 "processAliveMs=${android.os.SystemClock.elapsedRealtime() - processStartElapsedMs} " +
                 "slots=${SessionConcurrencyManager.diagSnapshot()}",
         )
@@ -227,8 +224,9 @@ class AgentForegroundService : Service() {
             return START_NOT_STICKY
         }
 
-        val sessionCount = intent?.getIntExtra(EXTRA_SESSION_COUNT, 0) ?: 0
-        val toolStatus = intent?.getStringExtra(EXTRA_TOOL_STATUS) ?: "Idle"
+        val sessionCount = SessionActivityTracker.runtimeActivity.value.runtimeSessionCount
+        val toolStatus = SessionActivityTracker.runtimeActivity.value.waitingText
+            ?: SessionActivityTracker.currentToolStatus.value
 
         val notification = buildNotification(sessionCount, toolStatus)
 
@@ -263,11 +261,15 @@ class AgentForegroundService : Service() {
         // [T-STALL-DIAG] Record the FULL keep-alive decision. The branch taken
         // here decides whether a swipe-away leaves a service behind that the
         // system will later revive with START_STICKY.
+        val activityAtRemoval = SessionActivityTracker.runtimeActivity.value
         val activeAtRemoval = SessionActivityTracker.activeSessions.value
         println(
             "[T-STALL-DIAG] FGS onTaskRemoved pid=${android.os.Process.myPid()} " +
+                "activeRoots=${activityAtRemoval.activeRootSessions.size} " +
+                "runtimeSessions=${activityAtRemoval.runtimeSessionCount} " +
                 "activeSessions=${activeAtRemoval.size}[${activeAtRemoval.joinToString(",")}] " +
-                "decision=${if (activeAtRemoval.isEmpty()) "stopSelf" else "KEEP-ALIVE"} " +
+                "waiting=${activityAtRemoval.waitingForChildren} " +
+                "decision=${if (activityAtRemoval.hasRuntimeActivity) "KEEP-ALIVE" else "stopSelf"} " +
                 "slots=${SessionConcurrencyManager.diagSnapshot()}",
         )
         // T166: swiping from recents kills the Activity but the FG
@@ -276,19 +278,21 @@ class AgentForegroundService : Service() {
         // longer a reason to keep alive — they explicitly dismissed
         // the app, so clear presence here and re-evaluate.
         SessionActivityTracker.clearPresence()
-        if (SessionActivityTracker.activeSessions.value.isEmpty()) {
-            Log.d(TAG, "onTaskRemoved with no active sessions, stopping self")
+        if (!SessionActivityTracker.runtimeActivity.value.hasRuntimeActivity) {
+            Log.d(TAG, "onTaskRemoved with no runtime activity, stopping self")
             stopSelf()
             return
         }
-        Log.d(TAG, "onTaskRemoved with ${SessionActivityTracker.activeSessions.value.size} active session(s) — keeping service alive")
+        val runtimeCount = SessionActivityTracker.runtimeActivity.value.runtimeSessionCount
+        Log.d(TAG, "onTaskRemoved with $runtimeCount runtime session(s) — keeping service alive")
         // Re-issue the foreground notification with current state so the
         // OS sees us as a "live" foreground service after the task tear-
         // down. Without this, OEM ROMs sometimes downgrade us to a plain
         // background service and reclaim within ~60 s.
+        val runtimeSnapshot = SessionActivityTracker.runtimeActivity.value
         val notification = buildNotification(
-            SessionActivityTracker.activeSessions.value.size,
-            SessionActivityTracker.currentToolStatus.value,
+            runtimeSnapshot.runtimeSessionCount,
+            runtimeSnapshot.waitingText ?: SessionActivityTracker.currentToolStatus.value,
         )
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(
@@ -369,14 +373,13 @@ class AgentForegroundService : Service() {
                 SessionActivityTracker.lastToolName,
                 SessionActivityTracker.lastToolTitle,
                 SessionActivityTracker.lastToolStatus,
-                SessionActivityTracker.activeSessions,
+                SessionActivityTracker.runtimeActivity,
                 // [T-android-dynamic-island] Reactive dynamic-island toggle —
                 // flipping it must appear/hide the overlay live (mutual
                 // exclusion) without an app restart.
                 backgroundRepo.dynamicIslandEnabled,
             ) { values: Array<Any?> ->
-                @Suppress("UNCHECKED_CAST")
-                val activeSessions = values[13] as Set<String>
+                val runtimeActivity = values[13] as SessionActivityTracker.RuntimeActivitySnapshot
                 OverlayState(
                     isForeground = values[0] as Boolean,
                     toolName = values[1] as String?,
@@ -391,7 +394,7 @@ class AgentForegroundService : Service() {
                     lastToolName = values[10] as String?,
                     lastToolTitle = values[11] as String?,
                     lastToolStatus = values[12] as String?,
-                    hasActiveStream = activeSessions.isNotEmpty(),
+                    hasActiveStream = runtimeActivity.hasRuntimeActivity,
                     dynamicIslandEnabled = values[14] as Boolean,
                 )
             }.distinctUntilChanged().collect { state -> applyOverlayState(state) }
@@ -452,7 +455,7 @@ class AgentForegroundService : Service() {
             // it). Only when we're actually foregrounded as a service — a bare
             // notify() here would post a non-FGS notification. Guard on active
             // sessions since that's when the FG service is alive.
-            if (SessionActivityTracker.activeSessions.value.isNotEmpty()) {
+            if (SessionActivityTracker.runtimeActivity.value.hasRuntimeActivity) {
                 refreshOngoingNotification()
             }
             Log.d(
@@ -587,9 +590,10 @@ class AgentForegroundService : Service() {
      */
     private fun refreshOngoingNotification() {
         try {
+            val runtime = SessionActivityTracker.runtimeActivity.value
             val notification = buildNotification(
-                SessionActivityTracker.activeSessions.value.size,
-                SessionActivityTracker.currentToolStatus.value,
+                runtime.runtimeSessionCount,
+                runtime.waitingText ?: SessionActivityTracker.currentToolStatus.value,
             )
             getSystemService(NotificationManager::class.java)
                 ?.notify(NOTIFICATION_ID, notification)
@@ -715,7 +719,8 @@ class AgentForegroundService : Service() {
         // uptime forever — the reported bug was a completed task whose dynamic
         // island kept ticking as though it were still running.
         val finishedAtMs = SessionActivityTracker.lastTaskFinishedAtMs.value
-        val isCompleted = finishedAtMs != null && SessionActivityTracker.activeSessions.value.isEmpty()
+        val isCompleted = finishedAtMs != null &&
+            !SessionActivityTracker.runtimeActivity.value.hasRuntimeActivity
         val endMs = if (isCompleted) finishedAtMs!! else SystemClock.elapsedRealtime()
         // Anchor to the current run's start, not the service's. The service is
         // created once per presence window and outlives individual tasks, so

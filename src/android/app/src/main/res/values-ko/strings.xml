@@ -1765,4 +1765,33 @@
     <string name="chat_input_placeholder_hint_5">Minis에서 ↩︎ 키를 전송 또는 줄바꿈으로 바꿀 수 있습니다</string>
     <string name="compact_progress">압축 중… %1$d초 경과</string>
     <string name="compact_progress_split">압축 중… %1$d초 · 분할 요약 중(%2$d/%3$d)</string>
+    <!-- Routing strategy labels and descriptions. -->
+    <string name="model_group_detail_no_fallback">대체 없음</string>
+    <string name="model_group_detail_no_fallback_footer">선택한 모델만 사용하며 다른 구성원으로 전환하거나 장애 조치를 하지 않습니다.</string>
+    <string name="model_group_detail_fallback_footer">모델을 순서대로 시도하고 실패하면 다음 모델로 전환합니다.</string>
+    <string name="model_group_detail_load_balance_footer">그룹의 모델 간에 세션을 분산합니다.</string>
+    <string name="model_group_detail_no_models">이 그룹에 모델이 없습니다.</string>
+    <string name="model_group_strategy_no_fallback_short">없음</string>
+    <string name="model_group_strategy_fallback_short">FB</string>
+    <string name="model_group_strategy_load_balance_short">LB</string>
+    <string name="settings_round_injection">라운드 주입</string>
+    <string name="settings_round_injection_subtitle">모든 기본 세션과 하위 에이전트 세션에 추가 프롬프트 주입</string>
+    <string name="round_injection_title">라운드 주입</string>
+    <string name="round_injection_section_general">일반</string>
+    <string name="round_injection_footer">중첩된 하위 에이전트를 포함한 모든 OpenMinis 세션에 적용됩니다.</string>
+    <string name="round_injection_enabled">사용</string>
+    <string name="round_injection_enabled_description">모든 세션에 라운드 주입 적용</string>
+    <string name="round_injection_section_start">세션 시작 시</string>
+    <string name="round_injection_start_enabled">시작 시 주입</string>
+    <string name="round_injection_start_enabled_description">첫 번째 모델 호출 전에 시작 프롬프트를 추가합니다.</string>
+    <string name="round_injection_start_prompt">시작 프롬프트</string>
+    <string name="round_injection_start_prompt_placeholder">세션 시작 시 추가할 프롬프트</string>
+    <string name="round_injection_section_periodic">주기적 주입</string>
+    <string name="round_injection_periodic_enabled">주기적으로 주입</string>
+    <string name="round_injection_periodic_enabled_description">설정한 모델 호출 횟수마다 이 프롬프트를 추가합니다.</string>
+    <string name="round_injection_periodic_prompt">주기 프롬프트</string>
+    <string name="round_injection_periodic_prompt_placeholder">주기적으로 추가할 프롬프트</string>
+    <string name="round_injection_interval">트리거 간격</string>
+    <string name="round_injection_interval_description">주기적 주입 사이의 모델 호출 횟수</string>
+    <string name="round_injection_interval_suffix">회</string>
 </resources>

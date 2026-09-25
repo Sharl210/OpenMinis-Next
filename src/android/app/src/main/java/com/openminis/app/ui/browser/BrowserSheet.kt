@@ -33,6 +33,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Bookmark
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Computer
 import androidx.compose.material.icons.filled.Download
@@ -41,6 +42,8 @@ import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.filled.PhoneAndroid
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Star
+import androidx.compose.material.icons.filled.StarBorder
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
@@ -107,8 +110,20 @@ fun BrowserSheet(
     val userAgentProfile = tabPool.currentUserAgentProfile.collectAsState().value
 
     var urlInput by remember(currentURL) { mutableStateOf(currentURL) }
+    val historyStore = remember { BrowserHistoryStore.getInstance(context) }
     var showHistory by remember { mutableStateOf(false) }
+    var showBookmarks by remember { mutableStateOf(false) }
     var showSettings by remember { mutableStateOf(false) }
+    val isBookmarked = remember(currentURL) {
+        currentURL.isNotBlank() && currentURL != "about:blank" && historyStore.isBookmarked(currentURL)
+    }
+    var currentPageBookmarked by remember(currentURL) { mutableStateOf(isBookmarked) }
+    LaunchedEffect(currentURL, showHistory) {
+        if (!showHistory && currentURL.isNotBlank() && currentURL != "about:blank") {
+            currentPageBookmarked = historyStore.isBookmarked(currentURL)
+        }
+    }
+    val canBookmarkCurrentPage = currentURL.isNotBlank() && currentURL != "about:blank" && !isAgentBusy
     // [T-android-browser-download-ux] Downloads panel + badge state.
     var showDownloads by remember { mutableStateOf(false) }
     val downloadEntries by tabPool.downloads.collectAsState()
@@ -167,7 +182,7 @@ fun BrowserSheet(
             ) {
                 IconButton(
                     onClick = { scope.launch { tabPool.newTabFromUI() } },
-                    enabled = tabs.size < 3 && !isAgentBusy,
+                    enabled = tabs.size < BrowserTabPool.MAX_TABS && !isAgentBusy,
                     modifier = Modifier.size(36.dp),
                 ) {
                     Icon(Icons.Default.Add, contentDescription = stringResource(R.string.browser_new_tab), modifier = Modifier.size(20.dp))
@@ -198,7 +213,7 @@ fun BrowserSheet(
                     }
                     item {
                         Text(
-                            "${tabs.size}/3",
+                            "${tabs.size}/${BrowserTabPool.MAX_TABS}",
                             fontSize = 10.sp,
                             fontWeight = FontWeight.Medium,
                             fontFamily = FontFamily.Monospace,
@@ -207,12 +222,57 @@ fun BrowserSheet(
                         )
                     }
                 }
-                IconButton(
-                    onClick = { showHistory = true },
-                    enabled = !isAgentBusy,
-                    modifier = Modifier.size(36.dp),
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Icon(Icons.Default.History, contentDescription = stringResource(R.string.browser_history_action), modifier = Modifier.size(20.dp))
+                    IconButton(
+                        onClick = {
+                            showBookmarks = false
+                            showHistory = true
+                        },
+                        enabled = !isAgentBusy,
+                        modifier = Modifier.size(48.dp),
+                    ) {
+                        Icon(
+                            Icons.Default.History,
+                            contentDescription = stringResource(R.string.browser_history_action),
+                            modifier = Modifier.size(20.dp),
+                        )
+                    }
+                    IconButton(
+                        onClick = {
+                            if (canBookmarkCurrentPage) {
+                                currentPageBookmarked = historyStore.toggleBookmark(
+                                    currentURL,
+                                    pageTitle,
+                                )
+                            }
+                        },
+                        enabled = canBookmarkCurrentPage,
+                        modifier = Modifier.size(48.dp),
+                    ) {
+                        Icon(
+                            if (currentPageBookmarked) Icons.Default.Star else Icons.Default.StarBorder,
+                            contentDescription = stringResource(R.string.browser_bookmark_toggle),
+                            modifier = Modifier.size(20.dp),
+                            tint = if (currentPageBookmarked) Color(0xFFFFC107)
+                            else MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    IconButton(
+                        onClick = {
+                            showHistory = true
+                            showBookmarks = true
+                        },
+                        enabled = !isAgentBusy,
+                        modifier = Modifier.size(48.dp),
+                    ) {
+                        Icon(
+                            Icons.Default.Bookmark,
+                            contentDescription = stringResource(R.string.browser_bookmarks_title),
+                            modifier = Modifier.size(20.dp),
+                        )
+                    }
                 }
             }
 
@@ -450,7 +510,8 @@ fun BrowserSheet(
 
     if (showHistory) {
         BrowserHistorySheet(
-            historyStore = BrowserHistoryStore.getInstance(context),
+            historyStore = historyStore,
+            initialBookmarks = showBookmarks,
             // [T-android-browser-history-no-tab] C1: with no tabs open,
             // selectedTab is null and the old safe-call silently dropped the
             // navigation. Create a tab first (same path as the "+" button);

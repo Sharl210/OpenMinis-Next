@@ -1766,4 +1766,33 @@
     <string name="selection_copy_as_rich_text">คัดลอกเป็นข้อความจัดรูปแบบ</string>
     <string name="selection_copy_as_plain_text">คัดลอกเป็นข้อความธรรมดา</string>
     <string name="chat_input_placeholder_hint_5">ตั้งปุ่ม Enter ให้ส่งหรือขึ้นบรรทัดใหม่ได้</string>
+    <!-- Routing strategy labels and descriptions. -->
+    <string name="model_group_detail_no_fallback">ไม่สำรอง</string>
+    <string name="model_group_detail_no_fallback_footer">ใช้โมเดลที่เลือกเสมอ และจะไม่สลับไปยังสมาชิกอื่น</string>
+    <string name="model_group_detail_fallback_footer">ลองใช้โมเดลตามลำดับ หากล้มเหลวให้ไปยังโมเดลถัดไป</string>
+    <string name="model_group_detail_load_balance_footer">กระจายเซสชันไปยังโมเดลในกลุ่ม</string>
+    <string name="model_group_detail_no_models">กลุ่มนี้ยังไม่มีโมเดล</string>
+    <string name="model_group_strategy_no_fallback_short">ปิด</string>
+    <string name="model_group_strategy_fallback_short">FB</string>
+    <string name="model_group_strategy_load_balance_short">LB</string>
+    <string name="settings_round_injection">การแทรกตามรอบ</string>
+    <string name="settings_round_injection_subtitle">เพิ่มพรอมต์ในทุกเซสชันหลักและเซสชันซับเอเจนต์</string>
+    <string name="round_injection_title">การแทรกตามรอบ</string>
+    <string name="round_injection_section_general">ทั่วไป</string>
+    <string name="round_injection_footer">ใช้กับทุกเซสชันของ OpenMinis รวมถึงซับเอเจนต์ที่ซ้อนกัน</string>
+    <string name="round_injection_enabled">เปิดใช้งาน</string>
+    <string name="round_injection_enabled_description">ใช้การแทรกตามรอบกับทุกเซสชัน</string>
+    <string name="round_injection_section_start">เมื่อเริ่มเซสชัน</string>
+    <string name="round_injection_start_enabled">แทรกเมื่อเริ่ม</string>
+    <string name="round_injection_start_enabled_description">เพิ่มพรอมต์เริ่มต้นก่อนเรียกโมเดลครั้งแรก</string>
+    <string name="round_injection_start_prompt">พรอมต์เริ่มต้น</string>
+    <string name="round_injection_start_prompt_placeholder">พรอมต์ที่จะเพิ่มเมื่อเริ่มเซสชัน</string>
+    <string name="round_injection_section_periodic">การแทรกเป็นระยะ</string>
+    <string name="round_injection_periodic_enabled">แทรกเป็นระยะ</string>
+    <string name="round_injection_periodic_enabled_description">เพิ่มพรอมต์นี้หลังจำนวนครั้งที่เรียกโมเดลตามที่ตั้งไว้</string>
+    <string name="round_injection_periodic_prompt">พรอมต์เป็นระยะ</string>
+    <string name="round_injection_periodic_prompt_placeholder">พรอมต์ที่จะเพิ่มเป็นระยะ</string>
+    <string name="round_injection_interval">ช่วงทริกเกอร์</string>
+    <string name="round_injection_interval_description">จำนวนครั้งที่เรียกโมเดลระหว่างการแทรกแต่ละครั้ง</string>
+    <string name="round_injection_interval_suffix">ครั้ง</string>
 </resources>

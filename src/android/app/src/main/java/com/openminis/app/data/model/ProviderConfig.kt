@@ -145,6 +145,8 @@ enum class ThinkingLevel {
 
 @Serializable
 enum class RoutingStrategy {
+    /** Never rotate or fail over away from the selected member. */
+    none,
     fallback,
     loadBalance,
 }
@@ -340,6 +342,9 @@ data class ModelOverrides(
     // user explicitly flipped this dimension; null means "inherit baseModel".
     val inputModalities: List<String>? = null,
     val outputModalities: List<String>? = null,
+    // User override for whether this model may use tools. null = inherit the
+    // provider/catalog declaration (or the permissive unknown default).
+    val supportsTools: Boolean? = null,
     // [T-android-thinking-level-arch] User-set ceiling for this model's thinking
     // intensity. Highest-priority source in the resolution chain (overrides the
     // built-in ThinkingLevelCatalog rule). null = inherit the catalog default.
@@ -355,6 +360,7 @@ data class ModelOverrides(
             && supportsReasoning == null
             && inputModalities == null
             && outputModalities == null
+            && supportsTools == null
             && maxThinkingLevel == null
 }
 
@@ -383,6 +389,7 @@ data class ModelEntry(
             supportsReasoning = overrides.supportsReasoning ?: baseModel.supportsReasoning,
             inputModalities = overrides.inputModalities ?: baseModel.inputModalities,
             outputModalities = overrides.outputModalities ?: baseModel.outputModalities,
+            supportsTools = overrides.supportsTools ?: baseModel.supportsTools,
         )
 
     /** True when this entry carries user intent beyond API-reported defaults. */

@@ -1768,4 +1768,33 @@
     <string name="chat_input_placeholder_hint_5">Minis peut régler la touche ↩︎ sur envoyer ou saut de ligne</string>
     <string name="compact_progress">Compactage… %1$d s écoulées</string>
     <string name="compact_progress_split">Compactage… %1$d s · résumé par segments (%2$d/%3$d)</string>
+    <!-- Routing strategy labels and descriptions. -->
+    <string name="model_group_detail_no_fallback">Sans basculement</string>
+    <string name="model_group_detail_no_fallback_footer">Utiliser toujours le modèle sélectionné. Ne jamais basculer vers un autre membre.</string>
+    <string name="model_group_detail_fallback_footer">Essayer les modèles dans l’ordre et passer au suivant en cas d’échec.</string>
+    <string name="model_group_detail_load_balance_footer">Répartir les sessions entre les modèles du groupe.</string>
+    <string name="model_group_detail_no_models">Aucun modèle dans ce groupe.</string>
+    <string name="model_group_strategy_no_fallback_short">SANS</string>
+    <string name="model_group_strategy_fallback_short">FB</string>
+    <string name="model_group_strategy_load_balance_short">LB</string>
+    <string name="settings_round_injection">Injection par tours</string>
+    <string name="settings_round_injection_subtitle">Ajouter des prompts à chaque session principale et sous-agent</string>
+    <string name="round_injection_title">Injection par tours</string>
+    <string name="round_injection_section_general">Général</string>
+    <string name="round_injection_footer">S’applique à toutes les sessions OpenMinis, y compris les sous-agents imbriqués.</string>
+    <string name="round_injection_enabled">Activée</string>
+    <string name="round_injection_enabled_description">Appliquer l’injection à toutes les sessions</string>
+    <string name="round_injection_section_start">Au début de la session</string>
+    <string name="round_injection_start_enabled">Injecter au démarrage</string>
+    <string name="round_injection_start_enabled_description">Ajouter le prompt de début avant le premier appel au modèle.</string>
+    <string name="round_injection_start_prompt">Prompt de début</string>
+    <string name="round_injection_start_prompt_placeholder">Prompt à ajouter au début de la session</string>
+    <string name="round_injection_section_periodic">Injection périodique</string>
+    <string name="round_injection_periodic_enabled">Injecter périodiquement</string>
+    <string name="round_injection_periodic_enabled_description">Ajouter ce prompt après le nombre d’appels configuré.</string>
+    <string name="round_injection_periodic_prompt">Prompt périodique</string>
+    <string name="round_injection_periodic_prompt_placeholder">Prompt à ajouter périodiquement</string>
+    <string name="round_injection_interval">Intervalle de déclenchement</string>
+    <string name="round_injection_interval_description">Nombre d’appels du modèle entre deux injections</string>
+    <string name="round_injection_interval_suffix">appels</string>
 </resources>

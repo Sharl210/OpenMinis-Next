@@ -1771,4 +1771,33 @@
     <string name="selection_copy_as_rich_text">Salin sebagai Teks Berformat</string>
     <string name="selection_copy_as_plain_text">Salin sebagai Teks Biasa</string>
     <string name="chat_input_placeholder_hint_5">Tombol Enter bisa diatur: kirim atau baris baru</string>
+    <!-- Routing strategy labels and descriptions. -->
+    <string name="model_group_detail_no_fallback">Tanpa cadangan</string>
+    <string name="model_group_detail_no_fallback_footer">Selalu gunakan model yang dipilih. Jangan beralih ke anggota lain.</string>
+    <string name="model_group_detail_fallback_footer">Coba model secara berurutan dan beralih ke berikutnya jika gagal.</string>
+    <string name="model_group_detail_load_balance_footer">Bagikan sesi di antara model dalam grup.</string>
+    <string name="model_group_detail_no_models">Tidak ada model dalam grup ini.</string>
+    <string name="model_group_strategy_no_fallback_short">NON</string>
+    <string name="model_group_strategy_fallback_short">FB</string>
+    <string name="model_group_strategy_load_balance_short">LB</string>
+    <string name="settings_round_injection">Injeksi putaran</string>
+    <string name="settings_round_injection_subtitle">Tambahkan prompt ke setiap sesi utama dan sub-agen</string>
+    <string name="round_injection_title">Injeksi putaran</string>
+    <string name="round_injection_section_general">Umum</string>
+    <string name="round_injection_footer">Berlaku untuk semua sesi OpenMinis, termasuk sub-agen bertingkat.</string>
+    <string name="round_injection_enabled">Diaktifkan</string>
+    <string name="round_injection_enabled_description">Terapkan injeksi putaran ke semua sesi</string>
+    <string name="round_injection_section_start">Saat sesi dimulai</string>
+    <string name="round_injection_start_enabled">Injeksi saat mulai</string>
+    <string name="round_injection_start_enabled_description">Tambahkan prompt awal sebelum panggilan model pertama.</string>
+    <string name="round_injection_start_prompt">Prompt awal</string>
+    <string name="round_injection_start_prompt_placeholder">Prompt yang ditambahkan saat sesi dimulai</string>
+    <string name="round_injection_section_periodic">Injeksi berkala</string>
+    <string name="round_injection_periodic_enabled">Injeksi berkala</string>
+    <string name="round_injection_periodic_enabled_description">Tambahkan prompt ini setelah jumlah panggilan model yang dikonfigurasi.</string>
+    <string name="round_injection_periodic_prompt">Prompt berkala</string>
+    <string name="round_injection_periodic_prompt_placeholder">Prompt yang ditambahkan secara berkala</string>
+    <string name="round_injection_interval">Interval pemicu</string>
+    <string name="round_injection_interval_description">Jumlah panggilan model di antara injeksi berkala</string>
+    <string name="round_injection_interval_suffix">panggilan</string>
 </resources>

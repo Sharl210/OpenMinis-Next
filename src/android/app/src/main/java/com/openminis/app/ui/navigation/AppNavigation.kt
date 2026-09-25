@@ -12,6 +12,8 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -35,6 +37,12 @@ import com.openminis.app.ui.settings.AboutScreen
 import com.openminis.app.ui.settings.AddAgentLoopGroupsScreen
 import com.openminis.app.ui.settings.AddAgentLoopModelsScreen
 import com.openminis.app.ui.settings.AddCustomModelScreen
+import com.openminis.app.ui.settings.AgentBehaviorSettingsScreen
+import com.openminis.app.ui.settings.AgentBehaviorSettingsPrefs
+import com.openminis.app.ui.settings.AgentBehaviorSettings
+import com.openminis.app.feature.runtime.RoundInjectionSettings
+import com.openminis.app.feature.runtime.RoundInjectionSettingsPrefs
+import com.openminis.app.ui.settings.RoundInjectionSettingsScreen
 import com.openminis.app.ui.settings.BackgroundSettingsScreen
 import com.openminis.app.ui.settings.AddModelsToGroupScreen
 import com.openminis.app.ui.settings.ShadowVoiceDetailScreen
@@ -89,6 +97,8 @@ object Routes {
     const val SESSION_LIST = "sessions"
     const val CHAT = "chat/{sessionId}"
     const val SETTINGS = "settings"
+    const val AGENT_BEHAVIOR = "agent_behavior"
+    const val ROUND_INJECTION = "round_injection"
     const val PROVIDER_LIST = "providers"
     const val ADD_PROVIDER = "add_provider"
     const val PROVIDER_DETAIL = "provider/{instanceId}"
@@ -591,6 +601,8 @@ fun AppNavigation(
                 onSkillsClick = { navController.safeNavigate(Routes.SKILLS) },
                 onTerminalClick = { navController.safeNavigate(Routes.terminal()) },
                 onMemoryClick = { navController.safeNavigate(Routes.MEMORY) },
+                onAgentBehaviorClick = { navController.safeNavigate(Routes.AGENT_BEHAVIOR) },
+                onRoundInjectionClick = { navController.safeNavigate(Routes.ROUND_INJECTION) },
                 onMcpClick = { navController.safeNavigate(Routes.MCP) },
                 onSoulClick = { navController.safeNavigate(Routes.SOUL) },
                 onPermissionsClick = { navController.safeNavigate(Routes.PERMISSIONS) },
@@ -601,6 +613,21 @@ fun AppNavigation(
                 onAboutClick = { navController.safeNavigate(Routes.ABOUT) },
                 onMountedFoldersClick = { navController.safeNavigate(Routes.MOUNTED_FOLDERS) },
                 onSharedFoldersClick = { navController.safeNavigate(Routes.SHARED_FOLDERS) },
+            )
+        }
+
+        composable(Routes.ROUND_INJECTION) {
+            val context = LocalContext.current
+            val prefs = remember { RoundInjectionSettingsPrefs(context) }
+            var settings by remember { mutableStateOf(prefs.load()) }
+            fun update(next: RoundInjectionSettings) {
+                settings = next
+                prefs.save(next)
+            }
+            RoundInjectionSettingsScreen(
+                onBack = { navController.safePopBackStack() },
+                settings = settings,
+                onSettingsChange = ::update,
             )
         }
 

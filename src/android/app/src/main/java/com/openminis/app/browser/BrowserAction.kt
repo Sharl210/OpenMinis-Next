@@ -25,7 +25,26 @@ enum class BrowserAction(val value: String) {
     GET_COOKIES("get_cookies"),
     SET_COOKIES("set_cookies"),
     SCROLL_AND_COLLECT("scroll_and_collect"),
-    WAIT_FOR_DOM_STABLE("wait_for_dom_stable");
+    WAIT_FOR_DOM_STABLE("wait_for_dom_stable"),
+    GET_HISTORY("get_history"),
+    LIST_BOOKMARKS("list_bookmarks"),
+    GET_BOOKMARKS("get_bookmarks"),
+    GET_FAVORITES("get_favorites"),
+    ADD_BOOKMARK("add_bookmark"),
+    BOOKMARK("bookmark"),
+    ADD_FAVORITE("add_favorite"),
+    REMOVE_BOOKMARK("remove_bookmark"),
+    UNBOOKMARK("unbookmark"),
+    REMOVE_FAVORITE("remove_favorite"),
+    UNFAVORITE("unfavorite"),
+    DELETE_HISTORY("delete_history"),
+    CLEAR_HISTORY("clear_history"),
+    DELETE_BOOKMARK("delete_bookmark"),
+    CLEAR_BOOKMARKS("clear_bookmarks"),
+    DELETE_FAVORITE("delete_favorite"),
+    CLEAR_FAVORITES("clear_favorites"),
+    OPEN_BOOKMARK("open_bookmark"),
+    OPEN_FAVORITE("open_favorite");
 
     /**
      * [T-browser-readaction-follow-tab-and-yolo-android] True when this action

@@ -61,8 +61,16 @@ import com.openminis.app.tools.MemoryTools
 import com.openminis.app.tools.ReadImageTool
 import com.openminis.app.tools.ToolExecutionResult
 import com.openminis.app.offload.OffloadPermissionManager
+import com.openminis.app.feature.runtime.AgentRetryPolicy
+import com.openminis.app.feature.runtime.AgentRuntimeConfig
+import com.openminis.app.feature.runtime.RuntimeFailure
+import com.openminis.app.feature.runtime.RuntimeChildRunner
+import com.openminis.app.feature.runtime.RuntimeDelegationParser
+import com.openminis.app.feature.runtime.RuntimeModelSnapshot
+import com.openminis.app.feature.runtime.RoundInjectionCoordinator
 import com.openminis.app.service.SessionActivityTracker
 import com.openminis.app.service.SessionConcurrencyManager
+import com.openminis.app.ui.settings.AgentBehaviorSettingsPrefs
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -1143,6 +1151,96 @@ class ChatViewModel(
     @Volatile
     private var streamJob: Job? = null
     private var currentProvider: LLMProvider? = null
+
+    private val roundInjectionCoordinator by lazy {
+        RoundInjectionCoordinator(context)
+    }
+
+    private val delegatedChildRunner by lazy {
+        RuntimeChildRunner(context, chatRepository, providerRepository)
+    }
+
+    /** Parent model snapshot passed to a child root before its first request. */
+    private fun runtimeParentModelSnapshot(): RuntimeModelSnapshot {
+        val model = currentModel
+        return RuntimeModelSnapshot(
+            provider = currentModelSnapshot()?.providerTypeRaw ?: model?.provider.orEmpty(),
+            model = model?.id ?: "active-session",
+            capabilities = RuntimeModelSnapshot.DEFAULT_CAPABILITIES,
+        )
+    }
+
+    private suspend fun dispatchDelegationCommand(input: String): Boolean {
+        val request = RuntimeDelegationParser.parse(input) ?: return false
+        if (_attachments.value.isNotEmpty()) {
+            appendSystemInfo(
+                "Delegated text commands do not forward attachments yet; send the attachment through the main agent instead.",
+                "info",
+            )
+            return true
+        }
+        val parentSession = ensureSession()
+        val userParts = "[{\"type\":\"text\",\"value\":${escapeJson(input.trim())}}]"
+        val parentUser = withContext(Dispatchers.IO) {
+            chatRepository.appendMessage(parentSession, "user", userParts)
+        }
+        withContext(Dispatchers.Main) {
+            _messages.value = _messages.value + ChatMessage(
+                id = parentUser.id,
+                role = "user",
+                content = input.trim(),
+                sourceDbIds = listOf(parentUser.id),
+            )
+        }
+        val parentHistory = LLMMessage(
+            role = LLMMessage.Role.USER,
+            content = input.trim(),
+            contentParts = listOf(AgentContentPart.Text(input.trim())),
+            dbMessageId = parentUser.id,
+        )
+        agentHistory.add(parentHistory)
+        viewModelScope.launch {
+            val result = delegatedChildRunner.execute(
+                parentSessionId = parentSession,
+                request = request,
+                preferredEntry = _activeEntryId.value?.let { id ->
+                    providerRepository.config.value.modelEntries.firstOrNull { it.id == id }
+                },
+                parentModel = runtimeParentModelSnapshot(),
+            )
+            val childResult = result.getOrNull()
+            val output = childResult?.output ?: "Delegated child failed: ${result.exceptionOrNull()?.message ?: "unknown error"}"
+            val snapshot = childResult?.modelSnapshot
+            val assistantParts = "[{\"type\":\"text\",\"value\":${escapeJson(output)}}]"
+            val persisted = withContext(Dispatchers.IO) {
+                chatRepository.appendMessage(
+                    parentSession,
+                    "assistant",
+                    assistantParts,
+                    modelSnapshot = snapshot,
+                )
+            }
+            withContext(Dispatchers.Main) {
+                _messages.value = _messages.value + ChatMessage(
+                    id = persisted.id,
+                    role = "assistant",
+                    content = output,
+                    error = if (result.isFailure) output else null,
+                    sourceDbIds = listOf(persisted.id),
+                )
+            }
+            agentHistory.add(
+                LLMMessage(
+                    role = LLMMessage.Role.ASSISTANT,
+                    content = output,
+                    contentParts = listOf(AgentContentPart.Text(output)),
+                    dbMessageId = persisted.id,
+                ),
+            )
+        }
+        return true
+    }
+
     private var currentModel: LLMModel? = null
 
     /**
@@ -1945,6 +2043,26 @@ class ChatViewModel(
         if (trimmed.isEmpty()) return false
         val first = trimmed[0]
         if (first != '/' && first != '／') return false
+        if (RuntimeDelegationParser.isCommand(trimmed)) {
+            if (RuntimeDelegationParser.parse(trimmed) == null) {
+                appendSystemInfo(
+                    "用法：/subagent <任务>，或 /team [--provider=… --model=… --note=…] <任务>",
+                    "info",
+                )
+                return true
+            }
+            viewModelScope.launch {
+                runCatching { dispatchDelegationCommand(trimmed) }
+                    .onFailure { error ->
+                        Log.e(TAG, "Delegation command failed", error)
+                        appendSystemInfo(
+                            "Delegated child failed: ${error.message ?: "unknown error"}",
+                            "info",
+                        )
+                    }
+            }
+            return true
+        }
         val name = trimmed.drop(1).lowercase()
         val cmd = availableSlashCommands.firstOrNull { it.title.lowercase() == name }
             ?: return false
@@ -4712,6 +4830,7 @@ class ChatViewModel(
                             available.size,
                         ),
                     ]
+                RoutingStrategy.none -> available.first()
                 RoutingStrategy.fallback -> available.first()
             }
 
@@ -4879,6 +4998,7 @@ class ChatViewModel(
         val groupId = _selectedGroupId.value ?: return emptyList()
         val config = providerRepository.config.value
         val group = config.modelGroups.find { it.id == groupId } ?: return emptyList()
+        if (group.strategy == RoutingStrategy.none) return emptyList()
         val members = group.memberEntryIds
         // Find current provider's position in the group.
         // [T-android-fallback-entry-identity] Prefer the ACTIVE ENTRY id — the
@@ -7866,6 +7986,15 @@ class ChatViewModel(
                         }
                     }
                     try {
+                    val injection = roundInjectionCoordinator.beforeModelCall(activeSessionId)
+                    injection.prompt?.let { prompt ->
+                        roundInjectionCoordinator.appendToHistory(agentHistory, prompt)
+                        AppLogger.info(
+                            TAG_STREAM,
+                            "[RoundInject] session=${activeSessionId.take(8)} invocation=${injection.invocation} " +
+                                "kind=${if (injection.isStartPrompt) "start" else "periodic"}",
+                        )
+                    }
                     // Route through effectiveAgentHistory() so a populated
                     // [_compactSummary] is prepended as a `<context-summary>`
                     // user message. Falls through to the raw agentHistory when
@@ -8265,30 +8394,63 @@ class ChatViewModel(
                     if (e is CancellationException && e.cause == null) throw e  // real job cancellation
                     val actual = unwrapFlowException(e)
                     val isRateLimit = actual is com.openminis.app.data.model.LLMError.RateLimited
-                    val is5xx = actual is com.openminis.app.data.model.LLMError.ProviderError &&
-                        actual.detail.contains(Regex("[5][0-9]{2}"))
-                    // Auto-retry on transient network/5xx/transient errors on the SAME provider
-                    // before considering a fallback (mirrors iOS streamWithAutoRetry).
-                    // Rate limits are provider-level signals that should trigger fallback immediately,
-                    // not retry on the same provider.
-                    val isTransient = actual is com.openminis.app.data.model.LLMError.NetworkError ||
-                        actual is com.openminis.app.data.model.LLMError.TransientError ||
-                        is5xx
-                    if (isTransient && retryAttempt < AUTO_RETRY_DELAYS_SEC.size) {
-                        val delaySec = AUTO_RETRY_DELAYS_SEC[retryAttempt]
-                        retryAttempt += 1
+                    val providerDetail = (actual as? com.openminis.app.data.model.LLMError.ProviderError)?.detail.orEmpty()
+                    val statusCode = Regex("\\b[1-5][0-9]{2}\\b")
+                        .find(providerDetail)
+                        ?.value
+                        ?.toIntOrNull()
+                    val is5xx = statusCode in 500..599
+                    val retrySettings = AgentBehaviorSettingsPrefs(context).load()
+                    val retryPolicy = AgentRetryPolicy(
+                        AgentRuntimeConfig(
+                            maxAttempts = if (retrySettings.autoRetryEnabled) {
+                                retrySettings.maxRetryAttempts
+                            } else {
+                                1
+                            },
+                            initialRetryDelayMillis = 1_000L,
+                            maxRetryDelayMillis = 30_000L,
+                            backoffMultiplier = 1.2,
+                            jitterRatio = 0.2,
+                        ),
+                    ) { kotlin.random.Random.nextDouble(-1.0, 1.0) }
+                    val failure = RuntimeFailure(
+                        code = actual.javaClass.simpleName,
+                        message = actual.message ?: providerDetail.ifBlank { "provider failure" },
+                        retryable = actual is com.openminis.app.data.model.LLMError.NetworkError ||
+                            actual is com.openminis.app.data.model.LLMError.TransientError ||
+                            is5xx || isRateLimit,
+                        statusCode = statusCode,
+                        networkError = actual is com.openminis.app.data.model.LLMError.NetworkError,
+                    )
+                    val retryDecision = retryPolicy.decide(retryAttempt + 1, failure)
+                    // Auto-retry transient/network/rate-limit/status failures on the
+                    // same provider before considering fallback. The policy also
+                    // blocks auth, permission, quota and explicit stop keywords.
+                    if (retryDecision.shouldRetry) {
+                        val delayMillis = retryDecision.delayMillis
+                        retryAttempt = (retryDecision.nextAttempt ?: (retryAttempt + 1)) - 1
                         val errDesc = actual.message ?: actual.javaClass.simpleName
-                        Log.w(TAG, "🔁 Transient error on ${currentProvider.model.displayName}, retry $retryAttempt/${AUTO_RETRY_DELAYS_SEC.size} in ${delaySec}s: $errDesc")
+                        Log.w(
+                            TAG,
+                            "🔁 Transient error on ${currentProvider.model.displayName}, " +
+                                "retry ${retryAttempt}/${retrySettings.maxRetryAttempts} " +
+                                "in ${delayMillis}ms: $errDesc",
+                        )
                         withContext(Dispatchers.Main) {
                             _autoRetryAttempt.value = retryAttempt
-                            // Show the error inline on the streaming assistant message during countdown.
-                            // Keeps isStreaming=true so the UI doesn't tear down the streaming state.
-                            setTransientInlineError("$errDesc — retrying ($retryAttempt/${AUTO_RETRY_DELAYS_SEC.size})…")
+                            setTransientInlineError(
+                                "$errDesc — retrying ($retryAttempt/${retrySettings.maxRetryAttempts})…",
+                            )
                         }
                         try {
-                            for (remaining in delaySec downTo 1) {
-                                _autoRetryCountdown.value = remaining
-                                kotlinx.coroutines.delay(1000)
+                            var remainingMillis = delayMillis
+                            while (remainingMillis > 0L) {
+                                _autoRetryCountdown.value =
+                                    ((remainingMillis + 999L) / 1_000L).toInt()
+                                val slice = minOf(1_000L, remainingMillis)
+                                kotlinx.coroutines.delay(slice)
+                                remainingMillis -= slice
                             }
                         } finally {
                             _autoRetryCountdown.value = 0
@@ -8663,8 +8825,21 @@ class ChatViewModel(
                 }
             }
 
-            // Execute all tool calls
+            // Execute all tool calls. Keep the original path for a single call;
+            // batch calls use the dependency-aware scheduler and merge all side
+            // effects/results back in the model-provided call order.
             val resultParts = mutableListOf<AgentContentPart>()
+            if (toolCalls.size > 1) {
+                resultParts.addAll(
+                    executeToolCallBatch(
+                        toolCalls = toolCalls,
+                        allToolBlocks = allToolBlocks,
+                        assistantId = assistantId,
+                        accumulatedText = accumulatedText,
+                        toolInputChunkRings = toolInputChunkRings,
+                    ),
+                )
+            } else {
             for ((id, name, args) in toolCalls) {
                 // [T-android-overlay-tool-title] Pull tool_title uniformly
                 // from args for ALL tools — without this browser_use's
@@ -8949,6 +9124,7 @@ class ChatViewModel(
                     imageLinuxPath = result.imageLinuxPath,
                 ))
             }
+            }
 
             // Update UI with tool statuses. Mark as awaiting the next model
             // response so "Minis is thinking" shows during the network gap
@@ -9127,6 +9303,221 @@ class ChatViewModel(
         tools: List<AgentToolDefinition>,
     ): String? = preflightValidateToolCallImpl(name, args, tools)
 
+    private suspend fun executeToolCallBatch(
+        toolCalls: List<Triple<String, String, JSONObject>>,
+        allToolBlocks: MutableList<AssistantBlock>,
+        assistantId: String,
+        accumulatedText: String,
+        toolInputChunkRings: MutableMap<String, MutableList<String>>,
+    ): List<AgentContentPart> {
+        data class BatchCall(
+            val id: String,
+            val name: String,
+            val args: JSONObject,
+            val argsJson: String,
+            val params: Map<String, Any?>,
+            val truncationRepairTag: String?,
+            val precomputed: ToolExecutionResult?,
+            val precomputedError: String?,
+            val dependencies: Set<String>,
+            val dependencyError: String?,
+        )
+        data class BatchRun(
+            val result: ToolExecutionResult,
+            val block: AssistantBlock? = null,
+        )
+
+        val prepared = toolCalls.map { (id, name, args) ->
+            val dispatchToolTitle = runCatching { args.optString("tool_title", "").takeIf { it.isNotBlank() } }.getOrNull()
+            SessionActivityTracker.updateToolStatus(
+                status = "Running: $name",
+                toolName = name,
+                isRunning = true,
+                toolTitle = dispatchToolTitle,
+            )
+            val repairs = com.openminis.app.provider.ToolJsonRepair.repair(
+                name, args, toolInputChunkRings[id]?.lastOrNull(), agentTools,
+            )
+            val truncationRepairTag = repairs.firstOrNull { it.startsWith("truncation+") }
+            val argsJson = args.toString()
+            val params = parseToolParams(argsJson)
+            val dependencyResult = parseToolCallDependencies(args)
+            var precomputed: ToolExecutionResult? = null
+            var precomputedError: String? = null
+
+            if (truncationRepairTag != null && (name == "file_write" || name == "file_edit")) {
+                val path = args.optString("path", "").ifBlank { args.optString("file_path", "") }
+                val message = buildString {
+                    append("Error: This call was NOT executed. Its argument stream was truncated ")
+                    append("in transit (repair strategy: $truncationRepairTag), so the `content` ")
+                    append("your client sent was cut short and would have written an incomplete file")
+                    if (path.isNotBlank()) append(" to $path")
+                    append(". Nothing was written to disk — the target file is unchanged.\n\n")
+                    append("Re-issue this write in smaller pieces with complete arguments.")
+                }
+                precomputed = ToolExecutionResult(message, false, toolTitle = dispatchToolTitle ?: name)
+                precomputedError = message
+                toolLoopDetector.record(name, params, result = null, errorMessage = message, toolCallId = id)
+            } else {
+                val precheck = toolLoopDetector.check(name, params)
+                if (precheck.level == Level.CRITICAL) {
+                    val message = precheck.message ?: "[LOOP BLOCKED] tool execution blocked"
+                    precomputed = ToolExecutionResult(message, false, toolTitle = dispatchToolTitle ?: name)
+                    precomputedError = message
+                    toolLoopDetector.record(name, params, result = null, errorMessage = message, toolCallId = id)
+                } else {
+                    val preflightError = preflightValidateToolCall(name, args, agentTools)
+                    if (preflightError != null) {
+                        val message = "Error: Tool call rejected before execution. $preflightError"
+                        precomputed = ToolExecutionResult(message, false, toolTitle = dispatchToolTitle ?: name)
+                        precomputedError = message
+                        toolLoopDetector.record(name, params, result = null, errorMessage = message, toolCallId = id)
+                    }
+                }
+            }
+
+            val dependencyError = when (dependencyResult) {
+                is ToolDependencyParseResult.Invalid -> dependencyResult.reason
+                is ToolDependencyParseResult.Valid -> null
+            }
+            val dependencies = when (dependencyResult) {
+                is ToolDependencyParseResult.Valid -> dependencyResult.ids
+                is ToolDependencyParseResult.Invalid -> emptySet()
+            }
+            BatchCall(
+                id = id,
+                name = name,
+                args = args,
+                argsJson = argsJson,
+                params = params,
+                truncationRepairTag = truncationRepairTag,
+                precomputed = precomputed,
+                precomputedError = precomputedError,
+                dependencies = dependencies,
+                dependencyError = dependencyError,
+            )
+        }
+
+        val items = prepared.map { call ->
+            ToolBatchItem(
+                id = call.id,
+                dependsOn = call.dependencies,
+                value = call,
+                dependencyError = call.dependencyError,
+            )
+        }
+        val outcomes = ToolCallBatchScheduler.execute(items) { call ->
+            val synthetic = call.precomputed
+            if (synthetic != null) {
+                return@execute ToolBatchExecution(
+                    success = false,
+                    value = BatchRun(synthetic),
+                    error = call.precomputedError,
+                )
+            }
+            val original = allToolBlocks.firstOrNull { it.id == call.id }
+            val localBlocks = mutableListOf(original ?: AssistantBlock(
+                id = call.id,
+                kind = "tool_use",
+                toolName = call.name,
+                toolArgs = call.argsJson,
+                toolStatus = ToolBlockStatus.RUNNING,
+                startTimeMs = System.currentTimeMillis(),
+            ))
+            val result = executeTool(
+                name = call.name,
+                argsJson = call.argsJson,
+                toolId = call.id,
+                toolBlocks = localBlocks,
+                assistantId = assistantId,
+                currentText = accumulatedText,
+                publishStreamingUpdates = false,
+            )
+            ToolBatchExecution(
+                success = result.success,
+                value = BatchRun(result, localBlocks.firstOrNull()),
+                error = if (result.success) null else result.output,
+            )
+        }
+
+        val resultParts = mutableListOf<AgentContentPart>()
+        outcomes.forEach { outcome ->
+            val call = outcome.item.value
+            val run = outcome.value ?: BatchRun(
+                ToolExecutionResult(
+                    output = outcome.error ?: "Tool call was not executed",
+                    success = false,
+                    toolTitle = call.name,
+                ),
+            )
+            val result = run.result
+            val postRecord = if (call.precomputed == null && outcome.status == ToolBatchStatus.SUCCESS ||
+                call.precomputed == null && outcome.status == ToolBatchStatus.FAILED && run.block != null
+            ) {
+                toolLoopDetector.record(
+                    toolName = call.name,
+                    params = call.params,
+                    result = if (result.success) result.output else null,
+                    errorMessage = if (result.success) null else result.output,
+                    toolCallId = call.id,
+                )
+            } else null
+            val outputForLlm = if (postRecord?.level == Level.WARNING && postRecord.message != null) {
+                "${result.output}\n\n${postRecord.message}"
+            } else {
+                result.output
+            }
+            val blockIndex = allToolBlocks.indexOfFirst { it.id == call.id }
+            if (blockIndex >= 0) {
+                val existing = allToolBlocks[blockIndex]
+                val streamed = run.block?.content.orEmpty()
+                val resultContent = if (call.name == "shell_execute") {
+                    result.output.lines().takeLast(80).joinToString("\n")
+                } else result.output
+                val finalContent = listOf(existing.content, streamed, resultContent).maxByOrNull { it.length }.orEmpty()
+                val finalStatus = when {
+                    result.success && call.truncationRepairTag != null -> ToolBlockStatus.FAILED
+                    result.success -> ToolBlockStatus.SUCCESS
+                    result.timedOut -> ToolBlockStatus.TIMEOUT
+                    else -> ToolBlockStatus.FAILED
+                }
+                allToolBlocks[blockIndex] = existing.copy(
+                    toolStatus = finalStatus,
+                    content = finalContent,
+                    toolTitle = result.toolTitle.ifEmpty { existing.toolTitle },
+                    durationMs = System.currentTimeMillis() - existing.startTimeMs,
+                    browserURL = result.pageURL ?: existing.browserURL,
+                    imageFilePath = result.imageFilePath ?: existing.imageFilePath,
+                )
+                SessionActivityTracker.clearToolRunning(
+                    when (finalStatus) {
+                        ToolBlockStatus.SUCCESS -> com.openminis.app.service.ToolOutcome.Success
+                        ToolBlockStatus.TIMEOUT -> com.openminis.app.service.ToolOutcome.Timeout
+                        ToolBlockStatus.FAILED -> com.openminis.app.service.ToolOutcome.Error
+                        else -> com.openminis.app.service.ToolOutcome.Unknown
+                    },
+                )
+            }
+            toolInputChunkRings.remove(call.id)
+            val outputWithNote = if (call.truncationRepairTag != null) {
+                "$outputForLlm\n\n<system-reminder>The argument stream was truncated in transit and auto-closed before execution.</system-reminder>"
+            } else outputForLlm
+            resultParts += AgentContentPart.ToolResult(
+                id = call.id,
+                name = call.name,
+                content = outputWithNote,
+                isError = !result.success,
+                imageData = result.imageData,
+                imageMimeType = result.imageMimeType,
+                imageLinuxPath = result.imageLinuxPath,
+            )
+        }
+        withContext(Dispatchers.Main) {
+            updateAssistantMessage(assistantId, accumulatedText, true, allToolBlocks)
+        }
+        return resultParts
+    }
+
     private suspend fun executeTool(
         name: String,
         argsJson: String,
@@ -9134,6 +9525,7 @@ class ChatViewModel(
         toolBlocks: MutableList<AssistantBlock>,
         assistantId: String,
         currentText: String,
+        publishStreamingUpdates: Boolean = true,
     ): ToolExecutionResult {
         // T330: tri-state permission gating moved into the offload IPC
         // handler (OffloadGate). The CLIs land there whether the LLM
@@ -9173,7 +9565,14 @@ class ChatViewModel(
             // bindMounts map and would surface another session's
             // /var/minis/{workspace,attachments,offloads,browser} files.
             ReadImageTool.NAME -> executeReadImageTool(argsJson)
-            "shell_execute" -> executeShellCommand(argsJson, toolId, toolBlocks, assistantId, currentText)
+            "shell_execute" -> executeShellCommand(
+                argsJson,
+                toolId,
+                toolBlocks,
+                assistantId,
+                currentText,
+                publishStreamingUpdates,
+            )
             "browser_use" -> executeBrowserUseTool(argsJson)
             "memory_write" -> executeMemoryWriteTool(argsJson)
             "memory_get" -> executeMemoryGetTool(argsJson)
@@ -9322,6 +9721,7 @@ class ChatViewModel(
         toolBlocks: MutableList<AssistantBlock>,
         assistantId: String,
         currentText: String,
+        publishStreamingUpdates: Boolean = true,
     ): ToolExecutionResult {
         return try {
             val args = JSONObject(argsJson)
@@ -9353,8 +9753,10 @@ class ChatViewModel(
                         val ss = remaining % 60
                         val countdown = if (mm > 0) String.format("%d:%02d", mm, ss) else "${ss}s"
                         toolBlocks[idx] = toolBlocks[idx].copy(content = "⏳ Waiting $countdown before executing...")
-                        withContext(Dispatchers.Main) {
-                            updateAssistantMessage(assistantId, currentText, true, toolBlocks)
+                        if (publishStreamingUpdates) {
+                            withContext(Dispatchers.Main) {
+                                updateAssistantMessage(assistantId, currentText, true, toolBlocks)
+                            }
                         }
                     }
                     kotlinx.coroutines.delay(1000)
@@ -9428,8 +9830,10 @@ class ChatViewModel(
                         // Keep last 50 lines for display
                         val trimmed = updated.lines().takeLast(50).joinToString("\n")
                         toolBlocks[idx] = toolBlocks[idx].copy(content = trimmed)
-                        viewModelScope.launch(Dispatchers.Main) {
-                            updateAssistantMessage(assistantId, currentText, true, toolBlocks)
+                        if (publishStreamingUpdates) {
+                            viewModelScope.launch(Dispatchers.Main) {
+                                updateAssistantMessage(assistantId, currentText, true, toolBlocks)
+                            }
                         }
                     }
                 },

@@ -392,14 +392,29 @@ class ModelsCollection(
         )
 
     private fun supportsToolsField(id: String): ConfigField =
-        ReadOnlyField(
+        ClosureField(
             path = "models.$id.supportsTools",
             displayName = "Supports tools",
-            description = "Derived. True when the model can produce text output.",
-            valueSchema = ConfigSchema.Bool,
+            description = "Whether the model may use tools. Null clears the user override and restores the catalog/default value.",
+            valueSchema = ConfigSchema.Optional(ConfigSchema.Bool),
+            risk = ConfigRisk.SENSITIVE,
+            revertable = true,
             reader = {
-                val e = entry(id) ?: return@ReadOnlyField ConfigValue.Null
-                ConfigValue.Bool("text_output" in effectiveModalities(e))
+                val e = entry(id) ?: return@ClosureField ConfigValue.Null
+                // Explicit tool_call data wins. When the catalog is silent, retain
+                // the permissive text-output fallback; explicit modalities still
+                // make text-only capability checks authoritative.
+                ConfigValue.Bool(e.model.supportsTools ?: e.model.isTextOutput)
+            },
+            writer = { v ->
+                val override = when (v) {
+                    ConfigValue.Null -> null
+                    is ConfigValue.Bool -> v.value
+                    else -> throw ConfigError.TypeMismatch("bool or null")
+                }
+                mutate(id) { e ->
+                    e.copy(overrides = e.overrides.copy(supportsTools = override))
+                }
             },
         )
 

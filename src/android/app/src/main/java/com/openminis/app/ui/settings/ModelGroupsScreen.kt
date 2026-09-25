@@ -931,6 +931,7 @@ private fun GroupRow(
     val isPrimary = config.defaultPrimaryGroupId == group.id
     val isSub = config.defaultSubGroupId == group.id
     val strategyLabel = when (group.strategy) {
+        RoutingStrategy.none -> stringResource(R.string.model_group_detail_no_fallback)
         RoutingStrategy.fallback -> stringResource(R.string.model_group_detail_fallback)
         RoutingStrategy.loadBalance -> stringResource(R.string.model_group_detail_load_balance)
     }

@@ -3,6 +3,10 @@ package com.openminis.app.service
 import android.content.Context
 import android.os.SystemClock
 import android.util.Log
+import com.openminis.app.feature.runtime.RuntimeDelegationRequest
+import com.openminis.app.feature.runtime.RuntimeModelSnapshot
+import com.openminis.app.feature.runtime.RuntimeSessionCoordinator
+import com.openminis.app.feature.runtime.RuntimeTreeConfig
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -12,15 +16,14 @@ import kotlinx.coroutines.flow.asStateFlow
  *
  *  - `activeSessions`: at least one [com.openminis.app.ui.chat.ChatViewModel.streamJob]
  *    is in flight (LLM call, tool execution).
- *  - `presentSessions` (T166): the user is sitting on a chat screen
- *    with the composer mounted, regardless of whether a stream is
- *    running. Drives the FG service so backgrounding the chat for a
- *    minute doesn't drop the process to adj=700 and get it reclaimed.
+ *  - `presentSessions`: the user is sitting on a chat screen. Presence is UI
+ *    context only and never keeps the foreground service alive by itself.
+ *  - `activeChildSessions` / `waitingChildSessions`: child work is aggregated
+ *    under its root without changing the root ChatViewModel's active set.
  *
- * The foreground service runs whenever EITHER set is non-empty, so
- * the user holds a stable adj=200 across reading, composing, and
- * streaming alike. It stops only when both are empty (user has
- * navigated back to Sessions list AND no stream is in flight).
+ * The foreground service runs only while the runtime activity aggregate is
+ * non-empty: a root stream, a child stream, or an explicit root waiting for
+ * child work. Presence alone must not create a stale RUNNING notification.
  */
 object SessionActivityTracker {
 
@@ -41,6 +44,49 @@ object SessionActivityTracker {
      */
     private val _presentSessions = MutableStateFlow<Set<String>>(emptySet())
     val presentSessions: StateFlow<Set<String>> = _presentSessions.asStateFlow()
+
+    /**
+     * Child work is tracked separately from [activeSessions]. A child must not
+     * make the parent ChatViewModel's send/stop state look like a second root
+     * stream, but it still keeps the runtime status surface alive.
+     *
+     * The map is parent session id -> currently running child ids. Nested
+     * children use their own parent id, so callers can represent a whole tree
+     * without ever inserting child ids into the root active set.
+     */
+    private val _activeChildSessions = MutableStateFlow<Map<String, Set<String>>>(emptyMap())
+    val activeChildSessions: StateFlow<Map<String, Set<String>>> = _activeChildSessions.asStateFlow()
+
+    /** Explicit parent waits for child work; this is not inferred from presence. */
+    private val _waitingChildSessions = MutableStateFlow<Map<String, Set<String>>>(emptyMap())
+    val waitingChildSessions: StateFlow<Map<String, Set<String>>> = _waitingChildSessions.asStateFlow()
+
+    /** Human-readable aggregate for notifications/overlay consumers. */
+    private val _waitingChildStatusText = MutableStateFlow<String?>(null)
+    val waitingChildStatusText: StateFlow<String?> = _waitingChildStatusText.asStateFlow()
+
+    /**
+     * Snapshot consumed by background surfaces. Only this aggregate may decide
+     * whether a task-status notification/overlay represents live work.
+     */
+    data class RuntimeActivitySnapshot(
+        val activeRootSessions: Set<String> = emptySet(),
+        val activeChildSessions: Map<String, Set<String>> = emptyMap(),
+        val waitingChildSessions: Map<String, Set<String>> = emptyMap(),
+        val runtimeSessionCount: Int = 0,
+        val hasRuntimeActivity: Boolean = false,
+        val waitingForChildren: Boolean = false,
+        val waitingText: String? = null,
+    )
+
+    private val _runtimeActivity = MutableStateFlow(RuntimeActivitySnapshot())
+    val runtimeActivity: StateFlow<RuntimeActivitySnapshot> = _runtimeActivity.asStateFlow()
+
+    // child id -> root session id. This keeps nested child work aggregated at
+    // the root instead of inflating the notification count per implementation
+    // detail.
+    private val childRootIds = mutableMapOf<String, String>()
+    private val waitingRootIds = mutableMapOf<String, String>()
 
     private val _currentToolStatus = MutableStateFlow("Idle")
     val currentToolStatus: StateFlow<String> = _currentToolStatus.asStateFlow()
@@ -190,15 +236,58 @@ object SessionActivityTracker {
     }
 
     private var appContext: Context? = null
+    private var runtimeCoordinator: RuntimeSessionCoordinator? = null
 
-    /**
-     * The service should run iff at least one session is streaming OR
-     * the user is currently present in at least one chat. Both inputs
-     * are independently mutated, so we always recompute from the live
-     * state flows rather than tracking a derived flag.
-     */
-    private fun shouldRunService(): Boolean =
-        _activeSessions.value.isNotEmpty() || _presentSessions.value.isNotEmpty()
+    /** Runtime work, not UI presence, determines whether the service stays alive. */
+    private fun shouldRunService(): Boolean = _runtimeActivity.value.hasRuntimeActivity
+
+    private fun rootFor(sessionId: String): String =
+        childRootIds[sessionId] ?: sessionId
+
+    private fun recomputeRuntimeActivity() {
+        val previous = _runtimeActivity.value
+        val activeChildren = _activeChildSessions.value
+        val waitingChildren = _waitingChildSessions.value
+        val activeChildRoots = activeChildren.flatMap { (parent, children) ->
+            children.map { child -> childRootIds[child] ?: rootFor(parent) }
+        }.toSet()
+        val waitingRoots = waitingChildren.keys.map { sessionId ->
+            waitingRootIds[sessionId] ?: rootFor(sessionId)
+        }.toSet()
+        val roots = _activeSessions.value + activeChildRoots + waitingRoots
+        val waitingCount = waitingChildren.values.sumOf { it.size }
+        val waitingText = if (waitingRoots.isEmpty()) {
+            null
+        } else if (waitingCount == 1) {
+            "Waiting for sub-agent"
+        } else {
+            "Waiting for $waitingCount sub-agents"
+        }
+        _waitingChildStatusText.value = waitingText
+        val next = RuntimeActivitySnapshot(
+            activeRootSessions = _activeSessions.value,
+            activeChildSessions = activeChildren,
+            waitingChildSessions = waitingChildren,
+            runtimeSessionCount = roots.size,
+            hasRuntimeActivity = roots.isNotEmpty(),
+            waitingForChildren = waitingRoots.isNotEmpty(),
+            waitingText = waitingText,
+        )
+        _runtimeActivity.value = next
+        if (!previous.hasRuntimeActivity && next.hasRuntimeActivity) {
+            _lastTaskFinishedAtMs.value = null
+            _currentRunStartedAtMs.value = SystemClock.elapsedRealtime()
+        } else if (previous.hasRuntimeActivity && !next.hasRuntimeActivity) {
+            _lastTaskFinishedAtMs.value = SystemClock.elapsedRealtime()
+        }
+    }
+
+    private fun refreshServiceAfterRuntimeChange(wasActive: Boolean) {
+        when {
+            !shouldRunService() && wasActive -> stopService()
+            shouldRunService() -> if (wasActive) updateService() else startServiceIfNeeded()
+        }
+    }
 
     /**
      * T50: per-session stream-cancel callbacks. Each ChatViewModel
@@ -235,6 +324,9 @@ object SessionActivityTracker {
      * "pure session-tracking" responsibility.
      */
     private var completionListener: ((sessionId: String, isError: Boolean) -> Unit)? = null
+
+    /** Root streams that ended while child work was still live/waiting. */
+    private val pendingTreeCompletions = mutableMapOf<String, Boolean>()
 
     fun setCompletionListener(listener: ((sessionId: String, isError: Boolean) -> Unit)?) {
         completionListener = listener
@@ -287,6 +379,11 @@ object SessionActivityTracker {
      */
     fun init(context: Context) {
         appContext = context.applicationContext
+        runtimeCoordinator = runCatching {
+            RuntimeSessionCoordinator.open(context.applicationContext)
+        }.onFailure {
+            Log.w(TAG, "Runtime tree restore failed: ${it.message}")
+        }.getOrNull()
     }
 
     /**
@@ -297,10 +394,6 @@ object SessionActivityTracker {
      */
     fun setActive(sessionId: String, onStop: (() -> Unit)? = null) {
         val wasIdle = !shouldRunService()
-        // [T-android-live-update-completed] Capture BEFORE mutating: a run
-        // "begins" only on the empty → non-empty edge. A second concurrent
-        // session joining an in-flight run must not restart the clock.
-        val wasRunIdle = _activeSessions.value.isEmpty()
         _activeSessions.value = _activeSessions.value + sessionId
         if (onStop != null) {
             synchronized(streamCancellers) { streamCancellers[sessionId] = onStop }
@@ -314,21 +407,13 @@ object SessionActivityTracker {
         _lastToolName.value = null
         _lastToolTitle.value = null
         _lastToolStatus.value = null
-        // [T-android-live-update-completed] A new run supersedes any completed
-        // resting state — drop the finish stamp so the notification goes back to
-        // a live ticking timer instead of staying frozen at the previous total,
-        // and re-anchor the clock so this run's duration starts from zero.
-        if (wasRunIdle) {
-            _lastTaskFinishedAtMs.value = null
-            _currentRunStartedAtMs.value = SystemClock.elapsedRealtime()
-        }
-        Log.d(TAG, "Session activated: $sessionId (total: ${_activeSessions.value.size})")
-
-        if (wasIdle) {
-            startServiceIfNeeded()
-        } else {
-            updateService()
-        }
+        // A run starts on the empty runtime-tree -> non-empty edge. This is
+        // deliberately not based on presentSessions or child count so a chat
+        // screen cannot restart a completed timer.
+        runtimeCoordinator?.startRoot(sessionId)
+        recomputeRuntimeActivity()
+        Log.d(TAG, "Session activated: $sessionId (roots: ${_activeSessions.value.size})")
+        refreshServiceAfterRuntimeChange(wasIdle)
     }
 
     /**
@@ -338,115 +423,204 @@ object SessionActivityTracker {
      */
     fun setInactive(sessionId: String) {
         val wasActive = sessionId in _activeSessions.value
+        val wasRuntimeActive = shouldRunService()
         _activeSessions.value = _activeSessions.value - sessionId
         synchronized(streamCancellers) { streamCancellers.remove(sessionId) }
         val wasError = synchronized(pendingErrorFlag) { pendingErrorFlag.remove(sessionId) }
-        Log.d(TAG, "Session deactivated: $sessionId (total: ${_activeSessions.value.size})")
+        Log.d(TAG, "Session deactivated: $sessionId (roots: ${_activeSessions.value.size})")
 
         if (_activeSessions.value.isEmpty()) {
             _currentToolStatus.value = "Idle"
             _currentToolName.value = null
             _currentToolTitle.value = null
             _isToolRunning.value = false
-            // [T-android-live-update-completed] Stamp the finish moment so the
-            // ongoing notification can freeze its elapsed timer at the real task
-            // duration instead of tracking service uptime. Only set when the
-            // session was genuinely active — a defensive setInactive for a
-            // never-started session must not fake a completion.
-            if (wasActive) {
-                _lastTaskFinishedAtMs.value = SystemClock.elapsedRealtime()
-            }
-            // [T-android-overlay-reply-status-34599] Preserve the last
-            // tool outcome AND the last reply excerpt across stream
-            // teardown so the overlay observer in
-            // [AgentForegroundService] can flip into "completed" mode
-            // and render ✓ / ✗ + the assistant's reply text. Cleared
-            // when the user dismisses the overlay via [dismissOverlay]
-            // or starts a fresh run via [setActive].
-            // Tag the error outcome here if the stream finalized with
-            // an error (markStreamError was called); otherwise keep
-            // whatever the last tool reported (Success / Error / etc.)
-            // so the glyph reflects the actual end state.
-            if (wasError) {
-                _lastToolOutcome.value = ToolOutcome.Error
-            }
+            if (wasError) _lastToolOutcome.value = ToolOutcome.Error
         }
-        if (!shouldRunService()) {
-            stopService()
-        } else {
-            updateService()
-        }
-        // T180-bg-notif: fire the completion listener AFTER service state
-        // is settled so the notifier sees a stable activeSessions count.
-        // Skip if the session was never marked active (defensive — keeps
-        // the "completed" semantic honest).
+        recomputeRuntimeActivity()
+        refreshServiceAfterRuntimeChange(wasRuntimeActive)
+        // Child work may still be active after a root stream ends. Defer the
+        // completion callback until the whole root tree is idle.
         if (wasActive) {
-            completionListener?.invoke(sessionId, wasError)
+            val rootId = rootFor(sessionId)
+            if (hasRuntimeActivityForRoot(rootId)) {
+                runtimeCoordinator?.waitForChildren(sessionId)
+                pendingTreeCompletions[rootId] =
+                    (pendingTreeCompletions[rootId] == true) || wasError
+            } else {
+                runtimeCoordinator?.finishRoot(sessionId, wasError)
+                completionListener?.invoke(sessionId, wasError)
+            }
         }
     }
 
     /**
-     * T180-bg-notif: caller marks the session's stream as having ended in
-     * an error. Must be invoked BEFORE [setInactive] (the flag is consumed
-     * inside setInactive). If never called, the completion listener fires
-     * with `isError=false`.
+     * Start a delegated child without making it a second root in the chat UI.
+     * The parent root is persisted even when the command came from an idle
+     * composer, so the child has a durable tree parent and foreground activity.
      */
+    fun beginDelegatedChild(
+        parentSessionId: String,
+        childSessionId: String,
+        request: RuntimeDelegationRequest,
+        model: RuntimeModelSnapshot,
+        parentModel: RuntimeModelSnapshot = model,
+    ): Boolean {
+        require(parentSessionId.isNotBlank()) { "parentSessionId must not be blank" }
+        require(childSessionId.isNotBlank()) { "childSessionId must not be blank" }
+        val wasIdle = !shouldRunService()
+        runtimeCoordinator?.startRoot(parentSessionId, parentModel)
+        val started = runtimeCoordinator?.delegate(parentSessionId, childSessionId, request, model) == true
+        if (!started) return false
+        childRootIds[childSessionId] = rootFor(parentSessionId)
+        val next = _activeChildSessions.value.toMutableMap()
+        next[parentSessionId] = next[parentSessionId].orEmpty() + childSessionId
+        _activeChildSessions.value = next
+        recomputeRuntimeActivity()
+        refreshServiceAfterRuntimeChange(wasIdle)
+        return true
+    }
+
+    /** Finish a delegated child and close its temporary parent root when idle. */
+    fun finishDelegatedChild(parentSessionId: String, childSessionId: String, failed: Boolean = false) {
+        val wasRuntimeActive = shouldRunService()
+        runtimeCoordinator?.finishChild(childSessionId, failed)
+        val next = _activeChildSessions.value.toMutableMap()
+        next[parentSessionId]?.let { children ->
+            val remaining = children - childSessionId
+            if (remaining.isEmpty()) next.remove(parentSessionId) else next[parentSessionId] = remaining
+        }
+        _activeChildSessions.value = next
+        childRootIds.remove(childSessionId)
+        recomputeRuntimeActivity()
+        refreshServiceAfterRuntimeChange(wasRuntimeActive)
+        emitPendingCompletionIfIdle(rootFor(parentSessionId))
+    }
+
+    /**
+     * Register a child as running under [parentSessionId]. Child ids remain
+     * outside [activeSessions], so a child cannot alter the parent send state.
+     * [rootSessionId] is optional for nested trees and defaults to the parent
+     * root known to this tracker.
+     */
+    fun registerChild(
+        parentSessionId: String,
+        childSessionId: String,
+        rootSessionId: String = rootFor(parentSessionId),
+    ) {
+        require(parentSessionId.isNotBlank()) { "parentSessionId must not be blank" }
+        require(childSessionId.isNotBlank()) { "childSessionId must not be blank" }
+        val wasIdle = !shouldRunService()
+        childRootIds[childSessionId] = rootSessionId
+        runtimeCoordinator?.startChild(parentSessionId, childSessionId)
+        val next = _activeChildSessions.value.toMutableMap()
+        val ids = next[parentSessionId].orEmpty().toMutableSet()
+        ids.add(childSessionId)
+        next[parentSessionId] = ids
+        _activeChildSessions.value = next
+        recomputeRuntimeActivity()
+        refreshServiceAfterRuntimeChange(wasIdle)
+    }
+
+    /** Mark a child as no longer running without touching its parent root. */
+    fun unregisterChild(parentSessionId: String, childSessionId: String) {
+        val wasRuntimeActive = shouldRunService()
+        val next = _activeChildSessions.value.toMutableMap()
+        next[parentSessionId]?.let { currentIds ->
+            val ids = currentIds.toMutableSet()
+            ids.remove(childSessionId)
+            if (ids.isEmpty()) next.remove(parentSessionId) else next[parentSessionId] = ids
+        }
+        _activeChildSessions.value = next
+        runtimeCoordinator?.finishChild(childSessionId)
+        childRootIds.remove(childSessionId)
+        recomputeRuntimeActivity()
+        refreshServiceAfterRuntimeChange(wasRuntimeActive)
+        emitPendingCompletionIfIdle(rootFor(parentSessionId))
+    }
+
+    /**
+     * Keep the root alive while it is explicitly waiting for child results.
+     * Empty [childSessionIds] is allowed for callers that only know the parent;
+     * the parent still exposes a single waiting state to notification surfaces.
+     */
+    fun setWaitingForChildren(
+        parentSessionId: String,
+        childSessionIds: Set<String> = emptySet(),
+        rootSessionId: String = rootFor(parentSessionId),
+    ) {
+        require(parentSessionId.isNotBlank()) { "parentSessionId must not be blank" }
+        val wasIdle = !shouldRunService()
+        waitingRootIds[parentSessionId] = rootSessionId
+        runtimeCoordinator?.waitForChildren(parentSessionId)
+        _waitingChildSessions.value = _waitingChildSessions.value.toMutableMap().apply {
+            put(parentSessionId, childSessionIds.toSet())
+        }
+        recomputeRuntimeActivity()
+        refreshServiceAfterRuntimeChange(wasIdle)
+    }
+
+    /** Clear the explicit waiting state and allow a completed tree to stop FGS. */
+    fun clearWaitingForChildren(parentSessionId: String) {
+        if (parentSessionId !in _waitingChildSessions.value) return
+        val wasRuntimeActive = shouldRunService()
+        _waitingChildSessions.value = _waitingChildSessions.value.toMutableMap().apply {
+            remove(parentSessionId)
+        }
+        val rootId = waitingRootIds.remove(parentSessionId) ?: rootFor(parentSessionId)
+        runtimeCoordinator?.resume(parentSessionId)
+        recomputeRuntimeActivity()
+        refreshServiceAfterRuntimeChange(wasRuntimeActive)
+        emitPendingCompletionIfIdle(rootId)
+    }
+
+    private fun hasRuntimeActivityForRoot(rootSessionId: String): Boolean {
+        val activity = _runtimeActivity.value
+        return rootSessionId in activity.activeRootSessions ||
+            activity.activeChildSessions.any { (parent, children) ->
+                children.any { child -> (childRootIds[child] ?: rootFor(parent)) == rootSessionId }
+            } ||
+            activity.waitingChildSessions.keys.any { parent ->
+                (waitingRootIds[parent] ?: rootFor(parent)) == rootSessionId
+            }
+    }
+
+    private fun emitPendingCompletionIfIdle(rootSessionId: String) {
+        if (hasRuntimeActivityForRoot(rootSessionId)) return
+        runtimeCoordinator?.finishRoot(rootSessionId)
+        val error = pendingTreeCompletions.remove(rootSessionId) ?: return
+        completionListener?.invoke(rootSessionId, error)
+    }
+
     fun markStreamError(sessionId: String) {
         synchronized(pendingErrorFlag) { pendingErrorFlag.add(sessionId) }
     }
 
     /**
-     * T166: marks the user as present in a chat (composer is mounted,
-     * messages list is rendering). Idempotent. Starts the foreground
-     * service the first time presence is recorded so the process holds
-     * at adj=200 across Home / app-switcher / lock-screen, even when no
-     * stream is in flight.
+     * T166: records chat presence for UI/lifecycle consumers only. Presence
+     * does not start or update the foreground service when no runtime work is
+     * active; otherwise an idle chat could leave a stale RUNNING notification.
      */
     fun setPresent(sessionId: String) {
         if (sessionId in _presentSessions.value) return
-        val wasIdle = !shouldRunService()
         _presentSessions.value = _presentSessions.value + sessionId
         Log.d(TAG, "Presence set: $sessionId (present total: ${_presentSessions.value.size})")
-        if (wasIdle) {
-            startServiceIfNeeded()
-        } else {
-            updateService()
-        }
+        if (shouldRunService()) updateService()
     }
 
-    /**
-     * T166: counterpart of [setPresent]. Stops the foreground service
-     * if both presence and streaming are now empty. Called from
-     * MainActivity when the user leaves the chat route or the Activity
-     * is paused.
-     */
+    /** Counterpart of [setPresent]; runtime activity remains independent. */
     fun setAbsent(sessionId: String) {
         if (sessionId !in _presentSessions.value) return
         _presentSessions.value = _presentSessions.value - sessionId
         Log.d(TAG, "Presence cleared: $sessionId (present total: ${_presentSessions.value.size})")
-        if (!shouldRunService()) {
-            stopService()
-        } else {
-            updateService()
-        }
+        if (shouldRunService()) updateService()
     }
 
-    /**
-     * T166: clear all presence markers. Called only when MainActivity
-     * is destroyed for real (not just paused) — Home press / lock
-     * screen MUST keep presence so the FG service keeps the process
-     * pinned at adj=200 across the user's brief absence. Backgrounding
-     * is the entire scenario this exists to protect against.
-     */
+    /** Clear UI presence markers without creating or stopping runtime work. */
     fun clearPresence() {
         if (_presentSessions.value.isEmpty()) return
         _presentSessions.value = emptySet()
         Log.d(TAG, "Presence cleared (all)")
-        if (!shouldRunService()) {
-            stopService()
-        } else {
-            updateService()
-        }
+        if (shouldRunService()) updateService()
     }
 
     /**
@@ -569,51 +743,28 @@ object SessionActivityTracker {
         )
     }
 
-    /**
-     * Notification session count = streaming sessions if any, otherwise
-     * presence count. The user sees "1 session — Streaming…" while a
-     * turn runs, and "1 session — In session" while they're composing
-     * but idle. Two-bucket display keeps the count honest without
-     * double-counting a session that's both present and streaming.
-     */
     private fun sessionCountForNotification(): Int =
-        if (_activeSessions.value.isNotEmpty()) _activeSessions.value.size
-        else _presentSessions.value.size
+        _runtimeActivity.value.runtimeSessionCount.coerceAtLeast(1)
 
-    /**
-     * Tool status fallback: when nothing is streaming, expose "In session"
-     * (or "Idle" if the user isn't even in a chat). The FG service is
-     * still running because of presence, but the notification shouldn't
-     * imply a tool is executing.
-     *
-     * T180-bg-notif: localize via context resources when the active set
-     * is non-empty — the notification reads "1 task running" / "N tasks
-     * running" instead of falling through to the per-tool English status.
-     * Tool-specific status strings (e.g. "browser_use") still surface as
-     * `_currentToolStatus.value` when set; otherwise we synthesize
-     * "%d task(s) running".
-     */
+    /** Notification text is derived from runtime work, never from chat presence. */
     private fun statusForNotification(): String {
         val ctx = appContext
-        val activeCount = _activeSessions.value.size
-        return when {
-            activeCount > 0 -> {
-                val tool = _currentToolStatus.value
-                if (tool.isNotBlank() && tool != "Idle") {
-                    tool
-                } else if (ctx != null) {
-                    if (activeCount == 1) {
-                        ctx.getString(com.openminis.app.R.string.notif_one_task_running)
-                    } else {
-                        ctx.getString(com.openminis.app.R.string.notif_n_tasks_running, activeCount)
-                    }
-                } else {
-                    if (activeCount == 1) "1 task running" else "$activeCount tasks running"
-                }
+        val activity = _runtimeActivity.value
+        if (activity.waitingForChildren) {
+            return activity.waitingText ?: "Waiting for sub-agent"
+        }
+        val activeCount = activity.runtimeSessionCount
+        if (activeCount <= 0) return "Idle"
+        val tool = _currentToolStatus.value
+        if (tool.isNotBlank() && !tool.equals("Idle", ignoreCase = true)) return tool
+        return if (ctx != null) {
+            if (activeCount == 1) {
+                ctx.getString(com.openminis.app.R.string.notif_one_task_running)
+            } else {
+                ctx.getString(com.openminis.app.R.string.notif_n_tasks_running, activeCount)
             }
-            _presentSessions.value.isNotEmpty() ->
-                ctx?.getString(com.openminis.app.R.string.notif_in_session) ?: "In session"
-            else -> "Idle"
+        } else {
+            if (activeCount == 1) "1 task running" else "$activeCount tasks running"
         }
     }
 

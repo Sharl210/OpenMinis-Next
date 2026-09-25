@@ -170,6 +170,15 @@
     <string name="settings_skills_subtitle">Manage Minis Agent skills and instructions</string>
     <string name="settings_memory">Memory</string>
     <string name="settings_memory_subtitle">Persistent knowledge across sessions</string>
+    <string name="settings_agent_behavior">Agent behavior</string>
+    <string name="settings_agent_behavior_subtitle">Work steps, delegation, sending, compaction and retry</string>
+    <string name="agent_behavior_retry_description">Choose unlimited retries, disable automatic retries, or set a retry limit up to 150.</string>
+    <string name="agent_behavior_retry_enabled">Enable automatic retry</string>
+    <string name="agent_behavior_retry_enabled_description">Retry transient failures automatically when enabled.</string>
+    <string name="agent_behavior_retry_unlimited">Unlimited</string>
+    <string name="agent_behavior_retry_disabled">Disabled</string>
+    <string name="agent_behavior_retry_bounded">Up to %1$d retries</string>
+    <string name="agent_behavior_retry_max_attempts">Retry limit</string>
     <!-- [T-mcp-integration-android] MCP Integrations settings entry + management screen -->
     <string name="settings_mcp">MCP Integrations</string>
     <string name="settings_mcp_subtitle">Connect Model Context Protocol servers</string>
@@ -609,6 +618,11 @@
     <string name="browser_history_results">Results</string>
     <string name="browser_history_clear_dialog_title">Clear Browsing History?</string>
     <string name="browser_history_clear_dialog_message">This will remove all browsing history. This cannot be undone.</string>
+    <string name="browser_bookmarks_title">Bookmarks</string>
+    <string name="browser_bookmarks_search">Search bookmarks</string>
+    <string name="browser_bookmarks_empty">No bookmarks saved</string>
+    <string name="browser_bookmark_delete">Delete bookmark</string>
+    <string name="browser_bookmark_toggle">Toggle bookmark</string>
     <string name="terminal_title">Minis Shell</string>
     <string name="terminal_clear">Clear</string>
     <string name="terminal_show_keyboard">Show</string>
@@ -1296,6 +1310,10 @@
     <string name="chat_menu_new_chat">New Chat</string>
     <string name="chat_new_chat_stop_dialog_body">A task is running in this chat. Starting a new chat will stop it.</string>
     <string name="chat_new_chat_stop_dialog_confirm">Stop &amp; New Chat</string>
+    <string name="chat_scroll_to_top">Scroll to top</string>
+    <string name="chat_scroll_to_previous_user">Previous user message</string>
+    <string name="chat_scroll_to_next_user">Next user message</string>
+    <string name="chat_scroll_to_bottom">Scroll to bottom</string>
     <string name="chat_menu_clear_chat">Clear Chat</string>
     <string name="chat_menu_open_terminal">Open Terminal</string>
     <string name="chat_menu_open_browser">Open Browser</string>
@@ -1938,4 +1956,47 @@
     <!-- [T-android-compact-progress] Live status while a compaction runs. -->
     <string name="compact_progress">Compacting… %1$d s elapsed</string>
     <string name="compact_progress_split">Compacting… %1$d s · summarizing in segments (%2$d/%3$d)</string>
+    <!-- Routing strategy labels and descriptions. -->
+    <string name="model_group_detail_no_fallback">No fallback</string>
+    <string name="model_group_detail_no_fallback_footer">Always use the selected model. Never rotate or fail over to another member.</string>
+    <string name="model_group_detail_fallback_footer">Try models in order. If one fails, advance to the next.</string>
+    <string name="model_group_detail_load_balance_footer">Distribute sessions across models in the group.</string>
+    <string name="model_group_detail_no_models">No models in this group.</string>
+    <string name="model_group_strategy_no_fallback_short">OFF</string>
+    <string name="model_group_strategy_fallback_short">FB</string>
+    <string name="model_group_strategy_load_balance_short">LB</string>
+    <!-- OpenMinis round injection settings -->
+    <string name="settings_round_injection">Round injection</string>
+    <string name="settings_round_injection_subtitle">Add extra prompts to every main and sub-agent session</string>
+    <string name="round_injection_title">Round injection</string>
+    <string name="round_injection_section_general">General</string>
+    <string name="round_injection_footer">Prompts are applied to every OpenMinis session, including nested sub-agents.</string>
+    <string name="round_injection_enabled">Enabled</string>
+    <string name="round_injection_enabled_description">Apply round injection to all sessions</string>
+    <string name="round_injection_section_start">At session start</string>
+    <string name="round_injection_start_enabled">Inject at session start</string>
+    <string name="round_injection_start_enabled_description">Add the start prompt before the first model call.</string>
+    <string name="round_injection_start_prompt">Start prompt</string>
+    <string name="round_injection_start_prompt_placeholder">Prompt to add at session start</string>
+    <string name="round_injection_section_periodic">Periodic injection</string>
+    <string name="round_injection_periodic_enabled">Inject periodically</string>
+    <string name="round_injection_periodic_enabled_description">Add this prompt after the configured number of model calls.</string>
+    <string name="round_injection_periodic_prompt">Periodic prompt</string>
+    <string name="round_injection_periodic_prompt_placeholder">Prompt to add periodically</string>
+    <string name="round_injection_interval">Trigger interval</string>
+    <string name="round_injection_interval_description">Number of model calls between periodic injections</string>
+    <string name="round_injection_interval_suffix">calls</string>
+    <!-- Agent topology map: reusable labels for zoom and poster-grade PNG export. -->
+    <string name="agent_topology_title">Agent topology</string>
+    <string name="agent_topology_zoom">Topology zoom</string>
+    <string name="agent_topology_zoom_description">Global zoom is shared across topology views. Pan resets when the map is reopened.</string>
+    <string name="agent_topology_zoom_reset">Reset zoom</string>
+    <string name="agent_topology_export">Export topology</string>
+    <string name="agent_topology_export_png">Export PNG</string>
+    <string name="agent_topology_export_poster">Poster quality</string>
+    <string name="agent_topology_export_poster_default">Poster quality (default)</string>
+    <string name="agent_topology_export_background">Background</string>
+    <string name="agent_topology_export_transparent">Transparent background</string>
+    <string name="agent_topology_export_solid">Solid background</string>
+    <string name="agent_topology_export_poster_description">Default export uses poster-grade PNG quality at 300 DPI.</string>
 </resources>

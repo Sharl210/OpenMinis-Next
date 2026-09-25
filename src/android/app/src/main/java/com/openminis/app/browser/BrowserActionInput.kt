@@ -37,6 +37,12 @@ data class BrowserActionInput(
     val timeoutMs: Int? = null,
     /** When true on screenshot, stretch viewport to full document.scrollHeight before capture. */
     val fullPage: Boolean = false,
+    /** Optional history/bookmark id or URL used by library actions. */
+    val itemId: String? = null,
+    /** Optional search/filter text used by history/bookmark listing actions. */
+    val query: String? = null,
+    /** Optional title used when creating or updating a bookmark. */
+    val title: String? = null,
     /**
      * Cookies to write (set_cookies). Each entry has keys name + value
      * (required) and optional domain, path, secure, http_only, expires
@@ -76,6 +82,13 @@ data class BrowserActionInput(
                     scrollCount = if (obj.has("scroll_count")) obj.optInt("scroll_count") else null,
                     timeoutMs = if (obj.has("timeout")) obj.optInt("timeout") else null,
                     fullPage = obj.optBoolean("full_page", false),
+                    itemId = obj.optString("item_id").ifEmpty {
+                        obj.optString("bookmark_id").ifEmpty {
+                            obj.optString("history_id").ifEmpty { null }
+                        }
+                    },
+                    query = obj.optString("query").ifEmpty { null },
+                    title = obj.optString("title").ifEmpty { null },
                     cookies = parseCookies(obj),
                 )
             } catch (_: Exception) {

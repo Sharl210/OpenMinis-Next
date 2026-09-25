@@ -37,7 +37,9 @@ import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.Compress
 import androidx.compose.material.icons.filled.KeyboardArrowDown
-import androidx.compose.material.icons.filled.VerticalAlignTop
+import androidx.compose.material.icons.filled.KeyboardArrowUp
+import androidx.compose.material.icons.filled.KeyboardDoubleArrowDown
+import androidx.compose.material.icons.filled.KeyboardDoubleArrowUp
 import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material.icons.filled.AudioFile
 import androidx.compose.material.icons.filled.FolderZip
@@ -873,6 +875,8 @@ fun ChatScreen(
     var showThinkingLevelSheet by remember { mutableStateOf(false) }
     var showAttachMenu by remember { mutableStateOf(false) }
     var showChatMenu by remember { mutableStateOf(false) }
+    var showConversationMap by remember { mutableStateOf(false) }
+    var pendingConversationMapMessageId by remember { mutableStateOf<String?>(null) }
     var showSkillsSheet by remember { mutableStateOf(false) }
     // [T-mcp-integration-android] MCPs-in-Session sheet visibility.
     var showMcpsSheet by remember { mutableStateOf(false) }
@@ -1272,7 +1276,20 @@ fun ChatScreen(
         }
     }
 
-    // [T-android-scrollbtn-turn-walk] Per-index observed item sizes. These once
+    val userMessageIds = remember(messages) {
+        messages.filter { it.role == "user" }.map { it.id }
+    }
+
+    val atVisualTop = remember(listState) {
+        derivedStateOf {
+            val info = listState.layoutInfo
+            val oldestIndex = (info.totalItemsCount - 1).coerceAtLeast(0)
+            val oldestVisible = info.visibleItemsInfo.maxByOrNull { it.index }
+            oldestVisible?.index == oldestIndex &&
+                oldestVisible.offset <= info.viewportStartOffset + 8
+        }
+    }
+
     // backed the up-button's isFarFromTop/isFarFromBottom gate (now removed in
     // favour of the shared !isNearBottom condition); they are retained because
     // the streaming-content glide still uses the running average to size its
@@ -1348,14 +1365,122 @@ fun ChatScreen(
     // change, or session switch — so the next tap re-anchors to whatever the
     // user is currently looking at rather than continuing a stale sequence.
     var lastJumpedUserId by remember(sessionId) { mutableStateOf<String?>(null) }
+    var lastNextUserId by remember(sessionId) { mutableStateOf<String?>(null) }
+
+    val currentUserAnchorId by remember(listState, messages, userMessageIds) {
+        derivedStateOf {
+            val topKey = listState.layoutInfo.visibleItemsInfo
+                .minByOrNull { it.index }?.key as? String
+            val topMessageId = topKey
+                ?.split(':')
+                ?.getOrNull(1)
+                ?.substringBefore('#')
+                ?.takeIf { it.isNotEmpty() }
+            val topMessageIndex = topMessageId
+                ?.let { id -> messages.indexOfFirst { it.id == id } }
+                ?.takeIf { it >= 0 }
+                ?: 0
+            messages.take(topMessageIndex + 1)
+                .lastOrNull { it.role == "user" }
+                ?.id
+                ?: userMessageIds.firstOrNull()
+        }
+    }
+    val fullyVisibleUserIds by remember(listState) {
+        derivedStateOf {
+            val info = listState.layoutInfo
+            info.visibleItemsInfo.asSequence()
+                .filter { item ->
+                    val key = item.key as? String ?: return@filter false
+                    key.startsWith("user:") &&
+                        item.offset >= info.viewportStartOffset &&
+                        item.offset + item.size <= info.viewportEndOffset
+                }
+                .mapNotNull { (it.key as? String)?.removePrefix("user:")?.substringBefore('#') }
+                .toSet()
+        }
+    }
+    val canGoToPreviousUser by remember(
+        listState, messages, userMessageIds, atVisualTop,
+    ) {
+        derivedStateOf {
+            if (atVisualTop.value || userMessageIds.isEmpty()) return@derivedStateOf false
+            val walkFrom = lastJumpedUserId?.takeIf { it in userMessageIds }
+                ?: currentUserAnchorId
+                ?: return@derivedStateOf false
+            val pos = userMessageIds.indexOf(walkFrom)
+            if (pos < 0) return@derivedStateOf false
+            var targetPos = if (lastJumpedUserId == walkFrom && pos > 0) pos - 1 else pos
+            while (targetPos > 0 && userMessageIds[targetPos] in fullyVisibleUserIds) targetPos--
+            userMessageIds[targetPos] !in fullyVisibleUserIds
+        }
+    }
+    val canGoToNextUser by remember(listState, userMessageIds) {
+        derivedStateOf {
+            if (userMessageIds.isEmpty()) return@derivedStateOf false
+            val walkFrom = lastNextUserId?.takeIf { it in userMessageIds }
+                ?: currentUserAnchorId
+                ?: return@derivedStateOf false
+            val fromPos = userMessageIds.indexOf(walkFrom)
+            if (fromPos < 0) return@derivedStateOf false
+            var targetPos = fromPos + 1
+            while (
+                targetPos < userMessageIds.lastIndex &&
+                userMessageIds[targetPos] in fullyVisibleUserIds
+            ) targetPos++
+            targetPos in userMessageIds.indices &&
+                !(targetPos == userMessageIds.lastIndex && userMessageIds[targetPos] in fullyVisibleUserIds)
+        }
+    }
 
     // [T-android-scrollbtn-turn-walk] Content changed (new/removed messages) —
     // the turn-walk anchor may no longer line up, so restart it on the next tap.
     // iOS does this in its snapshot-apply path; on Android the equivalent
     // trigger is the message list itself changing identity/size.
-    LaunchedEffect(messages.size) { lastJumpedUserId = null }
+    LaunchedEffect(messages.size) {
+        lastJumpedUserId = null
+        lastNextUserId = null
+    }
 
-    // [T-android-scrollbtn-turn-walk] Up-button action: walk backwards through
+    // Resolve a user-message row by its stable key, then place its top edge
+    // below the chat header. The scan is deliberately key-based: one message
+    // expands into several flat rows, and reverseLayout means arithmetic on
+    // message indices is not a row index.
+    suspend fun seekUserMessage(target: String, source: String): Boolean {
+        val targetKey = "user:$target"
+        fun indexOfTargetKey(): Int? =
+            listState.layoutInfo.visibleItemsInfo.firstOrNull { it.key == targetKey }?.index
+
+        val restoreIndex = listState.firstVisibleItemIndex
+        val restoreOffset = listState.firstVisibleItemScrollOffset
+        var targetIndex = indexOfTargetKey()
+        var guard = 0
+        if (targetIndex == null) {
+            val maxIdx = (listState.layoutInfo.totalItemsCount - 1).coerceAtLeast(0)
+            var probe = 0
+            while (targetIndex == null && probe <= maxIdx && guard++ < 200) {
+                tracedScrollToItem("$source/seek", probe, 0)
+                targetIndex = indexOfTargetKey()
+                val hi = listState.layoutInfo.visibleItemsInfo.maxByOrNull { it.index }?.index
+                probe = (hi ?: probe) + 1
+            }
+        }
+        if (targetIndex == null) {
+            tracedScrollToItem("$source/restore", restoreIndex, restoreOffset)
+            return false
+        }
+
+        val landIndex = targetIndex
+        tracedScrollToItem("$source/materialize", landIndex, 0)
+        val rowSize = listState.layoutInfo.visibleItemsInfo
+            .firstOrNull { it.key == targetKey }?.size ?: 0
+        val viewportHeight = listState.layoutInfo.viewportSize.height
+        val headerInset = listState.layoutInfo.beforeContentPadding
+        val topOffset = rowSize - viewportHeight + headerInset
+        tracedScrollToItem("$source/land", landIndex, topOffset)
+        return true
+    }
+
     // the conversation one USER turn at a time (iOS `scrollToPreviousUserTurn`).
     // Replaces the old "jump to the very first message":
     //   - First tap: scroll to the user message of the turn the viewport is
@@ -1606,7 +1731,59 @@ fun ChatScreen(
         tracedScrollToItem("FAB-UP/turn-walk-top", landIndex, topOffset)
     }
 
-    // [T-android-scroll-fab-reversed] TEMP diagnostic — capture BOTH FABs'
+    // Symmetric walk toward newer user turns. The same viewport anchor and
+    // stable-key resolver are used as the older-turn action; only the ordinal
+    // direction differs. This keeps the four-button navigator deterministic
+    // even when one message expands into multiple flat rows.
+    val scrollToNextUserTurn: suspend () -> Unit = scrollToNextUserTurn@{
+        val info = listState.layoutInfo
+        val visible = info.visibleItemsInfo
+        if (visible.isEmpty()) return@scrollToNextUserTurn
+        val userIds = messages.filter { it.role == "user" }.map { it.id }
+        if (userIds.isEmpty()) return@scrollToNextUserTurn
+
+        val topKey = visible.minByOrNull { it.index }?.key as? String
+        val topMessageId = topKey
+            ?.split(':')
+            ?.getOrNull(1)
+            ?.takeIf { it.isNotEmpty() }
+        val topMsgIdx = topMessageId
+            ?.let { id -> messages.indexOfFirst { it.id == id } }
+            ?.takeIf { it >= 0 }
+            ?: 0
+        val currentAnchor = messages.take(topMsgIdx + 1)
+            .lastOrNull { it.role == "user" }
+            ?.id
+            ?: userIds.first()
+        val walkFrom = lastNextUserId?.takeIf { it in userIds } ?: currentAnchor
+        val fromPos = userIds.indexOf(walkFrom).coerceAtLeast(0)
+        var targetPos = fromPos + 1
+
+        val viewportTop = info.viewportStartOffset
+        val viewportBottom = info.viewportEndOffset
+        val fullyVisibleUserIds = visible.asSequence()
+            .filter { item ->
+                val key = item.key as? String ?: return@filter false
+                key.startsWith("user:") &&
+                    item.offset >= viewportTop &&
+                    item.offset + item.size <= viewportBottom
+            }
+            .mapNotNull { (it.key as? String)?.removePrefix("user:") }
+            .toSet()
+        while (targetPos < userIds.lastIndex && userIds[targetPos] in fullyVisibleUserIds) {
+            targetPos++
+        }
+        if (targetPos !in userIds.indices) return@scrollToNextUserTurn
+        val target = userIds[targetPos]
+        if (target in fullyVisibleUserIds && targetPos == userIds.lastIndex) {
+            return@scrollToNextUserTurn
+        }
+        if (seekUserMessage(target, "FAB-NEXT")) {
+            lastNextUserId = target
+            lastJumpedUserId = null
+        }
+    }
+
     // gates so we can verify the matrix (bottom=none, middle=both, top=down
     // only) and why the down-FAB is missing at the top. Remove after fix.
     LaunchedEffect(listState) {
@@ -1719,10 +1896,10 @@ fun ChatScreen(
             when (interaction) {
                 is androidx.compose.foundation.interaction.DragInteraction.Start -> {
                     isUserDragging = true
-                    // [T-android-scrollbtn-turn-walk] A manual drag breaks the
-                    // up-button's turn-walk chain: the next tap should re-anchor
-                    // to wherever the user landed, not continue the old sequence.
+                    // Manual scrolling invalidates both directional turn walks;
+                    // the next tap must anchor to the viewport the user chose.
                     lastJumpedUserId = null
+                    lastNextUserId = null
                 }
                 is androidx.compose.foundation.interaction.DragInteraction.Stop -> {
                     isUserDragging = false
@@ -2900,7 +3077,19 @@ fun ChatScreen(
                                 },
                             )
                             MinisMenuDivider()
-                            // Clear Chat (iOS parity, red)
+                                                         // Conversation map: search and jump to any message.
+                             DropdownMenuItem(
+                                 text = { Text("Conversation map") },
+                                 onClick = {
+                                     showChatMenu = false
+                                     showConversationMap = true
+                                 },
+                                 leadingIcon = {
+                                     Icon(Icons.Default.AccountTree, contentDescription = null)
+                                 },
+                             )
+                             MinisMenuDivider()
+                             // Clear Chat (iOS parity, red)
                             DropdownMenuItem(
                                 text = { Text(stringResource(R.string.chat_menu_clear_chat), color = MaterialTheme.colorScheme.error) },
                                 onClick = {
@@ -4517,115 +4706,121 @@ fun ChatScreen(
                     if (leftover > 0.dp) leftover / 2 else 0.dp
                 }
 
-                // Scroll-to-bottom FAB (iOS: circle chevron.down, bottom-right)
-                // T138 phase 2 v3: show on user-scroll intent, not transient
-                // layout state. Otherwise the FAB flickers whenever multi-tool
-                // emissions briefly bump the bottom item off-screen during
-                // re-anchoring.
-                //
-                // T170: gate also on `contentOverflows` so short sessions
-                // (one Q+A on a tall screen) never flash the FAB if an IME
-                // animation produces a synthetic drag-stop. iOS gets this
-                // for free via `maxOffset > 0`; Compose needs the explicit
-                // check.
-                // [T-android-scrollbtn-turn-walk] Floating up-button. Visibility
-                // is now the SHARED `!isNearBottom` condition (iOS dcdec3c5),
-                // replacing the separate isFarFromTop && isFarFromBottom
-                // middle-region gate: both floating buttons now appear together
-                // on the same signal, which is what the iOS refactor converged
-                // on. Sits ABOVE the scroll-to-bottom button (same BottomEnd
-                // anchor, extra bottom padding = down-button height 36dp + 10dp
-                // spacing). Tapping walks BACK one user turn at a time rather
-                // than jumping to the oldest message.
-                if (messages.isNotEmpty() && !isNearBottom.value) {
-                    val upBaseBottom = if (lastToolBlocks.isNotEmpty()) 80.dp else 8.dp
-                    androidx.compose.material3.FilledIconButton(
-                        onClick = {
-                            // [T-android-updown-fab-asymmetry] Arm the same flag a
-                            // finger-drag would. The down-button is gated on
-                            // `userScrolledAway`, which ONLY the drag handlers set
-                            // — and `scrollToPreviousUserTurn` moves the viewport
-                            // with `listState.scrollToItem` (instant, not
-                            // animated), so `isScrollInProgress` never toggles and
-                            // the fling-settle re-arm below never runs either.
-                            // Result: walking up with this button left the user
-                            // far from the bottom with NO way back except a manual
-                            // drag. Measured (ScrollFAB2 trace):
-                            //   up=true down=false | nearBottom=false scrolledAway=false
-                            // The down-button already does the symmetric reset
-                            // (`userScrolledAway = false`); this is its mirror.
-                            userScrolledAway = true
-                            coroutineScope.launch { scrollToPreviousUserTurn() }
-                        },
+                // Long-conversation navigator: keep the same compact circular
+                // controls, but expose all four destinations in one vertical
+                // stack: visual top, previous user message, next user message,
+                // and visual bottom. The stack is only shown away from the
+                // bottom, so it never covers the composer while a new turn is
+                // being written. Every action uses the LazyColumn's stable
+                // keys or its measured end index; no message-row arithmetic is
+                // used for a target that may expand into multiple flat rows.
+                if (messages.isNotEmpty() && contentOverflows.value && !isNearBottom.value) {
+                    val fabBaseBottom = if (lastToolBlocks.isNotEmpty()) 80.dp else 8.dp
+                    Column(
                         modifier = Modifier
                             .align(Alignment.BottomEnd)
-                            .padding(end = 12.dp + fabEndInset, bottom = upBaseBottom + 46.dp)
-                            .shadow(4.dp, CircleShape)
-                            .size(36.dp),
-                        colors = androidx.compose.material3.IconButtonDefaults.filledIconButtonColors(
-                            containerColor = ChatColors.inputBg,
-                            contentColor = ChatColors.primaryText,
-                        ),
+                            .padding(end = 12.dp + fabEndInset, bottom = fabBaseBottom)
+                            .shadow(4.dp, RoundedCornerShape(24.dp))
+                            .background(ChatColors.inputBg, RoundedCornerShape(24.dp))
+                            .padding(vertical = 4.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
                     ) {
-                        Icon(
-                            // Matches iOS's `arrow.up.to.line` (AIChatView.swift:2501):
-                            // an arrow pointing at a top line reads as "jump to a top
-                            // anchor" for the turn-walk, and keeps this button visually
-                            // distinct from the down button's plain chevron.
-                            imageVector = Icons.Default.VerticalAlignTop,
-                            contentDescription = "Scroll to previous message",
-                            modifier = Modifier.size(20.dp),
-                        )
+                        // 到顶：双箭头向上。
+                        androidx.compose.material3.FilledIconButton(
+                            onClick = {
+                                userScrolledAway = true
+                                lastJumpedUserId = null
+                                lastNextUserId = null
+                                coroutineScope.launch {
+                                    val topIndex = (listState.layoutInfo.totalItemsCount - 1).coerceAtLeast(0)
+                                    tracedScrollToItem("FAB-TOP", topIndex, 0)
+                                    kotlinx.coroutines.delay(100)
+                                    val settledTop = (listState.layoutInfo.totalItemsCount - 1).coerceAtLeast(0)
+                                    tracedScrollToItem("FAB-TOP/settle", settledTop, 0)
+                                }
+                            },
+                            modifier = Modifier.size(48.dp),
+                            colors = androidx.compose.material3.IconButtonDefaults.filledIconButtonColors(
+                                containerColor = ChatColors.inputBg,
+                                contentColor = ChatColors.primaryText,
+                            ),
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.KeyboardDoubleArrowUp,
+                                contentDescription = stringResource(R.string.chat_scroll_to_top),
+                                modifier = Modifier.size(20.dp),
+                            )
+                        }
+
+                        // 上一条用户消息：单箭头向上。
+                        androidx.compose.material3.FilledIconButton(
+                            onClick = {
+                                userScrolledAway = true
+                                lastNextUserId = null
+                                coroutineScope.launch { scrollToPreviousUserTurn() }
+                            },
+                            enabled = canGoToPreviousUser,
+                            modifier = Modifier.size(48.dp),
+                            colors = androidx.compose.material3.IconButtonDefaults.filledIconButtonColors(
+                                containerColor = ChatColors.inputBg,
+                                contentColor = ChatColors.primaryText,
+                            ),
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.KeyboardArrowUp,
+                                contentDescription = stringResource(R.string.chat_scroll_to_previous_user),
+                                modifier = Modifier.size(20.dp),
+                            )
+                        }
+
+                        // 下一条用户消息：单箭头向下。
+                        androidx.compose.material3.FilledIconButton(
+                            onClick = {
+                                userScrolledAway = true
+                                coroutineScope.launch { scrollToNextUserTurn() }
+                            },
+                            enabled = canGoToNextUser,
+                            modifier = Modifier.size(48.dp),
+                            colors = androidx.compose.material3.IconButtonDefaults.filledIconButtonColors(
+                                containerColor = ChatColors.inputBg,
+                                contentColor = ChatColors.primaryText,
+                            ),
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.KeyboardArrowDown,
+                                contentDescription = "Scroll to next user message",
+                                modifier = Modifier.size(20.dp),
+                            )
+                        }
+
+                        // 到底：双箭头向下。
+                        androidx.compose.material3.FilledIconButton(
+                            onClick = {
+                                userScrolledAway = false
+                                lastJumpedUserId = null
+                                lastNextUserId = null
+                                coroutineScope.launch {
+                                    tracedScrollToItem("FAB-BOTTOM", 0, 0)
+                                    kotlinx.coroutines.delay(100)
+                                    tracedScrollToItem("FAB-BOTTOM/settle", 0, 0)
+                                }
+                            },
+                            modifier = Modifier.size(48.dp),
+                            colors = androidx.compose.material3.IconButtonDefaults.filledIconButtonColors(
+                                containerColor = ChatColors.inputBg,
+                                contentColor = ChatColors.primaryText,
+                            ),
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.KeyboardDoubleArrowDown,
+                                contentDescription = stringResource(R.string.chat_scroll_to_bottom),
+                                modifier = Modifier.size(20.dp),
+                            )
+                        }
                     }
                 }
 
-                if (userScrolledAway && contentOverflows.value && messages.isNotEmpty()) {
-                    val fabBottomPadding = if (lastToolBlocks.isNotEmpty()) 80.dp else 8.dp
-                    androidx.compose.material3.FilledIconButton(
-                        onClick = {
-                            // [T-android-scroll-fab-down-stuck] Clear the
-                            // scrolled-away intent SYNCHRONOUSLY on tap — that
-                            // alone hides the FAB (its gate is userScrolledAway).
-                            // Don't rely on the at-bottom auto-reset LE
-                            // (`isNearBottom && userScrolledAway → false`): on a
-                            // long reverseLayout session scrollToItem(0,0) can
-                            // settle on a non-zero firstVisibleItemIndex while
-                            // unmeasured items resolve (logged: FAB-DOWN tap left
-                            // firstIdx=41/60, canBwd=false), so isNearBottom stays
-                            // false, the auto-reset never fires, and the FAB was
-                            // stuck visible. The user tapped "go to bottom" — the
-                            // intent is unambiguous, so reset directly.
-                            userScrolledAway = false
-                            // [T-android-scrollbtn-turn-walk] Jumping to the
-                            // bottom resets the up-button's turn-walk (iOS does
-                            // the same in its forceScrollToBottom handler).
-                            lastJumpedUserId = null
-                            coroutineScope.launch {
-                                tracedScrollToItem("FAB-DOWN", 0, 0)
-                                // Second pin after a frame: the first scroll may
-                                // land short while late-measuring items shift the
-                                // true bottom; re-issue once layout settles.
-                                kotlinx.coroutines.delay(100)
-                                tracedScrollToItem("FAB-DOWN/settle", 0, 0)
-                            }
-                        },
-                        modifier = Modifier
-                            .align(Alignment.BottomEnd)
-                            .padding(end = 12.dp + fabEndInset, bottom = fabBottomPadding)
-                            .shadow(4.dp, CircleShape)
-                            .size(36.dp),
-                        colors = androidx.compose.material3.IconButtonDefaults.filledIconButtonColors(
-                            containerColor = ChatColors.inputBg,
-                            contentColor = ChatColors.primaryText,
-                        ),
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.KeyboardArrowDown,
-                            contentDescription = "Scroll to bottom",
-                            modifier = Modifier.size(20.dp),
-                        )
-                    }
-                }
 
                 // T51 / T185: the "Move to…" capsule was previously rendered
                 // here, on top of the message list. After the user actually

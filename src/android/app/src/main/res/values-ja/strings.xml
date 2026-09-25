@@ -1765,4 +1765,33 @@
     <string name="chat_input_placeholder_hint_5">Minis なら ↩︎ キーを送信か改行かに変更できます</string>
     <string name="compact_progress">圧縮中… %1$d 秒経過</string>
     <string name="compact_progress_split">圧縮中… %1$d 秒 · 分割して要約中（%2$d/%3$d）</string>
+    <!-- Routing strategy labels and descriptions. -->
+    <string name="model_group_detail_no_fallback">フォールバックなし</string>
+    <string name="model_group_detail_no_fallback_footer">選択したモデルだけを使用し、他のメンバーへの切り替えやフェイルオーバーを行いません。</string>
+    <string name="model_group_detail_fallback_footer">モデルを順番に試し、失敗したら次のモデルに切り替えます。</string>
+    <string name="model_group_detail_load_balance_footer">グループ内のモデル間でセッションを分散します。</string>
+    <string name="model_group_detail_no_models">このグループにはモデルがありません。</string>
+    <string name="model_group_strategy_no_fallback_short">なし</string>
+    <string name="model_group_strategy_fallback_short">FB</string>
+    <string name="model_group_strategy_load_balance_short">LB</string>
+    <string name="settings_round_injection">ラウンド注入</string>
+    <string name="settings_round_injection_subtitle">すべてのメインセッションとサブエージェントに追加プロンプトを注入</string>
+    <string name="round_injection_title">ラウンド注入</string>
+    <string name="round_injection_section_general">全般</string>
+    <string name="round_injection_footer">ネストされたサブエージェントを含むすべての OpenMinis セッションに適用します。</string>
+    <string name="round_injection_enabled">有効</string>
+    <string name="round_injection_enabled_description">すべてのセッションでラウンド注入を適用</string>
+    <string name="round_injection_section_start">セッション開始時</string>
+    <string name="round_injection_start_enabled">開始時に注入</string>
+    <string name="round_injection_start_enabled_description">最初のモデル呼び出し前に開始プロンプトを追加します。</string>
+    <string name="round_injection_start_prompt">開始プロンプト</string>
+    <string name="round_injection_start_prompt_placeholder">セッション開始時に追加するプロンプト</string>
+    <string name="round_injection_section_periodic">定期注入</string>
+    <string name="round_injection_periodic_enabled">定期的に注入</string>
+    <string name="round_injection_periodic_enabled_description">設定したモデル呼び出し回数ごとにこのプロンプトを追加します。</string>
+    <string name="round_injection_periodic_prompt">定期プロンプト</string>
+    <string name="round_injection_periodic_prompt_placeholder">定期的に追加するプロンプト</string>
+    <string name="round_injection_interval">トリガー間隔</string>
+    <string name="round_injection_interval_description">定期注入の間のモデル呼び出し回数</string>
+    <string name="round_injection_interval_suffix">回</string>
 </resources>

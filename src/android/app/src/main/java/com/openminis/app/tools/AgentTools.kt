@@ -62,7 +62,7 @@ object AgentTools {
     // Aligned with iOS AIChatViewModel.swift browser_use definition
     private fun browserUseDefinition(): AgentToolDefinition = AgentToolDefinition(
         name = "browser_use",
-        description = "Control a web browser with up to 3 tabs. " +
+        description = "Control a web browser with up to 10 tabs. " +
             "Do NOT use this tool for minis:// action URLs (open_terminal, views, settings) — those are app deep links, use Markdown links in chat instead. " +
             "The browser supports both web URLs and minis:// resource URLs. Use minis:// URLs to preview session files (e.g. navigate to minis://workspace/index.html). " +
             "Sub-resources (JS, CSS, images, fonts) referenced via minis:// absolute paths or relative paths within HTML pages resolve correctly. " +
@@ -73,6 +73,9 @@ object AgentTools {
             "get_page_info for page metadata, get_backbone to get a structural overview of the page DOM as a simplified tree, " +
             "fetch to download files/resources using the page's session (returns metadata and a minis:// URL), " +
             "new_tab to open an additional tab, close_tab to close a tab, and list_tabs to see all open tabs. " +
+             "Use get_history to read or delete browsing history, and list_bookmarks/get_bookmarks to list saved bookmarks. " +
+             "Use add_bookmark/bookmark to save the current or supplied URL, remove_bookmark/unbookmark to cancel it, " +
+             "delete_bookmark/clear_bookmarks to remove saved items, and open_bookmark/open_favorite to navigate to a saved item. " +
             "Use set_viewport with viewport_width + viewport_height to override the viewport for the current session (e.g. before screenshotting a 1920×1080 HTML composition that would otherwise be cropped to the phone viewport); pass reset=true to drop the session override and fall back to the global browser setting. " +
             "Use get_cookies to retrieve cookies for the current page URL / current site root domain only (including HttpOnly cookies). get_cookies supports optional 'keywords' (filter by cookie name) and 'fuzzy' (true=contains match, false=exact match, default true). It returns only a summary and an offload env file path — raw cookie values are NOT included in the tool response. To reuse cookies in shell commands: `. /var/minis/offloads/env_cookies_xxx.sh && command`. You may define alias variables when needed. " +
             "Use set_cookies to write cookies into the current page's cookie store via the native cookie store (so even HttpOnly cookies, which JS cannot set, land). Pass a 'cookies' array of objects, each with name + value (required) and optional domain (defaults to the current page host), path (defaults to '/'), secure, http_only, and expires (Unix timestamp in seconds; omit for a session cookie). " +
@@ -102,9 +105,12 @@ object AgentTools {
             "viewport_width" to AgentToolParam("integer", "Viewport width in CSS pixels for set_viewport (e.g. 1920). Required together with viewport_height unless reset=true."),
             "viewport_height" to AgentToolParam("integer", "Viewport height in CSS pixels for set_viewport (e.g. 1080). Required together with viewport_width unless reset=true."),
             "reset" to AgentToolParam("boolean", "For set_viewport: when true, clear the session-level viewport override and fall back to the global browser setting."),
+             "item_id" to AgentToolParam("string", "History or bookmark id for delete/open/remove actions; a bookmark URL is also accepted."),
+             "query" to AgentToolParam("string", "Optional text filter for get_history or bookmark listing actions."),
+             "title" to AgentToolParam("string", "Optional bookmark title for add_bookmark/bookmark actions."),
         ),
         required = listOf("tool_title", "action"),
-        propertyOrdering = listOf("tool_title", "action", "tab_id", "url", "selector", "text", "coordinate_x", "coordinate_y", "direction", "amount", "scroll_count", "item_selector", "script", "user_agent", "max_depth", "keywords", "fuzzy", "cookies", "timeout", "viewport_width", "viewport_height", "reset"),
+        propertyOrdering = listOf("tool_title", "action", "tab_id", "url", "selector", "text", "coordinate_x", "coordinate_y", "direction", "amount", "scroll_count", "item_selector", "script", "user_agent", "max_depth", "keywords", "fuzzy", "cookies", "timeout", "viewport_width", "viewport_height", "reset", "item_id", "query", "title"),
     )
 
     // Aligned with iOS AIChatViewModel.swift:5059-5067

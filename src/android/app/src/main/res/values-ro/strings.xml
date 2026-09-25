@@ -1770,4 +1770,33 @@
     <string name="selection_copy_as_rich_text">Copiază ca text formatat</string>
     <string name="selection_copy_as_plain_text">Copiază ca text simplu</string>
     <string name="chat_input_placeholder_hint_5">Enter poate trimite sau adăuga un rând</string>
+    <!-- Routing strategy labels and descriptions. -->
+    <string name="model_group_detail_no_fallback">Fără rezervă</string>
+    <string name="model_group_detail_no_fallback_footer">Folosește mereu modelul selectat. Nu comuta niciodată la alt membru.</string>
+    <string name="model_group_detail_fallback_footer">Încearcă modelele în ordine și treci la următorul dacă unul eșuează.</string>
+    <string name="model_group_detail_load_balance_footer">Distribuie sesiunile între modelele grupului.</string>
+    <string name="model_group_detail_no_models">Nu există modele în acest grup.</string>
+    <string name="model_group_strategy_no_fallback_short">FĂRĂ</string>
+    <string name="model_group_strategy_fallback_short">FB</string>
+    <string name="model_group_strategy_load_balance_short">LB</string>
+    <string name="settings_round_injection">Injectare pe runde</string>
+    <string name="settings_round_injection_subtitle">Adaugă prompturi în fiecare sesiune principală și de subagent</string>
+    <string name="round_injection_title">Injectare pe runde</string>
+    <string name="round_injection_section_general">General</string>
+    <string name="round_injection_footer">Se aplică tuturor sesiunilor OpenMinis, inclusiv subagenților imbricați.</string>
+    <string name="round_injection_enabled">Activată</string>
+    <string name="round_injection_enabled_description">Aplică injectarea pe runde tuturor sesiunilor</string>
+    <string name="round_injection_section_start">La începutul sesiunii</string>
+    <string name="round_injection_start_enabled">Injectează la început</string>
+    <string name="round_injection_start_enabled_description">Adaugă promptul de început înainte de primul apel al modelului.</string>
+    <string name="round_injection_start_prompt">Prompt de început</string>
+    <string name="round_injection_start_prompt_placeholder">Prompt de adăugat la începutul sesiunii</string>
+    <string name="round_injection_section_periodic">Injectare periodică</string>
+    <string name="round_injection_periodic_enabled">Injectează periodic</string>
+    <string name="round_injection_periodic_enabled_description">Adaugă acest prompt după numărul configurat de apeluri ale modelului.</string>
+    <string name="round_injection_periodic_prompt">Prompt periodic</string>
+    <string name="round_injection_periodic_prompt_placeholder">Prompt de adăugat periodic</string>
+    <string name="round_injection_interval">Interval de declanșare</string>
+    <string name="round_injection_interval_description">Numărul de apeluri ale modelului dintre injectările periodice</string>
+    <string name="round_injection_interval_suffix">apeluri</string>
 </resources>

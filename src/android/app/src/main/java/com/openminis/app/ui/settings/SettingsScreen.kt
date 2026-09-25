@@ -39,10 +39,12 @@ import androidx.compose.material.icons.outlined.Inventory2
 import androidx.compose.material.icons.outlined.Lock
 import androidx.compose.material.icons.outlined.Palette
 import androidx.compose.material.icons.outlined.Psychology
+import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.automirrored.outlined.Send
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.outlined.Shield
 import androidx.compose.material.icons.outlined.Terminal
+import androidx.compose.material.icons.outlined.Tune
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -82,6 +84,10 @@ fun SettingsScreen(
     onSkillsClick: () -> Unit = {},
     onTerminalClick: () -> Unit = {},
     onMemoryClick: () -> Unit = {},
+    // Agent execution behavior and delegation preferences.
+    onAgentBehaviorClick: () -> Unit = {},
+    // DSH-compatible round prompt injection settings.
+    onRoundInjectionClick: () -> Unit = {},
     // [T-mcp-integration-android] MCP Integrations page, listed directly below
     // Memory. Default no-op for callers that haven't wired the route yet.
     onMcpClick: () -> Unit = {},
@@ -195,6 +201,20 @@ fun SettingsScreen(
                     title = stringResource(R.string.settings_memory),
                     subtitle = stringResource(R.string.settings_memory_subtitle),
                     onClick = onMemoryClick,
+                )
+                SettingsItem(
+                    icon = Icons.Outlined.Tune,
+                    iconColor = Color(0xFFAF52DE),
+                    title = stringResource(R.string.settings_agent_behavior),
+                    subtitle = stringResource(R.string.settings_agent_behavior_subtitle),
+                    onClick = onAgentBehaviorClick,
+                )
+                SettingsItem(
+                    icon = Icons.Outlined.Refresh,
+                    iconColor = Color(0xFF5AC8FA),
+                    title = stringResource(R.string.settings_round_injection),
+                    subtitle = stringResource(R.string.settings_round_injection_subtitle),
+                    onClick = onRoundInjectionClick,
                 )
                 // [T-mcp-integration-android] MCP Integrations — directly below Memory.
                 // [T-android-mcp-icon-distinct] Dashboard (2x2 block grid) instead of

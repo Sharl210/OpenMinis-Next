@@ -101,6 +101,24 @@ data class StreamingDelta(
     val isAwaitingModelResponse: Boolean,
 )
 
+/**
+ * Immutable attribution captured for one assistant message.
+ *
+ * The fields mirror the nullable attribution columns on [MessageEntity].
+ * Null means that the row predates message attribution (or that the live
+ * request had no resolved model), so the UI must retain the legacy Soul header.
+ */
+data class AssistantHeaderSnapshot(
+    val modelDisplayName: String? = null,
+    val providerType: String? = null,
+    val providerInstanceId: String? = null,
+    val thinkingLevel: ThinkingLevel? = null,
+) {
+    /** True when this message has enough model identity to replace the legacy header. */
+    val hasModelIdentity: Boolean
+        get() = !modelDisplayName.isNullOrBlank() || !providerType.isNullOrBlank()
+}
+
 data class ChatMessage(
     val id: String,
     val role: String,
@@ -127,6 +145,12 @@ data class ChatMessage(
     // only; assistant messages restored from DB get null and fall back
     // to the chat's current thinking level at render time.
     val thinkingLevel: com.openminis.app.data.model.ThinkingLevel? = null,
+    // [T-android-message-model-title] Attribution captured at message write
+    // time. These remain nullable so pre-attribution rows keep the legacy Soul
+    // header instead of showing a guessed current model.
+    val modelDisplayName: String? = null,
+    val providerType: String? = null,
+    val providerInstanceId: String? = null,
     val error: String? = null,
     // Queued user prompt awaiting injection into the running agent loop.
     // Mirrors iOS ChatMessage.isQueued / queuedPromptId.
@@ -148,6 +172,30 @@ data class ChatMessage(
     // role (AIChatViewModel.swift:3411, 3421).
     val sourceDbIds: List<String> = emptyList(),
 ) {
+    /** Snapshot used by the assistant header, or null for legacy rows. */
+    val assistantHeaderSnapshot: AssistantHeaderSnapshot?
+        get() {
+            val hasAnyAttribution = !modelDisplayName.isNullOrBlank() ||
+                !providerType.isNullOrBlank() ||
+                providerInstanceId != null ||
+                thinkingLevel != null
+            return if (hasAnyAttribution) {
+                AssistantHeaderSnapshot(
+                    modelDisplayName = modelDisplayName,
+                    providerType = providerType,
+                    providerInstanceId = providerInstanceId,
+                    thinkingLevel = thinkingLevel,
+                )
+            } else null
+        }
+
+    /**
+     * [T-android-message-model-title] True only when a model identity is
+     * available. Thinking-only metadata must not replace the legacy header.
+     */
+    val hasAssistantModelAttribution: Boolean
+        get() = assistantHeaderSnapshot?.hasModelIdentity == true
+
     /**
      * [T-bridge-message-ui-leak-android] True when this UI message is the
      * internal role-alternation bridge that `injectQueuedPromptsAsNewTurn`

@@ -26,14 +26,14 @@ import java.util.Date
 import java.util.concurrent.ConcurrentHashMap
 
 /**
- * Manages up to 3 browser tabs for the agent, mirroring iOS BrowserTabPool.
+ * Manages up to 10 browser tabs for the agent, mirroring iOS BrowserTabPool.
  * All tabs share the same cookie store by default on Android.
  */
 class BrowserTabPool(private val context: Context) {
 
     companion object {
         private const val TAG = "BrowserTabPool"
-        private const val MAX_TABS = 3
+        const val MAX_TABS = 10
         private const val IDLE_CHECK_INTERVAL_MS = 60_000L  // 60 seconds
         /** Default idle timeout — matches iOS BrowserTabPool.idleTimeout (15 minutes). */
         const val DEFAULT_IDLE_TIMEOUT_MINUTES = 15
@@ -529,6 +529,25 @@ class BrowserTabPool(private val context: Context) {
             BrowserAction.CLOSE_TAB -> closeTab(input.tabId)
             BrowserAction.LIST_TABS -> listTabs()
             BrowserAction.SET_VIEWPORT -> handleSetViewport(input)
+            BrowserAction.GET_HISTORY -> getHistory(input.query)
+            BrowserAction.LIST_BOOKMARKS,
+            BrowserAction.GET_BOOKMARKS,
+            BrowserAction.GET_FAVORITES -> listBookmarks(input.query)
+            BrowserAction.ADD_BOOKMARK,
+            BrowserAction.BOOKMARK,
+            BrowserAction.ADD_FAVORITE -> addBookmark(input)
+            BrowserAction.REMOVE_BOOKMARK,
+            BrowserAction.UNBOOKMARK,
+            BrowserAction.REMOVE_FAVORITE,
+            BrowserAction.UNFAVORITE -> removeBookmark(input)
+            BrowserAction.DELETE_HISTORY -> deleteHistory(input)
+            BrowserAction.CLEAR_HISTORY -> clearHistory()
+            BrowserAction.DELETE_BOOKMARK,
+            BrowserAction.DELETE_FAVORITE -> deleteBookmark(input)
+            BrowserAction.CLEAR_BOOKMARKS,
+            BrowserAction.CLEAR_FAVORITES -> clearBookmarks()
+            BrowserAction.OPEN_BOOKMARK,
+            BrowserAction.OPEN_FAVORITE -> openBookmark(input, singleTab)
             else -> {
                 // [T-browser-use-per-tab-serial-android] Serialize per explicit
                 // tab id. Only an explicit tab_id that names an EXISTING tab can
@@ -1046,7 +1065,97 @@ class BrowserTabPool(private val context: Context) {
         return tab
     }
 
-    // -- User Agent --
+    // -- History and bookmarks ----------------------------------------------
+
+    private fun historyStore(): BrowserHistoryStore = BrowserHistoryStore.getInstance(context)
+
+    private fun getHistory(query: String?): BrowserActionResult {
+        val entries = if (query.isNullOrBlank()) historyStore().getEntries() else historyStore().search(query)
+        if (entries.isEmpty()) return BrowserActionResult(text = "No browsing history")
+        val text = entries.joinToString("\n") { entry ->
+            "${entry.id} | ${entry.title.ifBlank { entry.domain }} | ${entry.url}"
+        }
+        return BrowserActionResult(text = text)
+    }
+
+    private fun listBookmarks(query: String?): BrowserActionResult {
+        val entries = if (query.isNullOrBlank()) historyStore().getBookmarks() else historyStore().searchBookmarks(query)
+        if (entries.isEmpty()) return BrowserActionResult(text = "No bookmarks")
+        val text = entries.joinToString("\n") { entry ->
+            "${entry.id} | ${entry.title.ifBlank { entry.domain }} | ${entry.url}"
+        }
+        return BrowserActionResult(text = text)
+    }
+
+    private fun addBookmark(input: BrowserActionInput): BrowserActionResult {
+        val url = input.url?.trim().takeUnless { it.isNullOrEmpty() }
+            ?: activeManager?.currentURL?.value?.takeUnless { it.isBlank() || it == "about:blank" }
+        if (url == null) return BrowserActionResult.error("add_bookmark requires 'url' or an open page")
+        val bookmark = historyStore().addBookmark(
+            url,
+            input.title?.takeIf { it.isNotBlank() } ?: activeManager?.pageTitle?.value.orEmpty(),
+        ) ?: return BrowserActionResult.error("invalid bookmark URL")
+        return BrowserActionResult(text = "Bookmarked ${bookmark.url} (id: ${bookmark.id})")
+    }
+
+    private fun removeBookmark(input: BrowserActionInput): BrowserActionResult {
+        val key = input.itemId ?: input.url?.trim()?.takeIf { it.isNotEmpty() }
+            ?: activeManager?.currentURL?.value?.takeUnless { it.isBlank() || it == "about:blank" }
+        if (key == null) return BrowserActionResult.error("remove_bookmark requires 'item_id' or 'url'")
+        val removed = if (historyStore().findBookmark(key)?.id == key) {
+            historyStore().removeBookmark(key)
+        } else {
+            historyStore().removeBookmarkForUrl(key)
+        }
+        return if (removed) BrowserActionResult(text = "Bookmark removed: $key")
+        else BrowserActionResult.error("Bookmark not found: $key")
+    }
+
+    private fun deleteHistory(input: BrowserActionInput): BrowserActionResult {
+        val key = input.itemId ?: input.url?.trim()?.takeIf { it.isNotEmpty() }
+            ?: return BrowserActionResult.error("delete_history requires 'item_id' or 'url'")
+        val deleted = if (historyStore().getEntries().any { it.id == key }) {
+            historyStore().deleteHistory(key)
+        } else {
+            historyStore().deleteHistoryForUrl(key)
+        }
+        return if (deleted) BrowserActionResult(text = "History deleted: $key")
+        else BrowserActionResult.error("History entry not found: $key")
+    }
+
+    private fun clearHistory(): BrowserActionResult {
+        historyStore().clear()
+        return BrowserActionResult(text = "Browsing history cleared")
+    }
+
+    private fun deleteBookmark(input: BrowserActionInput): BrowserActionResult {
+        val key = input.itemId ?: input.url?.trim()?.takeIf { it.isNotEmpty() }
+            ?: return BrowserActionResult.error("delete_bookmark requires 'item_id' or 'url'")
+        val bookmark = historyStore().findBookmark(key)
+        val deleted = if (bookmark != null) historyStore().removeBookmark(bookmark.id)
+        else historyStore().removeBookmarkForUrl(key)
+        return if (deleted) BrowserActionResult(text = "Bookmark deleted: $key")
+        else BrowserActionResult.error("Bookmark not found: $key")
+    }
+
+    private fun clearBookmarks(): BrowserActionResult {
+        historyStore().clearBookmarks()
+        return BrowserActionResult(text = "Bookmarks cleared")
+    }
+
+    private suspend fun openBookmark(input: BrowserActionInput, singleTab: Boolean): BrowserActionResult {
+        val key = input.itemId ?: input.url?.trim()?.takeIf { it.isNotEmpty() }
+            ?: return BrowserActionResult.error("open_bookmark requires a saved bookmark id or URL")
+        val bookmark = historyStore().findBookmark(key)
+            ?: return BrowserActionResult.error("Bookmark not found: $key")
+        val navigate = BrowserActionInput(
+            action = BrowserAction.NAVIGATE,
+            url = bookmark.url,
+            tabId = input.tabId,
+        )
+        return execute(navigate, singleTab)
+    }
+
 
     /** Set user agent from UI settings. Applies to all existing tabs and reloads them. */
     fun setUserAgentFromUI(profile: UserAgentProfile, customUA: String? = null) {

@@ -578,8 +578,9 @@ internal fun ModelPickerSheet(
                                 val isDefault = group.id == defaultPrimaryGroupId
                                 val isExpanded = expandedGroupIds.contains(group.id)
                                 val strategyLabel = when (group.strategy) {
-                                    RoutingStrategy.fallback -> "FB"
-                                    RoutingStrategy.loadBalance -> "LB"
+                                    RoutingStrategy.none -> stringResource(R.string.model_group_strategy_no_fallback_short)
+                                    RoutingStrategy.fallback -> stringResource(R.string.model_group_strategy_fallback_short)
+                                    RoutingStrategy.loadBalance -> stringResource(R.string.model_group_strategy_load_balance_short)
                                 }
                                 // Resolve entry: try memberEntryIds first, fallback to activeEntryId ONLY if this group is selected
                                 // SystemVoiceEntries fallback: voice groups are
@@ -655,9 +656,11 @@ internal fun ModelPickerSheet(
                                                     .padding(horizontal = 5.dp, vertical = 1.dp),
                                             ) {
                                                 Icon(
-                                                    if (group.strategy == RoutingStrategy.fallback)
-                                                        Icons.Default.ArrowCircleDown
-                                                    else Icons.Default.AccountTree,
+                                                    when (group.strategy) {
+                                                        RoutingStrategy.none -> Icons.Default.CheckCircle
+                                                        RoutingStrategy.fallback -> Icons.Default.ArrowCircleDown
+                                                        RoutingStrategy.loadBalance -> Icons.Default.AccountTree
+                                                    },
                                                     contentDescription = null,
                                                     modifier = Modifier.size(9.dp),
                                                     tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
