@@ -101,7 +101,7 @@ object SoulIcon {
 
     /** Decode a stored data URI. Returns null for an emoji value or garbage. */
     fun decode(value: String): Bitmap? {
-        if (!isDataUri(value)) return null
+        if (!isDataUri(value) || value.length > MAX_DATA_URI_CHARS) return null
         return runCatching {
             val bytes = Base64.decode(value.removePrefix(DATA_URI_PREFIX), Base64.DEFAULT)
             BitmapFactory.decodeByteArray(bytes, 0, bytes.size)

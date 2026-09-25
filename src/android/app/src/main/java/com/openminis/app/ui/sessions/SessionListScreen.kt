@@ -1,6 +1,10 @@
 package com.openminis.app.ui.sessions
 
 import android.content.Context
+import android.graphics.BitmapFactory
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
@@ -77,6 +81,7 @@ import androidx.compose.material.icons.outlined.Brush
 import androidx.compose.material.icons.outlined.Calculate
 import androidx.compose.material.icons.outlined.CalendarMonth
 import androidx.compose.material.icons.outlined.ChecklistRtl
+import androidx.compose.material.icons.outlined.CreateNewFolder
 import androidx.compose.material.icons.outlined.Circle
 import androidx.compose.material.icons.outlined.Code
 import androidx.compose.material.icons.outlined.Schedule
@@ -178,6 +183,12 @@ import com.openminis.app.ui.theme.ChatColors
 import com.openminis.app.ui.theme.minisFabColor
 import com.openminis.app.data.repository.ChatRepository
 import com.openminis.app.data.repository.ProviderRepository
+import com.openminis.app.agent.SoulIcon
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.foundation.Image
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlin.math.roundToInt
 import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.map
@@ -597,13 +608,14 @@ fun SessionListScreen(
     var showDeleteDialog by remember { mutableStateOf(false) }
     var deleteTargetId by remember { mutableStateOf<String?>(null) }
     // [T-android-session-grouping] Group management dialogs.
-    var folderToRename by remember { mutableStateOf<FolderEntity?>(null) }
+    var folderToEdit by remember { mutableStateOf<FolderEntity?>(null) }
     var folderToDissolve by remember { mutableStateOf<FolderEntity?>(null) }
     // iOS "Delete Group & N Sessions" — pair carries the member count so the
     // confirmation can restate the consequence.
     var folderToDelete by remember { mutableStateOf<Pair<FolderEntity, Int>?>(null) }
     var showBulkDeleteDialog by remember { mutableStateOf(false) }
     var showOverflowMenu by remember { mutableStateOf(false) }
+    var showCreateFolderDialog by remember { mutableStateOf(false) }
     var editSession by remember { mutableStateOf<ChatSessionEntity?>(null) }
     var showBrowserSheet by remember { mutableStateOf(false) }
     var showBrowserSettings by remember { mutableStateOf(false) }
@@ -808,6 +820,21 @@ fun SessionListScreen(
                         // [T-android-scheduled-tasks-full] Badge shows the count of
                         // scheduled tasks so the user can see at a glance how many
                         // are configured without opening the list.
+                        IconButton(
+                            onClick = {
+                                if (isSearchActive) {
+                                    viewModel.searchQuery.value = ""
+                                    viewModel.isSearchActive.value = false
+                                } else {
+                                    viewModel.isSearchActive.value = true
+                                }
+                            },
+                        ) {
+                            Icon(
+                                Icons.Outlined.Search,
+                                contentDescription = stringResource(R.string.sessionlist_search_action),
+                            )
+                        }
                         IconButton(onClick = onScheduledTasksClick) {
                             if (scheduledTaskCount > 0) {
                                 BadgedBox(badge = { Badge { Text("$scheduledTaskCount") } }) {
@@ -833,6 +860,17 @@ fun SessionListScreen(
                                 onDismissRequest = { showOverflowMenu = false },
                                 offset = DpOffset(0.dp, 0.dp),
                             ) {
+                                DropdownMenuItem(
+                                    text = { Text(stringResource(R.string.group_create_new)) },
+                                    onClick = {
+                                        showOverflowMenu = false
+                                        showCreateFolderDialog = true
+                                    },
+                                    leadingIcon = {
+                                        Icon(Icons.Outlined.CreateNewFolder, contentDescription = null)
+                                    },
+                                )
+                                MinisMenuDivider()
                                 if (sessions.isNotEmpty()) {
                                     DropdownMenuItem(
                                         text = { Text(stringResource(R.string.sessionlist_select_action)) },
@@ -1105,7 +1143,7 @@ fun SessionListScreen(
                                             }
                                         },
                                         onTogglePin = { viewModel.toggleFolderPin(block.folder.id) },
-                                        onRename = { folderToRename = block.folder },
+                                        onRename = { folderToEdit = block.folder },
                                         onDissolve = { folderToDissolve = block.folder },
                                         onNewChatInGroup = {
                                             // iOS newChatInFolder: auto-expand
@@ -1199,6 +1237,7 @@ fun SessionListScreen(
                             ) {
                                 FolderComposedIcon(
                                     category = bar.firstCategory,
+                                    icon = bar.folder.icon,
                                     diameter = 30.dp,
                                 )
                                 // Folder names are user data — verbatim.
@@ -1245,7 +1284,7 @@ fun SessionListScreen(
                     onDelete = { showBulkDeleteDialog = true },
                     modifier = Modifier.align(Alignment.BottomCenter),
                 )
-            } else if (hasProviders && (sessions.isNotEmpty() || isSearchActive)) {
+            } else if (hasProviders) {
                 // Dual FAB row (matching iOS: New Chat left + Search right, or vice versa).
                 // Hidden while the onboarding landing is showing — Step 3 provides the CTA.
                 // T46: stay visible while search is active even when the result
@@ -1256,7 +1295,6 @@ fun SessionListScreen(
                     isSearchActive = isSearchActive,
                     searchQuery = searchQuery,
                     isSearching = isSearching,
-                    hasSessions = sessions.isNotEmpty() || isSearchActive,
                     onNewChat = {
                         scope.launch {
                             val sessionId = viewModel.createNewSession()
@@ -1270,14 +1308,7 @@ fun SessionListScreen(
                         }
                     },
                     modelGroups = providerConfig.modelGroups,
-                    onSearchToggle = {
-                        if (isSearchActive) {
-                            viewModel.searchQuery.value = ""
-                            viewModel.isSearchActive.value = false
-                        } else {
-                            viewModel.isSearchActive.value = true
-                        }
-                    },
+                    onCreateGroup = { showCreateFolderDialog = true },
                     onSearchQueryChange = { viewModel.searchQuery.value = it },
                     onSearchDismiss = {
                         viewModel.searchQuery.value = ""
@@ -1346,29 +1377,106 @@ fun SessionListScreen(
         )
     }
 
-    folderToRename?.let { folder ->
-        // Both fields are SEEDED from the current group. The rename always
-        // writes the description through, so an unseeded field would silently
-        // wipe a description the user never touched.
+    showCreateFolderDialog.let { showDialog ->
+        if (showDialog) {
+            var name by remember { mutableStateOf("") }
+            var desc by remember { mutableStateOf("") }
+            val duplicate = remember(name, folders) {
+                folders.firstOrNull { it.name.trim().equals(name.trim(), ignoreCase = true) }
+            }
+            androidx.compose.material3.AlertDialog(
+                onDismissRequest = { showCreateFolderDialog = false },
+                title = { Text(stringResource(R.string.group_create_new)) },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        DialogTextFieldFrame {
+                            SectionTextField(
+                                value = name,
+                                onValueChange = { name = it },
+                                placeholder = stringResource(R.string.group_name_hint),
+                            )
+                        }
+                        DialogTextFieldFrame {
+                            SectionTextField(
+                                value = desc,
+                                onValueChange = { desc = it.take(FolderEntity.DESC_MAX_CHARS) },
+                                placeholder = stringResource(R.string.group_desc_hint),
+                            )
+                        }
+                        if (duplicate != null) {
+                            Text(
+                                stringResource(R.string.group_duplicate_exists, duplicate.name),
+                                color = MaterialTheme.colorScheme.error,
+                            )
+                        }
+                    }
+                },
+                confirmButton = {
+                    MinisTextButton(
+                        enabled = name.isNotBlank() && duplicate == null,
+                        onClick = {
+                            viewModel.createFolder(name, desc)
+                            showCreateFolderDialog = false
+                        },
+                    ) { Text(stringResource(R.string.group_create)) }
+                },
+                dismissButton = {
+                    MinisTextButton(onClick = { showCreateFolderDialog = false }) {
+                        Text(stringResource(R.string.cancel))
+                    }
+                },
+            )
+        }
+    }
+
+    val imageUnreadableMessage = stringResource(R.string.soul_icon_error_unreadable)
+    val imageTooLargeMessage = stringResource(R.string.soul_icon_error_too_large)
+    folderToEdit?.let { folder ->
         var name by remember(folder.id) { mutableStateOf(folder.name) }
         var desc by remember(folder.id) { mutableStateOf(folder.description.orEmpty()) }
-        // A plain AlertDialog rather than MinisAlertDialog: this one needs two
-        // text fields, and MinisAlertDialog is a title/text/buttons component.
-        // Widening it for a single caller would push layout complexity into
-        // every other dialog in the app.
+        var icon by remember(folder.id) { mutableStateOf(folder.icon.orEmpty()) }
+        var imageError by remember(folder.id) { mutableStateOf<String?>(null) }
+        var showEmojiInput by remember(folder.id) { mutableStateOf(false) }
+        val context = LocalContext.current
+        val imagePicker = rememberLauncherForActivityResult(
+            contract = ActivityResultContracts.PickVisualMedia(),
+        ) { uri ->
+            if (uri == null) return@rememberLauncherForActivityResult
+            scope.launch {
+                val result = withContext(Dispatchers.IO) {
+                    val bitmap = runCatching {
+                        context.contentResolver.openInputStream(uri)?.use { input ->
+                            BitmapFactory.decodeStream(input)
+                        }
+                    }.getOrNull()
+                    if (bitmap == null) {
+                        SoulIcon.EncodeResult.Failure(SoulIcon.Rejection.UNREADABLE)
+                    } else {
+                        SoulIcon.encode(bitmap)
+                    }
+                }
+                when (result) {
+                    is SoulIcon.EncodeResult.Success -> {
+                        icon = result.dataUri
+                        imageError = null
+                    }
+                    is SoulIcon.EncodeResult.Failure -> {
+                        imageError = when (result.reason) {
+                            SoulIcon.Rejection.UNREADABLE -> imageUnreadableMessage
+                            SoulIcon.Rejection.TOO_LARGE -> imageTooLargeMessage
+                        }
+                    }
+                }
+            }
+        }
         androidx.compose.material3.AlertDialog(
-            onDismissRequest = { folderToRename = null },
-            title = { Text(stringResource(R.string.group_rename)) },
+            onDismissRequest = { folderToEdit = null },
+            title = { Text(stringResource(R.string.group_edit)) },
             text = {
-                Column {
-                    // SectionTextField is built for settings screens: it draws
-                    // NO border and uses horizontal contentPadding = 0, because
-                    // there its parent (SettingsCardBlock) supplies both the
-                    // 16dp inset and the card surface that bounds it. A dialog
-                    // has neither, so used bare the glyphs sat flush against
-                    // the fill and the two fields read as one block. Wrap each
-                    // one the way a settings card would, plus a hairline border
-                    // so the input edge is visible on the dialog's own surface.
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                        FolderComposedIcon(category = null, icon = icon, diameter = 56.dp)
+                    }
                     DialogTextFieldFrame {
                         SectionTextField(
                             value = name,
@@ -1376,7 +1484,6 @@ fun SessionListScreen(
                             placeholder = stringResource(R.string.group_name_hint),
                         )
                     }
-                    Spacer(Modifier.height(12.dp))
                     DialogTextFieldFrame {
                         SectionTextField(
                             value = desc,
@@ -1384,16 +1491,48 @@ fun SessionListScreen(
                             placeholder = stringResource(R.string.group_desc_hint),
                         )
                     }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        MinisOutlinedButton(
+                            onClick = { showEmojiInput = !showEmojiInput },
+                            modifier = Modifier.weight(1f),
+                        ) { Text(stringResource(R.string.soul_icon_choose_emoji)) }
+                        MinisOutlinedButton(
+                            onClick = {
+                                imagePicker.launch(
+                                    PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly),
+                                )
+                            },
+                            modifier = Modifier.weight(1f),
+                        ) { Text(stringResource(R.string.soul_icon_choose_image)) }
+                    }
+                    if (showEmojiInput) {
+                        OutlinedTextField(
+                            value = icon.takeIf { SoulIcon.isEmojiGlyph(it) }.orEmpty(),
+                            onValueChange = { icon = SoulIcon.normalizeEmojiInput(it) },
+                            singleLine = true,
+                            label = { Text(stringResource(R.string.soul_icon_choose_emoji)) },
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
+                    if (icon.isNotBlank()) {
+                        MinisTextButton(onClick = { icon = "" }) {
+                            Text(stringResource(R.string.soul_restore_default))
+                        }
+                    }
+                    imageError?.let { Text(it, color = MaterialTheme.colorScheme.error) }
                 }
             },
             confirmButton = {
                 MinisTextButton(onClick = {
-                    viewModel.renameFolder(folder.id, name, desc)
-                    folderToRename = null
+                    viewModel.updateFolderIdentity(folder.id, name, desc, icon.ifBlank { null })
+                    folderToEdit = null
                 }) { Text(stringResource(R.string.common_save)) }
             },
             dismissButton = {
-                MinisTextButton(onClick = { folderToRename = null }) {
+                MinisTextButton(onClick = { folderToEdit = null }) {
                     Text(stringResource(R.string.cancel))
                 }
             },
@@ -1479,11 +1618,10 @@ private fun DualFabRow(
     isSearchActive: Boolean,
     searchQuery: String,
     isSearching: Boolean,
-    hasSessions: Boolean,
     onNewChat: () -> Unit,
     onNewChatWithGroup: (String) -> Unit,
     modelGroups: List<com.openminis.app.data.model.ModelGroup>,
-    onSearchToggle: () -> Unit,
+    onCreateGroup: () -> Unit,
     onSearchQueryChange: (String) -> Unit,
     onSearchDismiss: () -> Unit,
     modifier: Modifier = Modifier,
@@ -1512,9 +1650,8 @@ private fun DualFabRow(
         }
     }
 
-    // Drag offset for the currently-dragged FAB
+    // The chat FAB retains the existing order-swap preference for continuity.
     var chatDragX by remember { mutableFloatStateOf(0f) }
-    var searchDragX by remember { mutableFloatStateOf(0f) }
 
     // Threshold to trigger swap (half screen width roughly)
     val density = LocalDensity.current
@@ -1585,41 +1722,20 @@ private fun DualFabRow(
         }
     }
 
-    val searchFab: @Composable () -> Unit = {
-        if (hasSessions) {
-            AnimatedVisibility(
-                visible = !isSearchActive,
-                enter = fadeIn(tween(200)) + scaleIn(tween(200), initialScale = 0.85f),
-                exit = fadeOut(tween(150)) + scaleOut(tween(150), targetScale = 0.85f),
-            ) {
-                FloatingActionButton(
-                    onClick = onSearchToggle,
-                    shape = CircleShape,
-                    // iOS: UIColor.secondarySystemBackground = #F2F2F7 (light) / #1C1C1E (dark).
-                    // ChatColors.secondaryBg already matches these values across themes.
-                    containerColor = ChatColors.secondaryBg,
-                    modifier = Modifier
-                        .size(56.dp)
-                        .offset { IntOffset(searchDragX.roundToInt(), 0) }
-                        .pointerInput(Unit) {
-                            detectHorizontalDragGestures(
-                                onDragEnd = {
-                                    if (kotlin.math.abs(searchDragX) > swapThreshold) {
-                                        isSwapped = !isSwapped
-                                        prefs.edit().putBoolean(PREF_FAB_SWAPPED, isSwapped).apply()
-                                    }
-                                    searchDragX = 0f
-                                },
-                                onDragCancel = { searchDragX = 0f },
-                                onHorizontalDrag = { _, dragAmount -> searchDragX += dragAmount },
-                            )
-                        }
-                        .shadow(6.dp, CircleShape, ambientColor = Color.Black.copy(alpha = 0.15f)),
-                    elevation = FloatingActionButtonDefaults.elevation(defaultElevation = 4.dp),
-                ) {
-                    Icon(Icons.Outlined.Search, contentDescription = stringResource(R.string.sessionlist_search_action), tint = MaterialTheme.colorScheme.onSurface, modifier = Modifier.size(24.dp))
-                }
-            }
+    val createGroupFab: @Composable () -> Unit = {
+        FloatingActionButton(
+            onClick = onCreateGroup,
+            shape = CircleShape,
+            containerColor = ChatColors.secondaryBg,
+            contentColor = MaterialTheme.colorScheme.onSurface,
+            modifier = Modifier.size(56.dp),
+            elevation = FloatingActionButtonDefaults.elevation(defaultElevation = 4.dp),
+        ) {
+            Icon(
+                Icons.Outlined.CreateNewFolder,
+                contentDescription = stringResource(R.string.group_create_new),
+                modifier = Modifier.size(24.dp),
+            )
         }
     }
 
@@ -1635,7 +1751,7 @@ private fun DualFabRow(
         verticalAlignment = Alignment.CenterVertically,
     ) {
         // Render in swapped or normal order
-        if (isSwapped) { searchFab(); } else { chatFab() }
+        if (isSwapped) { createGroupFab() } else { chatFab() }
 
         // Middle: Inline search bar (when active)
         AnimatedVisibility(
@@ -1708,7 +1824,7 @@ private fun DualFabRow(
             )
         }
 
-        if (isSwapped) { chatFab() } else { searchFab() }
+        if (isSwapped) { chatFab() } else { createGroupFab() }
     }
 }
 
@@ -2246,7 +2362,35 @@ private fun groupGlyphPath(side: Float): Path = Path().apply {
  * icons' 0.18 so a group circle reads as a different kind of thing.
  */
 @Composable
-private fun FolderComposedIcon(category: String?, diameter: Dp = 44.dp) {
+private fun FolderComposedIcon(
+    category: String?,
+    icon: String? = null,
+    diameter: Dp = 44.dp,
+) {
+    val stored = icon.orEmpty()
+    val bitmap = remember(stored) { SoulIcon.decode(stored) }
+    if (bitmap != null) {
+        Image(
+            bitmap = bitmap.asImageBitmap(),
+            contentDescription = stringResource(R.string.soul_icon_choose_image),
+            contentScale = ContentScale.Crop,
+            modifier = Modifier
+                .size(diameter)
+                .clip(CircleShape),
+        )
+        return
+    }
+    if (stored.isNotBlank() && SoulIcon.isEmojiGlyph(stored)) {
+        Box(
+            modifier = Modifier
+                .size(diameter)
+                .background(MaterialTheme.colorScheme.surfaceVariant, CircleShape),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(stored, fontSize = (diameter.value * 0.5f).sp)
+        }
+        return
+    }
     val tint = categoryStyle(category).color
     Box(
         modifier = Modifier
@@ -2378,7 +2522,10 @@ private fun FolderCard(
             // `anyPaused` already carries the 24h freshness filter; rows are
             // deliberately unfiltered.
             Box(modifier = Modifier.size(44.dp)) {
-                FolderComposedIcon(category = block.firstCategory)
+                FolderComposedIcon(
+                    category = block.firstCategory,
+                    icon = block.folder.icon,
+                )
                 // [T-android-group-running-ring] Collapsed-only, same as the
                 // paused badge below and for the same reason: an expanded
                 // group's members carry their own rings, so a header copy

@@ -128,6 +128,25 @@ interface ChatDao {
         UPDATE folders
         SET name = :name,
             description = COALESCE(:description, description),
+            icon = :icon,
+            updated_at = :updatedAt
+        WHERE id = :id
+        """,
+    )
+    suspend fun updateFolderIdentity(
+        id: String,
+        name: String,
+        description: String?,
+        icon: String?,
+        updatedAt: Long,
+    )
+
+    /** Backward-compatible title/description update for non-icon callers. */
+    @Query(
+        """
+        UPDATE folders
+        SET name = :name,
+            description = COALESCE(:description, description),
             updated_at = :updatedAt
         WHERE id = :id
         """,

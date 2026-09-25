@@ -509,12 +509,14 @@
     <string name="group_name_hint">Group Name</string>
     <string name="group_desc_hint">Description (optional, guides auto-grouping)</string>
     <string name="group_create">Create</string>
+    <string name="group_create_new">New Group</string>
     <string name="group_section_header">Groups</string>
     <string name="group_none">No Group</string>
     <string name="group_none_subtitle">Remove from its current group</string>
     <string name="group_n_chats">%1$d chats</string>
     <string name="group_empty">Empty group</string>
     <string name="group_rename">Rename Group</string>
+    <string name="group_edit">Edit Group</string>
     <string name="group_new_chat_in">New Chat in Group</string>
     <string name="group_dissolve">Dissolve Group</string>
     <string name="group_dissolve_confirm_title">Dissolve Group?</string>

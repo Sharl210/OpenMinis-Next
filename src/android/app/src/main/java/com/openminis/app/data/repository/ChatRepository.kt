@@ -5,6 +5,7 @@ import com.openminis.app.data.db.ChatDao
 import com.openminis.app.data.db.ChatSessionEntity
 import com.openminis.app.data.db.FolderEntity
 import com.openminis.app.data.db.MessageEntity
+import com.openminis.app.agent.SoulIcon
 import com.openminis.app.data.model.ModelAttributionSnapshot
 import kotlinx.coroutines.flow.Flow
 import java.util.UUID
@@ -164,7 +165,41 @@ class ChatRepository(internal val dao: ChatDao) {
         )
     }
 
-    /** @return the new pinned state. Bumps `updated_at` so the edit is stamped. */
+    /**
+     * Update the user-visible group identity without changing its UUID or members.
+     * [icon] is either a normalized SoulIcon emoji/data URI or null for default.
+     */
+    suspend fun updateFolderIdentity(
+        id: String,
+        name: String,
+        description: String? = null,
+        icon: String? = null,
+    ) {
+        val trimmed = name.trim()
+        if (trimmed.isEmpty()) return
+        val normalizedIcon = when {
+            icon == null -> null
+            icon.trim().isBlank() -> null
+            else -> {
+                val value = icon.trim()
+                when {
+                    SoulIcon.normalizeEmojiInput(value) == value -> value
+                    SoulIcon.isDataUri(value) &&
+                        value.length <= SoulIcon.MAX_DATA_URI_CHARS &&
+                        SoulIcon.decode(value) != null -> value
+                    else -> null
+                }
+            }
+        }
+        dao.updateFolderIdentity(
+            id = id,
+            name = trimmed,
+            description = description?.trim()?.take(FolderEntity.DESC_MAX_CHARS),
+            icon = normalizedIcon,
+            updatedAt = System.currentTimeMillis(),
+        )
+    }
+
     suspend fun toggleFolderPin(id: String): Boolean {
         val current = dao.getFolder(id) ?: return false
         val nowPinned = current.pinnedAt == null

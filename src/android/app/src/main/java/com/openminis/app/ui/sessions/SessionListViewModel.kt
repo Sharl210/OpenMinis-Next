@@ -736,6 +736,19 @@ class SessionListViewModel(
         viewModelScope.launch { chatRepository.toggleFolderPin(folderId) }
     }
 
+    fun createFolder(name: String, description: String?) {
+        viewModelScope.launch {
+            val folder = chatRepository.createFolder(name, description)
+            expandOnly(folder.id)
+        }
+    }
+
+    fun updateFolderIdentity(folderId: String, name: String, description: String?, icon: String?) {
+        viewModelScope.launch {
+            chatRepository.updateFolderIdentity(folderId, name, description, icon)
+        }
+    }
+
     fun renameFolder(folderId: String, name: String, description: String?) {
         viewModelScope.launch { chatRepository.renameFolder(folderId, name, description) }
     }
