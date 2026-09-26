@@ -16,6 +16,7 @@ enum class RuntimeNodeStatus {
     STARTING,
     RUNNING,
     WAITING_CHILDREN,
+    STOP_REQUESTED,
     SUCCEEDED,
     FAILED,
     ABORTED,
@@ -23,6 +24,42 @@ enum class RuntimeNodeStatus {
 }
 
 enum class RuntimeDelivery { QUEUE, STEER, NOTIFY, TEAM_PEER }
+
+enum class RuntimeControlOperationType { STOP_DESCENDANT }
+
+data class RuntimeStopRequest(
+    val actorNodeId: String,
+    val targetNodeId: String,
+    val rootId: String? = null,
+    val reason: String = "",
+    val operationId: String = UUID.randomUUID().toString(),
+    val idempotencyKey: String = operationId,
+) {
+    init {
+        require(actorNodeId.isNotBlank()) { "actorNodeId must not be blank" }
+        require(targetNodeId.isNotBlank()) { "targetNodeId must not be blank" }
+        require(operationId.isNotBlank()) { "operationId must not be blank" }
+        require(idempotencyKey.isNotBlank()) { "idempotencyKey must not be blank" }
+    }
+}
+
+data class RuntimeStopReceipt(
+    val operationId: String,
+    val idempotencyKey: String,
+    val type: RuntimeControlOperationType,
+    val actorNodeId: String,
+    val targetNodeId: String,
+    val rootId: String?,
+    val accepted: Boolean,
+    val stateBefore: RuntimeNodeStatus?,
+    val stateAfter: RuntimeNodeStatus?,
+    val affectedNodeIds: List<String>,
+    val actorCapabilitySnapshot: AgentCapabilitySnapshot?,
+    val targetCapabilitySnapshot: AgentCapabilitySnapshot?,
+    val createdAtMillis: Long,
+    val reason: String? = null,
+    val eventId: String? = null,
+)
 
 enum class RuntimeEdgeKind { PARENT_CHILD, SUBSCRIPTION, TEAM_PEER }
 
@@ -224,6 +261,9 @@ class RuntimeSessionTree(
     private val transcripts = LinkedHashMap<String, MutableList<RuntimeTranscriptMessage>>()
     private val topologyEdges = LinkedHashMap<String, RuntimeTopologyEdge>()
     private val subscriptions = LinkedHashMap<String, RuntimeSubscription>()
+    private val controlReceipts = LinkedHashMap<String, RuntimeStopReceipt>()
+    private val controlOperationIdByIdempotencyKey = LinkedHashMap<String, String>()
+    private val pendingStopOperationByNodeId = LinkedHashMap<String, String>()
     private val rootIds = LinkedHashSet<String>()
     /** Legacy representative root retained for source and JSON compatibility. */
     private var rootId: String? = null
@@ -401,7 +441,7 @@ class RuntimeSessionTree(
     @Synchronized
     fun heartbeat(nodeId: String, nowMillis: Long = clock()): Boolean {
         val node = nodes[nodeId] ?: return false
-        if (!node.status.isActive()) return false
+        if (!node.status.isLeaseActive()) return false
         nodes[nodeId] = node.copy(updatedAtMillis = nowMillis, leaseUntilMillis = nowMillis + config.leaseMillis)
         record(nodeId, "heartbeat", nowMillis)
         return true
@@ -409,7 +449,7 @@ class RuntimeSessionTree(
 
     @Synchronized
     fun renewActiveLeases(nowMillis: Long = clock()): List<String> {
-        val active = nodes.values.filter { it.status.isActive() }.map { it.id }
+        val active = nodes.values.filter { it.status.isLeaseActive() }.map { it.id }
         active.forEach { heartbeat(it, nowMillis) }
         return active
     }
@@ -428,17 +468,197 @@ class RuntimeSessionTree(
     )
 
     @Synchronized
+    fun stopDescendant(request: RuntimeStopRequest): RuntimeStopReceipt {
+        controlOperationIdByIdempotencyKey[request.idempotencyKey]?.let { previousId ->
+            controlReceipts[previousId]?.let { return it }
+        }
+        controlReceipts[request.operationId]?.let { previous ->
+            controlOperationIdByIdempotencyKey[request.idempotencyKey] = previous.operationId
+            return previous
+        }
+
+        val now = clock()
+        val actor = nodes[request.actorNodeId]
+        val target = nodes[request.targetNodeId]
+        val actorSnapshot = actor?.let { capabilitySnapshot(it.id) }
+        val targetSnapshot = target?.let { capabilitySnapshot(it.id) }
+        val authorizationFailure = authorizeDescendantStop(
+            actor = actor,
+            target = target,
+            requestedRootId = request.rootId,
+        )
+        val allowed = authorizationFailure == null
+        if (!allowed) {
+            val reason = authorizationFailure ?: "stop is not authorized"
+            val rejected = RuntimeStopReceipt(
+                operationId = request.operationId,
+                idempotencyKey = request.idempotencyKey,
+                type = RuntimeControlOperationType.STOP_DESCENDANT,
+                actorNodeId = request.actorNodeId,
+                targetNodeId = request.targetNodeId,
+                rootId = target?.rootId ?: request.rootId,
+                accepted = false,
+                stateBefore = target?.status,
+                stateAfter = target?.status,
+                affectedNodeIds = emptyList(),
+                actorCapabilitySnapshot = actorSnapshot,
+                targetCapabilitySnapshot = targetSnapshot,
+                createdAtMillis = now,
+                reason = reason,
+            )
+            val event = record(
+                request.actorNodeId,
+                "descendant_stop_rejected",
+                now,
+                stopAuditPayload(
+                    request = request,
+                    actorNodeId = request.actorNodeId,
+                    targetNodeId = request.targetNodeId,
+                    rootId = target?.rootId ?: request.rootId,
+                    stateBefore = target?.status,
+                    stateAfter = target?.status,
+                    reason = reason,
+                    actorSnapshot = actorSnapshot,
+                    targetSnapshot = targetSnapshot,
+                ),
+            )
+            val stored = rejected.copy(eventId = event.id)
+            controlReceipts[stored.operationId] = stored
+            controlOperationIdByIdempotencyKey[stored.idempotencyKey] = stored.operationId
+            return stored
+        }
+
+        val authorizedActor = requireNotNull(actor)
+        val authorizedTarget = requireNotNull(target)
+        val stateBefore = authorizedTarget.status
+        if (!authorizedTarget.status.isActive()) {
+            val reason = "target is not active"
+            val event = record(
+                authorizedActor.id,
+                "descendant_stop_rejected",
+                now,
+                stopAuditPayload(
+                    request = request,
+                    actorNodeId = authorizedActor.id,
+                    targetNodeId = authorizedTarget.id,
+                    rootId = authorizedTarget.rootId,
+                    stateBefore = stateBefore,
+                    stateAfter = stateBefore,
+                    reason = reason,
+                    actorSnapshot = actorSnapshot,
+                    targetSnapshot = targetSnapshot,
+                ),
+            )
+            val rejected = RuntimeStopReceipt(
+                operationId = request.operationId,
+                idempotencyKey = request.idempotencyKey,
+                type = RuntimeControlOperationType.STOP_DESCENDANT,
+                actorNodeId = authorizedActor.id,
+                targetNodeId = authorizedTarget.id,
+                rootId = authorizedTarget.rootId,
+                accepted = false,
+                stateBefore = stateBefore,
+                stateAfter = stateBefore,
+                affectedNodeIds = emptyList(),
+                actorCapabilitySnapshot = actorSnapshot,
+                targetCapabilitySnapshot = targetSnapshot,
+                createdAtMillis = now,
+                reason = reason,
+                eventId = event.id,
+            )
+            controlReceipts[rejected.operationId] = rejected
+            controlOperationIdByIdempotencyKey[rejected.idempotencyKey] = rejected.operationId
+            return rejected
+        }
+
+        val affected = listOf(authorizedTarget.id) + descendantsOf(authorizedTarget.id)
+        val changed = affected.mapNotNull { id ->
+            val node = nodes[id] ?: return@mapNotNull null
+            if (!node.status.isActive()) return@mapNotNull null
+            nodes[id] = node.copy(
+                status = RuntimeNodeStatus.STOP_REQUESTED,
+                updatedAtMillis = now,
+                leaseUntilMillis = now + config.leaseMillis,
+                abnormal = false,
+            )
+            record(id, "stop_requested", now, "operationId=${request.operationId};actor=${authorizedActor.id}")
+            pendingStopOperationByNodeId[id] = request.operationId
+            id
+        }
+        val event = record(
+            authorizedActor.id,
+            "descendant_stop_requested",
+            now,
+            stopAuditPayload(
+                request = request,
+                actorNodeId = authorizedActor.id,
+                targetNodeId = authorizedTarget.id,
+                rootId = authorizedTarget.rootId,
+                stateBefore = stateBefore,
+                stateAfter = nodes[authorizedTarget.id]?.status,
+                reason = request.reason.ifBlank { null },
+                actorSnapshot = actorSnapshot,
+                targetSnapshot = targetSnapshot,
+                affectedNodeIds = changed,
+            ),
+        )
+        val accepted = RuntimeStopReceipt(
+            operationId = request.operationId,
+            idempotencyKey = request.idempotencyKey,
+            type = RuntimeControlOperationType.STOP_DESCENDANT,
+            actorNodeId = authorizedActor.id,
+            targetNodeId = authorizedTarget.id,
+            rootId = authorizedTarget.rootId,
+            accepted = changed.isNotEmpty(),
+            stateBefore = stateBefore,
+            stateAfter = nodes[authorizedTarget.id]?.status,
+            affectedNodeIds = changed,
+            actorCapabilitySnapshot = actorSnapshot,
+            targetCapabilitySnapshot = targetSnapshot,
+            createdAtMillis = now,
+            reason = if (changed.isEmpty()) "target is not active" else request.reason.ifBlank { null },
+            eventId = event.id,
+        )
+        controlReceipts[accepted.operationId] = accepted
+        controlOperationIdByIdempotencyKey[accepted.idempotencyKey] = accepted.operationId
+        return accepted
+    }
+
+    @Synchronized
+    fun stopReceipts(): List<RuntimeStopReceipt> = controlReceipts.values.toList()
+
+    @Synchronized
+    fun stopReceipt(operationId: String): RuntimeStopReceipt? = controlReceipts[operationId]
+
+    @Synchronized
     fun abort(nodeId: String, abnormal: Boolean, reason: String = ""): Boolean {
         val node = nodes[nodeId] ?: return false
-        if (!node.status.isActive()) return false
+        if (!node.status.isActive() && node.status != RuntimeNodeStatus.STOP_REQUESTED) return false
         val now = clock()
+        val finalStatus = if (abnormal) RuntimeNodeStatus.ABNORMAL_INTERRUPTION else RuntimeNodeStatus.ABORTED
         nodes[nodeId] = node.copy(
-            status = if (abnormal) RuntimeNodeStatus.ABNORMAL_INTERRUPTION else RuntimeNodeStatus.ABORTED,
+            status = finalStatus,
             updatedAtMillis = now,
             leaseUntilMillis = null,
             abnormal = abnormal,
         )
-        record(nodeId, if (abnormal) "abnormal_interruption" else "aborted", now, reason)
+        val operationId = pendingStopOperationByNodeId.remove(nodeId)
+        if (operationId != null) {
+            controlReceipts[operationId]?.let { receipt ->
+                if (receipt.targetNodeId == nodeId) {
+                    controlReceipts[operationId] = receipt.copy(stateAfter = finalStatus)
+                }
+            }
+        }
+        record(
+            nodeId,
+            if (abnormal) "abnormal_interruption" else "aborted",
+            now,
+            buildString {
+                if (operationId != null) append("operationId=").append(operationId).append(';')
+                if (reason.isNotBlank()) append(reason)
+            },
+        )
         return true
     }
 
@@ -446,7 +666,7 @@ class RuntimeSessionTree(
     @Synchronized
     fun reconcileLeases(nowMillis: Long = clock()): List<String> {
         val stale = nodes.values.filter {
-            it.status.isActive() && it.leaseUntilMillis != null && it.leaseUntilMillis <= nowMillis
+            it.status.isLeaseActive() && it.leaseUntilMillis != null && it.leaseUntilMillis <= nowMillis
         }.map { it.id }
         stale.forEach { abort(it, abnormal = true, reason = "lease expired") }
         return stale
@@ -693,6 +913,7 @@ class RuntimeSessionTree(
         out.put("topologyEdges", JSONArray().apply { topologyEdges.values.forEach { put(edgeJson(it)) } })
         out.put("subscriptions", JSONArray().apply { subscriptions.values.forEach { put(subscriptionJson(it)) } })
         out.put("deliveryReceipts", JSONArray().apply { deliveryReceipts.forEach { put(receiptJson(it)) } })
+        out.put("stopReceipts", JSONArray().apply { controlReceipts.values.forEach { put(stopReceiptJson(it)) } })
         out.put("transcripts", JSONArray().apply {
             transcripts.values.flatten().forEach { put(transcriptJson(it)) }
         })
@@ -705,6 +926,8 @@ class RuntimeSessionTree(
             val json = JSONObject(raw)
             nodes.clear(); children.clear(); events.clear(); inbox.clear()
             topologyEdges.clear(); subscriptions.clear(); deliveryReceipts.clear(); transcripts.clear()
+            controlReceipts.clear(); controlOperationIdByIdempotencyKey.clear()
+            pendingStopOperationByNodeId.clear()
             rootIds.clear()
             val configJson = json.optJSONObject("config")
             if (configJson != null) {
@@ -744,6 +967,17 @@ class RuntimeSessionTree(
             }
             val receiptArray = json.optJSONArray("deliveryReceipts") ?: JSONArray()
             for (i in 0 until receiptArray.length()) deliveryReceipts += parseReceipt(receiptArray.getJSONObject(i))
+            val stopReceiptArray = json.optJSONArray("stopReceipts") ?: JSONArray()
+            for (i in 0 until stopReceiptArray.length()) {
+                val receipt = parseStopReceipt(stopReceiptArray.getJSONObject(i))
+                controlReceipts[receipt.operationId] = receipt
+                controlOperationIdByIdempotencyKey[receipt.idempotencyKey] = receipt.operationId
+                if (receipt.accepted) {
+                    receipt.affectedNodeIds
+                        .filter { nodes[it]?.status == RuntimeNodeStatus.STOP_REQUESTED }
+                        .forEach { pendingStopOperationByNodeId[it] = receipt.operationId }
+                }
+            }
             val transcriptArray = json.optJSONArray("transcripts") ?: JSONArray()
             for (i in 0 until transcriptArray.length()) {
                 val message = parseTranscript(transcriptArray.getJSONObject(i))
@@ -812,7 +1046,7 @@ class RuntimeSessionTree(
     }
     private fun updateStatus(nodeId: String, status: RuntimeNodeStatus, event: String): Boolean {
         val node = nodes[nodeId] ?: return false
-        if (node.status.isTerminal() && status != RuntimeNodeStatus.INACTIVE) return false
+        if (node.status.isTerminal()) return false
         val now = clock()
         nodes[nodeId] = node.copy(status = status, updatedAtMillis = now, leaseUntilMillis = if (status.isActive()) now + config.leaseMillis else null)
         record(nodeId, event, now)
@@ -837,9 +1071,61 @@ class RuntimeSessionTree(
 
     private fun descendantsOf(nodeId: String): List<String> = children[nodeId].orEmpty().flatMap { listOf(it) + descendantsOf(it) }
 
-    private fun record(nodeId: String, kind: String, timestamp: Long, payload: String = "") {
-        events += RuntimeEvent(UUID.randomUUID().toString(), nodeId, kind, timestamp, payload)
+    private fun record(nodeId: String, kind: String, timestamp: Long, payload: String = ""): RuntimeEvent {
+        val event = RuntimeEvent(UUID.randomUUID().toString(), nodeId, kind, timestamp, payload)
+        events += event
+        return event
     }
+
+    private fun isAncestor(ancestorNodeId: String, nodeId: String): Boolean {
+        var current = nodes[nodeId]?.parentId
+        while (current != null) {
+            if (current == ancestorNodeId) return true
+            current = nodes[current]?.parentId
+        }
+        return false
+    }
+
+    private fun authorizeDescendantStop(
+        actor: RuntimeSessionNode?,
+        target: RuntimeSessionNode?,
+        requestedRootId: String?,
+    ): String? {
+        if (actor == null || target == null) return "unknown actor or target"
+        if (actor.rootId != target.rootId || (requestedRootId != null && requestedRootId != actor.rootId)) {
+            return "cross-root stop is not authorized"
+        }
+        if (actor.id == target.id || !isAncestor(actor.id, target.id)) {
+            return "stop is limited to actor descendants"
+        }
+        return null
+    }
+
+    private fun stopAuditPayload(
+        request: RuntimeStopRequest,
+        actorNodeId: String,
+        targetNodeId: String,
+        rootId: String?,
+        stateBefore: RuntimeNodeStatus?,
+        stateAfter: RuntimeNodeStatus?,
+        reason: String?,
+        actorSnapshot: AgentCapabilitySnapshot?,
+        targetSnapshot: AgentCapabilitySnapshot?,
+        affectedNodeIds: List<String> = emptyList(),
+    ): String = JSONObject().apply {
+        put("operationId", request.operationId)
+        put("idempotencyKey", request.idempotencyKey)
+        put("type", RuntimeControlOperationType.STOP_DESCENDANT.name)
+        put("actorNodeId", actorNodeId)
+        put("targetNodeId", targetNodeId)
+        put("rootId", rootId)
+        put("stateBefore", stateBefore?.name)
+        put("stateAfter", stateAfter?.name)
+        put("affectedNodeIds", JSONArray(affectedNodeIds))
+        put("reason", reason)
+        put("actorCapabilitySnapshot", snapshotJson(actorSnapshot))
+        put("targetCapabilitySnapshot", snapshotJson(targetSnapshot))
+    }.toString()
 
     private fun snapshotJson(snapshot: AgentCapabilitySnapshot?) = snapshot?.let {
         JSONObject().apply {
@@ -910,6 +1196,47 @@ class RuntimeSessionTree(
         put("content", message.content); put("createdAtMillis", message.createdAtMillis)
         put("metadata", message.metadata)
     }
+
+    private fun stopReceiptJson(receipt: RuntimeStopReceipt) = JSONObject().apply {
+        put("operationId", receipt.operationId)
+        put("idempotencyKey", receipt.idempotencyKey)
+        put("type", receipt.type.name)
+        put("actorNodeId", receipt.actorNodeId)
+        put("targetNodeId", receipt.targetNodeId)
+        put("rootId", receipt.rootId)
+        put("accepted", receipt.accepted)
+        put("stateBefore", receipt.stateBefore?.name)
+        put("stateAfter", receipt.stateAfter?.name)
+        put("affectedNodeIds", JSONArray(receipt.affectedNodeIds))
+        put("actorCapabilitySnapshot", snapshotJson(receipt.actorCapabilitySnapshot))
+        put("targetCapabilitySnapshot", snapshotJson(receipt.targetCapabilitySnapshot))
+        put("createdAtMillis", receipt.createdAtMillis)
+        put("reason", receipt.reason)
+        put("eventId", receipt.eventId)
+    }
+
+    private fun parseStopReceipt(json: JSONObject): RuntimeStopReceipt = RuntimeStopReceipt(
+        operationId = json.optString("operationId"),
+        idempotencyKey = json.optString("idempotencyKey"),
+        type = runCatching { RuntimeControlOperationType.valueOf(json.optString("type")) }
+            .getOrDefault(RuntimeControlOperationType.STOP_DESCENDANT),
+        actorNodeId = json.optString("actorNodeId"),
+        targetNodeId = json.optString("targetNodeId"),
+        rootId = json.optString("rootId").takeIf { it.isNotBlank() && it != "null" },
+        accepted = json.optBoolean("accepted"),
+        stateBefore = json.optString("stateBefore").takeIf { it.isNotBlank() && it != "null" }
+            ?.let { value -> runCatching { RuntimeNodeStatus.valueOf(value) }.getOrNull() },
+        stateAfter = json.optString("stateAfter").takeIf { it.isNotBlank() && it != "null" }
+            ?.let { value -> runCatching { RuntimeNodeStatus.valueOf(value) }.getOrNull() },
+        affectedNodeIds = json.optJSONArray("affectedNodeIds")?.let { array ->
+            buildList { for (i in 0 until array.length()) add(array.optString(i)) }
+        }.orEmpty(),
+        actorCapabilitySnapshot = parseSnapshot(json.optJSONObject("actorCapabilitySnapshot")),
+        targetCapabilitySnapshot = parseSnapshot(json.optJSONObject("targetCapabilitySnapshot")),
+        createdAtMillis = json.optLong("createdAtMillis"),
+        reason = json.optString("reason").takeIf { it.isNotBlank() && it != "null" },
+        eventId = json.optString("eventId").takeIf { it.isNotBlank() && it != "null" },
+    )
 
     private fun nodeExportJson(node: RuntimeSessionNode) = JSONObject().apply {
         put("node", nodeJson(node))
@@ -1059,5 +1386,6 @@ class RuntimeSessionTree(
 
 
     private fun RuntimeNodeStatus.isActive() = this == RuntimeNodeStatus.STARTING || this == RuntimeNodeStatus.RUNNING || this == RuntimeNodeStatus.WAITING_CHILDREN
-    private fun RuntimeNodeStatus.isTerminal() = this == RuntimeNodeStatus.SUCCEEDED || this == RuntimeNodeStatus.FAILED || this == RuntimeNodeStatus.ABORTED || this == RuntimeNodeStatus.ABNORMAL_INTERRUPTION
+    private fun RuntimeNodeStatus.isLeaseActive() = isActive() || this == RuntimeNodeStatus.STOP_REQUESTED
+    private fun RuntimeNodeStatus.isTerminal() = this == RuntimeNodeStatus.STOP_REQUESTED || this == RuntimeNodeStatus.SUCCEEDED || this == RuntimeNodeStatus.FAILED || this == RuntimeNodeStatus.ABORTED || this == RuntimeNodeStatus.ABNORMAL_INTERRUPTION
 }

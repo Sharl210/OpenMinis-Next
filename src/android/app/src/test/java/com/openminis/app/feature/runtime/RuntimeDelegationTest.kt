@@ -5,6 +5,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.json.JSONObject
 import org.junit.Test
 
 class RuntimeDelegationTest {
@@ -114,5 +115,109 @@ class RuntimeDelegationTest {
         assertTrue(restored.restoreJson(tree.toJson()))
         assertEquals(RuntimeReceiptStatus.CLAIMED, restored.receipts().last().status)
         assertTrue(restored.claimNextNotification(child.id) == null)
+    }
+    @Test
+    fun `descendant stop authorizes descendants rejects siblings ancestors and cross root`() {
+        val tree = RuntimeSessionTree(
+            config = RuntimeTreeConfig(maxDepth = 3),
+            clock = { 40L },
+        )
+        val root = tree.createRoot("root", RuntimeModelSnapshot("p", "root"))
+        val child = tree.createChild(root.id, "child", RuntimeModelSnapshot("p", "child")).getOrThrow()
+        val grandchild = tree.createChild(child.id, "grandchild", RuntimeModelSnapshot("p", "grandchild")).getOrThrow()
+        val greatGrandchild = tree.createChild(grandchild.id, "great-grandchild", RuntimeModelSnapshot("p", "great-grandchild")).getOrThrow()
+        val sibling = tree.createChild(root.id, "sibling", RuntimeModelSnapshot("p", "sibling")).getOrThrow()
+        val otherRoot = tree.createRoot("other", RuntimeModelSnapshot("p", "other"))
+        val otherChild = tree.createChild(otherRoot.id, "other-child", RuntimeModelSnapshot("p", "other-child")).getOrThrow()
+        listOf(root, child, grandchild, greatGrandchild, sibling, otherRoot, otherChild).forEach { assertTrue(tree.start(it.id)) }
+
+        val accepted = tree.stopDescendant(
+            RuntimeStopRequest(
+                actorNodeId = root.id,
+                targetNodeId = grandchild.id,
+                rootId = root.id,
+                reason = "user interruption",
+                operationId = "stop-1",
+                idempotencyKey = "stop-key-1",
+            ),
+        )
+        assertTrue(accepted.accepted)
+        assertEquals(RuntimeNodeStatus.RUNNING, accepted.stateBefore)
+        assertEquals(RuntimeNodeStatus.STOP_REQUESTED, accepted.stateAfter)
+        assertEquals(listOf(grandchild.id, greatGrandchild.id), accepted.affectedNodeIds)
+        assertEquals(RuntimeNodeStatus.STOP_REQUESTED, tree.node(grandchild.id)?.status)
+        assertEquals(RuntimeNodeStatus.STOP_REQUESTED, tree.node(greatGrandchild.id)?.status)
+        assertTrue(tree.complete(grandchild.id).not())
+        assertTrue(tree.abort(grandchild.id, abnormal = false, reason = "stop acknowledged"))
+        assertTrue(tree.abort(greatGrandchild.id, abnormal = false, reason = "stop acknowledged"))
+        assertEquals(RuntimeNodeStatus.ABORTED, tree.node(grandchild.id)?.status)
+        assertEquals(RuntimeNodeStatus.ABORTED, tree.stopReceipt("stop-1")?.stateAfter)
+        assertTrue(tree.events().any { it.kind == "stop_requested" && it.payload.contains("stop-1") })
+        assertTrue(tree.events().any { it.kind == "aborted" && it.payload.contains("stop-1") })
+
+        val duplicate = tree.stopDescendant(
+            RuntimeStopRequest(
+                actorNodeId = root.id,
+                targetNodeId = grandchild.id,
+                rootId = root.id,
+                operationId = "stop-1-retry",
+                idempotencyKey = "stop-key-1",
+            ),
+        )
+        assertEquals("stop-1", duplicate.operationId)
+        assertEquals("stop-key-1", duplicate.idempotencyKey)
+        assertEquals(RuntimeNodeStatus.ABORTED, duplicate.stateAfter)
+
+        val siblingAttempt = tree.stopDescendant(
+            RuntimeStopRequest(actorNodeId = sibling.id, targetNodeId = child.id, rootId = root.id, operationId = "stop-sibling"),
+        )
+        assertFalse(siblingAttempt.accepted)
+        assertTrue(siblingAttempt.reason?.contains("descendants") == true)
+
+        val ancestorAttempt = tree.stopDescendant(
+            RuntimeStopRequest(actorNodeId = child.id, targetNodeId = root.id, rootId = root.id, operationId = "stop-ancestor"),
+        )
+        assertFalse(ancestorAttempt.accepted)
+
+        val crossRootAttempt = tree.stopDescendant(
+            RuntimeStopRequest(actorNodeId = root.id, targetNodeId = otherChild.id, rootId = root.id, operationId = "stop-cross-root"),
+        )
+        assertFalse(crossRootAttempt.accepted)
+        assertTrue(tree.events().any { it.kind == "descendant_stop_rejected" && it.payload.contains("cross-root") })
+    }
+
+    @Test
+    fun `descendant stop receipt and aborted state survive json round trip`() {
+        val source = RuntimeSessionTree(clock = { 50L })
+        val root = source.createRoot("root", RuntimeModelSnapshot("p", "root"))
+        val child = source.createChild(root.id, "child", RuntimeModelSnapshot("p", "child")).getOrThrow()
+        source.start(root.id)
+        source.start(child.id)
+        val receipt = source.stopDescendant(
+            RuntimeStopRequest(
+                actorNodeId = root.id,
+                targetNodeId = child.id,
+                rootId = root.id,
+                operationId = "stop-roundtrip",
+                idempotencyKey = "stop-roundtrip-key",
+            ),
+        )
+        assertTrue(receipt.accepted)
+
+        val restored = RuntimeSessionTree(clock = { 51L })
+        assertTrue(restored.restoreJson(source.toJson()))
+        assertEquals(RuntimeNodeStatus.STOP_REQUESTED, receipt.stateAfter)
+        assertEquals(RuntimeNodeStatus.STOP_REQUESTED, restored.node(child.id)?.status)
+        assertTrue(restored.complete(child.id).not())
+        assertEquals(receipt, restored.stopReceipt("stop-roundtrip"))
+        assertEquals(receipt, restored.stopDescendant(
+            RuntimeStopRequest(
+                actorNodeId = root.id,
+                targetNodeId = child.id,
+                rootId = root.id,
+                operationId = "stop-roundtrip-new",
+                idempotencyKey = "stop-roundtrip-key",
+            ),
+        ))
     }
 }
