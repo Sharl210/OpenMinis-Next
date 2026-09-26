@@ -103,6 +103,12 @@ object BackupFormat {
     /** Format major version. An unrecognised value must refuse the package. */
     const val CURRENT = "minisbak/1"
 
+    /** Next-only namespace; legacy readers and numeric timestamp migration do not apply. */
+    const val NEXT_NAMESPACE = "openminis-next"
+    const val NEXT_CURRENT = "$NEXT_NAMESPACE/1"
+    const val NEXT_FILE_EXTENSION = "minisnext"
+    const val NEXT_MIME_TYPE = "application/x-openminis-next"
+
     /** File extension registered to the app for "open to import". */
     const val FILE_EXTENSION = "minisbak"
 

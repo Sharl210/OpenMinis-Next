@@ -1,6 +1,7 @@
 package com.openminis.app.feature.runtime
 
 import android.content.Context
+import com.openminis.app.data.NextDataRoot
 import java.io.File
 import java.nio.charset.StandardCharsets
 
@@ -65,5 +66,12 @@ class RuntimeTreeStore private constructor(
 
         fun open(context: Context, config: RuntimeTreeConfig = RuntimeTreeConfig()): RuntimeTreeStore =
             RuntimeTreeStore(File(context.applicationContext.filesDir, "$DIRECTORY/$FILE"), config)
+
+        /**
+         * Opt-in Next boundary. The existing [open] path is intentionally left
+         * unchanged so current runtime state is not migrated implicitly.
+         */
+        fun openNext(context: Context, config: RuntimeTreeConfig = RuntimeTreeConfig()): RuntimeTreeStore =
+            RuntimeTreeStore(NextDataRoot.runtimeTreeFile(context.applicationContext.filesDir), config)
     }
 }
