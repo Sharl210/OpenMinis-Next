@@ -1751,10 +1751,37 @@ private fun RenderBlock(block: MdBlock) {
                 // on the same node, hence the nesting.
                 val vScroll = rememberScrollState()
                 val hScroll = rememberScrollState()
+                val liveCode = LocalLiveIncremental.current
+                val followMachine = remember { ScrollFollowStateMachine() }
+                fun dispatchFollow(event: ScrollFollowEvent): ScrollFollowTransition =
+                    followMachine.dispatch(event)
+                LaunchedEffect(vScroll) {
+                    dispatchFollow(ScrollFollowEvent.Initial)
+                    snapshotFlow { vScroll.maxValue }
+                        .collect {
+                            val transition = dispatchFollow(ScrollFollowEvent.LayoutChanged)
+                            if (transition.shouldFollow) vScroll.scrollTo(vScroll.maxValue)
+                        }
+                }
+                LaunchedEffect(vScroll, liveCode) {
+                    if (!liveCode) return@LaunchedEffect
+                    snapshotFlow { block.code.length }
+                        .collect {
+                            val transition = dispatchFollow(ScrollFollowEvent.ContentChanged)
+                            if (transition.shouldFollow) vScroll.scrollTo(vScroll.maxValue)
+                        }
+                }
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
                         .heightIn(max = 400.dp)
+                        .observeVerticalDrag(
+                            key = vScroll,
+                            atBottom = { vScroll.maxValue - vScroll.value <= 4 },
+                            onStopped = { atBottom ->
+                                dispatchFollow(ScrollFollowEvent.UserDragStopped(atBottom))
+                            },
+                        )
                         .verticalScroll(vScroll)
                         .padding(bottom = 8.dp),
                 ) {

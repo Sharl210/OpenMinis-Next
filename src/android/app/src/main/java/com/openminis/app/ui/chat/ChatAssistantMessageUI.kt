@@ -993,51 +993,38 @@ internal fun ThinkingBlock(block: AssistantBlock, isStreaming: Boolean, isLast: 
                     block.content
                 }
             }
-            // [T-android-thinking-inner-scroll] Pause auto-follow once the user
-            // scrolls away from the bottom; resume it when they return. iOS
-            // pulls the user back unconditionally — but that fights every
-            // touch on Compose's smaller pause-threshold scroller, so we
-            // honor the user's drag the way the outer chat list does.
-            var userScrolledAway by remember(block.id) { mutableStateOf(false) }
-            LaunchedEffect(scrollState, block.id) {
-                snapshotFlow {
-                    Triple(
-                        scrollState.value,
-                        scrollState.maxValue,
-                        scrollState.isScrollInProgress,
-                    )
-                }.collect { (v, max, dragging) ->
-                    // A nonzero gap from the bottom while the user is actively
-                    // dragging counts as "they took control". We don't flip
-                    // back until the gap closes — gives them room to scroll
-                    // up briefly without ping-ponging.
-                    val gap = (max - v).coerceAtLeast(0)
-                    when {
-                        dragging && gap > 4 -> userScrolledAway = true
-                        gap <= 4 -> userScrolledAway = false
-                    }
-                }
+            // [T-android-thinking-inner-scroll] Only a real vertical drag stop
+            // changes follow state. Content growth and layout changes never arm
+            // the pause, and each thinking block owns an isolated state machine.
+            val followMachine = remember(block.id) { ScrollFollowStateMachine() }
+            fun dispatchFollow(event: ScrollFollowEvent): ScrollFollowTransition =
+                followMachine.dispatch(event)
+            LaunchedEffect(block.id) {
+                dispatchFollow(ScrollFollowEvent.Initial)
             }
-            // Auto-follow: on every content growth, scroll to the new bottom.
-            // `snapshotFlow { block.content.length }` is recomposition-cheap
-            // and only ticks when the block's text actually grew.
+            // Auto-follow on content growth. A paused panel keeps its exact
+            // position until the user's next real drag reaches the bottom.
             LaunchedEffect(scrollState, block.id, isStreaming) {
                 if (!isStreaming) return@LaunchedEffect
                 snapshotFlow { block.content.length }
                     .collect {
-                        if (userScrolledAway) return@collect
-                        // scrollTo (not animateScrollTo) — animating fights
-                        // back-to-back token ticks; iOS uses a 0.15s linear
-                        // animation, but Compose's animateScrollTo cancels
-                        // any in-flight scroll, so streaming bursts get
-                        // jankier than a direct snap.
-                        scrollState.scrollTo(scrollState.maxValue)
+                        val transition = dispatchFollow(ScrollFollowEvent.ContentChanged)
+                        if (transition.shouldFollow) {
+                            scrollState.scrollTo(scrollState.maxValue)
+                        }
                     }
             }
             Column(
                 modifier = Modifier
                     .padding(top = 6.dp)
                     .heightIn(max = 300.dp)
+                    .observeVerticalDrag(
+                        key = block.id,
+                        atBottom = { scrollState.maxValue - scrollState.value <= 4 },
+                        onStopped = { atBottom ->
+                            dispatchFollow(ScrollFollowEvent.UserDragStopped(atBottom))
+                        },
+                    )
                     .verticalScroll(scrollState),
             ) {
                 if (isTruncated) {
