@@ -6,6 +6,7 @@ import com.openminis.app.data.model.AgentToolDefinition
 import com.openminis.app.data.model.LLMError
 import com.openminis.app.provider.ImageBudget
 import com.openminis.app.provider.applyUserAgentOverride
+import com.openminis.app.data.model.LLMRequestDiagnostics
 import com.openminis.app.data.model.LLMMessage
 import com.openminis.app.data.model.LLMModel
 import com.openminis.app.data.model.LLMMediaAttachment
@@ -73,7 +74,17 @@ class GeminiProvider(
         val responseBody = response.body?.string() ?: ""
 
         if (!response.isSuccessful) {
-            throw mapHttpError(response.code, responseBody)
+            throw mapHttpError(
+                response.code,
+                responseBody,
+                LLMRequestDiagnostics(
+                    statusCode = response.code,
+                    responseHeaders = response.headers.names().associateWith { response.headers[it] ?: "" },
+                    errorResponse = responseBody,
+                    requestBody = body.toString(),
+                    debugInfo = "Gemini sendMessage HTTP ${response.code}",
+                ),
+            )
         }
 
         val json = JSONObject(responseBody)
@@ -119,7 +130,17 @@ class GeminiProvider(
         if (!response.isSuccessful) {
             val errorBody = response.body?.string() ?: ""
             response.close()
-            throw mapHttpError(response.code, errorBody)
+            throw mapHttpError(
+                response.code,
+                errorBody,
+                LLMRequestDiagnostics(
+                    statusCode = response.code,
+                    responseHeaders = response.headers.names().associateWith { response.headers[it] ?: "" },
+                    errorResponse = errorBody,
+                    requestBody = body.toString(),
+                    debugInfo = "Gemini stream HTTP ${response.code}",
+                ),
+            )
         }
 
         val reader = BufferedReader(InputStreamReader(response.body!!.byteStream()))
@@ -505,13 +526,13 @@ class GeminiProvider(
         )
     }
 
-    private fun mapHttpError(statusCode: Int, body: String): LLMError {
-        if (statusCode == 401 || statusCode == 403) return LLMError.InvalidApiKey()
-        if (statusCode == 429) return LLMError.RateLimited()
+    private fun mapHttpError(statusCode: Int, body: String, diagnostics: LLMRequestDiagnostics? = null): LLMError {
+        if (statusCode == 401 || statusCode == 403) return LLMError.InvalidApiKey(diagnostics = diagnostics)
+        if (statusCode == 429) return LLMError.RateLimited(diagnostics = diagnostics)
         val message = "Gemini API error $statusCode: ${body.take(200)}"
         val transientCodes = setOf(500, 502, 503, 504, 529)
-        if (statusCode in transientCodes) return LLMError.TransientError(message)
-        return LLMError.ProviderError(message)
+        if (statusCode in transientCodes) return LLMError.TransientError(message, diagnostics)
+        return LLMError.ProviderError(message, diagnostics)
     }
 
     private fun mapError(error: Throwable): LLMError {

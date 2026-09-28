@@ -1203,6 +1203,12 @@
     <string name="chat_attach_add_file">Добавить файл</string>
     <string name="add_models_to_group_all_in_group">Все модели уже в этой группе.</string>
     <string name="add_models_to_group_no_match">Подходящие модели не найдены.</string>
+    <string name="chat_queued_withdraw">Withdraw queued message</string>
+    <string name="chat_queued_withdraw_and_edit">Withdraw and edit</string>
+    <string name="chat_queued_withdraw_failed">Unable to withdraw; the prompt has already started.</string>
+    <string name="chat_edit_writeback">Update message</string>
+    <string name="chat_edit_writeback_success">Message updated</string>
+    <string name="chat_edit_writeback_failed">Message update failed</string>
     <string name="chat_longpress_edit">Изменить</string>
     <string name="chat_longpress_delete_from_here">Удалить отсюда</string>
     <string name="chat_delete_from_here_confirm">Удалить</string>
@@ -1805,4 +1811,8 @@
     <string name="round_injection_interval">Интервал срабатывания</string>
     <string name="round_injection_interval_description">Число вызовов модели между периодическими инъекциями</string>
     <string name="round_injection_interval_suffix">вызовов</string>
+    <string name="model_groups_title_prompt">Title generation prompt</string>
+    <string name="model_groups_compaction_prompt">Conversation compaction prompt</string>
+    <string name="model_groups_prompt_reset">Reset to default</string>
+    <string name="model_groups_prompt_save">Save prompt</string>
 </resources>

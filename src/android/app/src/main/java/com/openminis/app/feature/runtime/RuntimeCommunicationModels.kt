@@ -174,6 +174,7 @@ data class RuntimeCommunicationMetadataPage(
 
 enum class RuntimeCommunicationQueryRejection {
     INVALID_CURSOR,
+    UNAUTHORIZED_ACTOR,
     PAGE_LIMIT_EXCEEDED,
     RESULT_BUDGET_EXCEEDED,
     RECORD_NOT_FOUND,
@@ -225,6 +226,9 @@ class RuntimeCommunicationDirectory(
         if (inserted) revision++
         return inserted
     }
+
+    @Synchronized
+    fun find(recordId: String): RuntimeCommunicationMetadata? = records[recordId]
 
     @Synchronized
     fun query(query: RuntimeCommunicationQuery): RuntimeCommunicationQueryResult {

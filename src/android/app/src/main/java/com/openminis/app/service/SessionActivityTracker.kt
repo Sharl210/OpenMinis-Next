@@ -6,6 +6,7 @@ import android.util.Log
 import com.openminis.app.feature.runtime.RuntimeDelegationRequest
 import com.openminis.app.feature.runtime.RuntimeModelSnapshot
 import com.openminis.app.feature.runtime.RuntimeSessionCoordinator
+import com.openminis.app.feature.runtime.RuntimeStopReport
 import com.openminis.app.feature.runtime.RuntimeTreeConfig
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -481,9 +482,14 @@ object SessionActivityTracker {
     }
 
     /** Finish a delegated child and close its temporary parent root when idle. */
-    fun finishDelegatedChild(parentSessionId: String, childSessionId: String, failed: Boolean = false) {
+    fun finishDelegatedChild(
+        parentSessionId: String,
+        childSessionId: String,
+        failed: Boolean = false,
+        report: RuntimeStopReport? = null,
+    ) {
         val wasRuntimeActive = shouldRunService()
-        runtimeCoordinator?.finishChild(childSessionId, failed)
+        runtimeCoordinator?.finishChild(childSessionId, failed, report)
         val next = _activeChildSessions.value.toMutableMap()
         next[parentSessionId]?.let { children ->
             val remaining = children - childSessionId

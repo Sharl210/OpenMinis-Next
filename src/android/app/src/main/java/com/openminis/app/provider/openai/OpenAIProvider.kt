@@ -806,9 +806,22 @@ class OpenAIProvider private constructor(
             if (ttfbTimedOut.get()) {
                 throw LLMError.TransientError(
                     "no response from server (${STREAM_TTFB_TIMEOUT_MS / 1000}s TTFB) — check network/proxy",
+                    diagnostics = com.openminis.app.data.model.LLMRequestDiagnostics(
+                        requestBody = bodyStr,
+                        debugInfo = "${e.javaClass.name}: ${e.message ?: "no message"}",
+                    ),
                 )
             }
-            throw e
+            throw LLMError.TransientError(
+                "network request failed: ${e.message ?: "I/O error"}",
+                diagnostics = com.openminis.app.data.model.LLMRequestDiagnostics(
+                    statusCode = null,
+                    responseHeaders = emptyMap(),
+                    errorResponse = null,
+                    requestBody = bodyStr,
+                    debugInfo = "${e.javaClass.name}: ${e.message ?: "no message"}",
+                ),
+            )
         } finally {
             headersArrived.set(true)
             ttfbWatchdog.cancel()
@@ -850,7 +863,17 @@ class OpenAIProvider private constructor(
                     )
                 )
             }
-            throw mapHttpError(response.code, errorBody)
+            throw mapHttpError(
+                response.code,
+                errorBody,
+                com.openminis.app.data.model.LLMRequestDiagnostics(
+                    statusCode = response.code,
+                    responseHeaders = response.headers.toMultimap().mapValues { it.value.joinToString(",") },
+                    errorResponse = errorBody,
+                    requestBody = bodyStr,
+                    debugInfo = "OpenAI HTTP response",
+                ),
+            )
         }
         if (com.openminis.app.BuildConfig.DEBUG) {
             com.openminis.app.debug.LLMRequestLog.add(
@@ -3427,9 +3450,9 @@ class OpenAIProvider private constructor(
         )
     }
 
-    private fun mapHttpError(statusCode: Int, body: String): LLMError {
-        if (statusCode == 401 || statusCode == 403) return LLMError.InvalidApiKey()
-        if (statusCode == 429) return LLMError.RateLimited()
+    private fun mapHttpError(statusCode: Int, body: String, diagnostics: com.openminis.app.data.model.LLMRequestDiagnostics? = null): LLMError {
+        if (statusCode == 401 || statusCode == 403) return LLMError.InvalidApiKey(diagnostics = diagnostics)
+        if (statusCode == 429) return LLMError.RateLimited(diagnostics = diagnostics)
 
         val message = try {
             val json = JSONObject(body)
@@ -3444,11 +3467,11 @@ class OpenAIProvider private constructor(
         if (statusCode in transientCodes) {
             // 503 with permanent failure indicators → ProviderError (trigger group fallback)
             if (statusCode == 503 && (body.contains("no_available_providers") || body.contains("model_not_found"))) {
-                return LLMError.ProviderError(message)
+                return LLMError.ProviderError(message, diagnostics)
             }
-            return LLMError.TransientError(message)
+            return LLMError.TransientError(message, diagnostics)
         }
-        return LLMError.ProviderError(message)
+        return LLMError.ProviderError(message, diagnostics)
     }
 
     private fun mapError(error: Throwable): LLMError {

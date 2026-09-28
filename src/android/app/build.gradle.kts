@@ -22,6 +22,21 @@ val appCustomization = Properties().apply {
 fun customizationValue(key: String): String =
     (appCustomization.getProperty(key) ?: "").replace("\"", "\\\"")
 
+val releaseStoreFilePath = providers.gradleProperty("OPENMINIS_RELEASE_STORE_FILE").orNull
+    ?: System.getenv("OPENMINIS_RELEASE_STORE_FILE")
+val releaseStorePassword = providers.gradleProperty("OPENMINIS_RELEASE_STORE_PASSWORD").orNull
+    ?: System.getenv("OPENMINIS_RELEASE_STORE_PASSWORD")
+val releaseKeyAlias = providers.gradleProperty("OPENMINIS_RELEASE_KEY_ALIAS").orNull
+    ?: System.getenv("OPENMINIS_RELEASE_KEY_ALIAS")
+val releaseKeyPassword = providers.gradleProperty("OPENMINIS_RELEASE_KEY_PASSWORD").orNull
+    ?: System.getenv("OPENMINIS_RELEASE_KEY_PASSWORD")
+val hasReleaseSigning = listOf(
+    releaseStoreFilePath,
+    releaseStorePassword,
+    releaseKeyAlias,
+    releaseKeyPassword,
+).all { !it.isNullOrBlank() }
+
 android {
     namespace = "com.openminis.app"
     // [T-android-dynamic-island] Bumped 35→36 so the Android 16 (Baklava)
@@ -68,6 +83,17 @@ android {
         }
     }
 
+    signingConfigs {
+        if (hasReleaseSigning) {
+            create("release") {
+                storeFile = file(checkNotNull(releaseStoreFilePath))
+                storePassword = checkNotNull(releaseStorePassword)
+                keyAlias = checkNotNull(releaseKeyAlias)
+                keyPassword = checkNotNull(releaseKeyPassword)
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = true
@@ -75,7 +101,9 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            signingConfig = signingConfigs.getByName("debug")
+            if (hasReleaseSigning) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
     }
 

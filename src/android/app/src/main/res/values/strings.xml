@@ -579,6 +579,10 @@
     <string name="browser_nav_forward">Forward</string>
     <string name="browser_stop">Stop</string>
     <string name="browser_reload">Reload</string>
+    <string name="browser_pick_element">Pick element</string>
+    <string name="browser_element_confirm_title">Send this element to AI?</string>
+    <string name="browser_element_send">Send to chat</string>
+    <string name="browser_element_cancel">Cancel</string>
     <string name="browser_minis_browsing">Minis is browsing</string>
     <!-- Streaming indicator shown while the assistant is composing a reply. %1$s is the Soul-customized assistant name (default "Minis"). -->
     <string name="chat_typing_indicator">%1$s is thinking</string>
@@ -1344,6 +1348,14 @@
     <string name="add_models_to_group_no_match">No matching models found.</string>
 
     <!-- T187 — user-bubble long-press Edit + Exit Edit Mode + Clear Chat dialog -->
+    <string name="chat_queue_steer_badge">STEER</string>
+    <string name="chat_queue_queue_badge">QUEUE</string>
+    <string name="chat_queued_withdraw">Withdraw queued message</string>
+    <string name="chat_queued_withdraw_and_edit">Withdraw and edit</string>
+    <string name="chat_queued_withdraw_failed">Unable to withdraw; the prompt has already started.</string>
+    <string name="chat_edit_writeback">Update message</string>
+    <string name="chat_edit_writeback_success">Message updated</string>
+    <string name="chat_edit_writeback_failed">Message update failed</string>
     <string name="chat_longpress_edit">Edit</string>
     <string name="chat_longpress_delete_from_here">Delete From Here</string>
     <string name="chat_delete_from_here_confirm">Delete</string>
@@ -2004,4 +2016,15 @@
     <string name="agent_topology_open">Agent topology</string>
     <string name="agent_topology_transparent">Transparent background</string>
     <string name="agent_topology_empty">No agent nodes yet</string>
+    <string name="model_groups_title_prompt">Title generation prompt</string>
+    <string name="model_groups_compaction_prompt">Conversation compaction prompt</string>
+    <string name="model_groups_prompt_reset">Reset to default</string>
+    <string name="model_groups_prompt_save">Save prompt</string>
+    <string name="model_groups_primary_agent_model">Primary Agent Model</string>
+    <string name="model_groups_title_generation_model">Title Generation Model</string>
+    <string name="model_groups_compaction_model">Conversation Compaction Model</string>
+    <string name="model_groups_legacy_primary_group">Legacy Primary Group Fallback</string>
+    <string name="model_groups_default_sub">Default Sub</string>
+    <string name="model_groups_use_current_default">Use current default</string>
+    <string name="model_groups_model_note_child_agents">Model note for child agents</string>
 </resources>

@@ -203,8 +203,7 @@ cd src/android
 ./gradlew :app:installDebug           # install onto a connected device
 ```
 
-Release builds are configured with the debug signing config, so no keystore is
-required to produce one locally.
+Release builds are intentionally **not** signed with the debug key. To create a distributable signed APK, provide the following values through local Gradle properties or environment variables (never commit them): `OPENMINIS_RELEASE_STORE_FILE`, `OPENMINIS_RELEASE_STORE_PASSWORD`, `OPENMINIS_RELEASE_KEY_ALIAS`, and `OPENMINIS_RELEASE_KEY_PASSWORD`. Without them, `assembleRelease` produces an unsigned artifact for inspection only; verify the final APK with `apksigner verify` before distribution.
 
 ### Tests
 

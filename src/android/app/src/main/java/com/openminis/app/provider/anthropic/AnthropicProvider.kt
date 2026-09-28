@@ -6,6 +6,7 @@ import com.openminis.app.data.model.AgentToolDefinition
 import com.openminis.app.data.model.sanitizeToolId
 import com.openminis.app.data.model.LLMError
 import com.openminis.app.data.model.LLMMessage
+import com.openminis.app.data.model.LLMRequestDiagnostics
 import com.openminis.app.data.model.LLMModel
 import com.openminis.app.data.model.LLMResponse
 import com.openminis.app.data.model.LLMStreamChunk
@@ -97,7 +98,17 @@ class AnthropicProvider(
         val responseBody = response.body?.string() ?: ""
 
         if (!response.isSuccessful) {
-            throw mapHttpError(response.code, responseBody)
+            throw mapHttpError(
+                response.code,
+                responseBody,
+                LLMRequestDiagnostics(
+                    statusCode = response.code,
+                    responseHeaders = requestHeaders(request),
+                    errorResponse = responseBody,
+                    requestBody = body.toString(),
+                    debugInfo = "Anthropic sendMessage HTTP ${response.code}",
+                ),
+            )
         }
 
         val json = JSONObject(responseBody)
@@ -165,7 +176,17 @@ class AnthropicProvider(
                 )
             }
             android.util.Log.e("AnthropicProvider", "Stream failed: ${response.code} isOAuth=$isOAuth body=${errorBody.take(300)}")
-            throw mapHttpError(response.code, errorBody)
+            throw mapHttpError(
+                response.code,
+                errorBody,
+                LLMRequestDiagnostics(
+                    statusCode = response.code,
+                    responseHeaders = requestHeaders(request),
+                    errorResponse = errorBody,
+                    requestBody = bodyStr,
+                    debugInfo = "Anthropic stream HTTP ${response.code}",
+                ),
+            )
         }
 
         // Log successful request (debug builds only — see above)
@@ -1029,9 +1050,12 @@ class AnthropicProvider(
         )
     }
 
-    private fun mapHttpError(statusCode: Int, body: String): LLMError {
-        if (statusCode == 401 || statusCode == 403) return LLMError.InvalidApiKey()
-        if (statusCode == 429) return LLMError.RateLimited()
+    private fun requestHeaders(request: Request): Map<String, String> =
+        request.headers.names().associateWith { request.headers[it] ?: "" }
+
+    private fun mapHttpError(statusCode: Int, body: String, diagnostics: LLMRequestDiagnostics? = null): LLMError {
+        if (statusCode == 401 || statusCode == 403) return LLMError.InvalidApiKey(diagnostics = diagnostics)
+        if (statusCode == 429) return LLMError.RateLimited(diagnostics = diagnostics)
 
         val message = try {
             val json = JSONObject(body)
@@ -1045,9 +1069,9 @@ class AnthropicProvider(
 
         val transientCodes = setOf(500, 502, 503, 504, 529)
         if (statusCode in transientCodes) {
-            return LLMError.TransientError(message)
+            return LLMError.TransientError(message, diagnostics)
         }
-        return LLMError.ProviderError(message)
+        return LLMError.ProviderError(message, diagnostics)
     }
 
     private fun mapError(error: Throwable): LLMError {

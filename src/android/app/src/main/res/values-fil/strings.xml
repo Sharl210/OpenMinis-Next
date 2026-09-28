@@ -1201,6 +1201,12 @@
     <string name="chat_attach_add_file">Magdagdag ng File</string>
     <string name="add_models_to_group_all_in_group">Nasa group na ang lahat ng model.</string>
     <string name="add_models_to_group_no_match">Walang natagpuang tugmang model.</string>
+    <string name="chat_queued_withdraw">Withdraw queued message</string>
+    <string name="chat_queued_withdraw_and_edit">Withdraw and edit</string>
+    <string name="chat_queued_withdraw_failed">Unable to withdraw; the prompt has already started.</string>
+    <string name="chat_edit_writeback">Update message</string>
+    <string name="chat_edit_writeback_success">Message updated</string>
+    <string name="chat_edit_writeback_failed">Message update failed</string>
     <string name="chat_longpress_edit">I-edit</string>
     <string name="chat_longpress_delete_from_here">Burahin Mula Rito</string>
     <string name="chat_delete_from_here_confirm">Burahin</string>
@@ -1795,4 +1801,8 @@
     <string name="round_injection_interval">Trigger interval</string>
     <string name="round_injection_interval_description">Bilang ng model calls sa pagitan ng periodic injection</string>
     <string name="round_injection_interval_suffix">calls</string>
+    <string name="model_groups_title_prompt">Title generation prompt</string>
+    <string name="model_groups_compaction_prompt">Conversation compaction prompt</string>
+    <string name="model_groups_prompt_reset">Reset to default</string>
+    <string name="model_groups_prompt_save">Save prompt</string>
 </resources>

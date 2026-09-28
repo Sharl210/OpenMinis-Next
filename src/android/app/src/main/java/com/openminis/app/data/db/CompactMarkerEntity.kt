@@ -54,4 +54,12 @@ data class CompactMarkerEntity(
      * any backfill — matches the SQL `DEFAULT 1` set by MIGRATION_7_8.
      */
     val version: Int = 1,
+    @ColumnInfo(name = "model_role") val modelRole: String? = null,
+    @ColumnInfo(name = "model_entry_id") val modelEntryId: String? = null,
+    @ColumnInfo(name = "model_id") val modelId: String? = null,
+    @ColumnInfo(name = "model_display_name") val modelDisplayName: String? = null,
+    @ColumnInfo(name = "provider_type") val providerType: String? = null,
+    @ColumnInfo(name = "provider_instance_id") val providerInstanceId: String? = null,
+    @ColumnInfo(name = "effective_compaction_entry_id") val effectiveCompactionEntryId: String? = null,
+    @ColumnInfo(name = "model_generated_at") val modelGeneratedAt: Long? = null,
 )

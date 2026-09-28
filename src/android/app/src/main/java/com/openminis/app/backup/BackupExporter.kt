@@ -338,6 +338,7 @@ class BackupExporter(
         // Android-only, preserved per §2.2 rule 4.
         put("editCount", JsonPrimitive(s.editCount))
         put("thinkingOverride", s.thinkingOverride?.let(::JsonPrimitive) ?: JsonNull)
+        BackupModelSnapshotCodec.sessionTitleFields(s).forEach { (key, value) -> put(key, value) }
     }
 
     /**
@@ -393,6 +394,7 @@ class BackupExporter(
         put("boundaryMessageId", c.boundaryMessageId?.let(::JsonPrimitive) ?: JsonNull)
         put("firstKeptMessageId", c.firstKeptMessageId?.let(::JsonPrimitive) ?: JsonNull)
         put("lastCompactedMessageId", c.lastCompactedMessageId?.let(::JsonPrimitive) ?: JsonNull)
+        BackupModelSnapshotCodec.markerFields(c).forEach { (key, value) -> put(key, value) }
     }
 
     private fun folderRecord(f: FolderEntity): JsonElement = buildJsonObject {

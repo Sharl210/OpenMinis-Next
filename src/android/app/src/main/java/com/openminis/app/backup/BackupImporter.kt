@@ -381,6 +381,11 @@ class BackupImporter(
                     editCount = s.int("editCount") ?: 0,
                     thinkingOverride = s.str("thinkingOverride"),
                     folderId = s.str("folderId"),
+                     titleModelEntryId = BackupModelSnapshotCodec.stringOrNull(s, "titleModelEntryId"),
+                     titleModelId = BackupModelSnapshotCodec.stringOrNull(s, "titleModelId"),
+                     titleModelDisplayName = BackupModelSnapshotCodec.stringOrNull(s, "titleModelDisplayName"),
+                     titleProviderType = BackupModelSnapshotCodec.stringOrNull(s, "titleProviderType"),
+                     titleGeneratedAt = BackupModelSnapshotCodec.millisOrNull(s, "titleGeneratedAt"),
                 )
             )
             if (existing == null) report.imported += 1 else report.updated += 1
@@ -512,6 +517,14 @@ class BackupImporter(
                         boundaryMessageId = c.str("boundaryMessageId"),
                         firstKeptMessageId = c.str("firstKeptMessageId"),
                         lastCompactedMessageId = c.str("lastCompactedMessageId"),
+                        modelRole = BackupModelSnapshotCodec.stringOrNull(c, "modelRole"),
+                        modelEntryId = BackupModelSnapshotCodec.stringOrNull(c, "modelEntryId"),
+                        modelId = BackupModelSnapshotCodec.stringOrNull(c, "modelId"),
+                        modelDisplayName = BackupModelSnapshotCodec.stringOrNull(c, "modelDisplayName"),
+                        providerType = BackupModelSnapshotCodec.stringOrNull(c, "providerType"),
+                        providerInstanceId = BackupModelSnapshotCodec.stringOrNull(c, "providerInstanceId"),
+                        effectiveCompactionEntryId = BackupModelSnapshotCodec.stringOrNull(c, "effectiveCompactionEntryId"),
+                        modelGeneratedAt = BackupModelSnapshotCodec.millisOrNull(c, "modelGeneratedAt"),
                     )
                 )
                 report.imported += 1
@@ -672,7 +685,7 @@ class BackupImporter(
             )
         }
 
-        val (before, after) = repo.mergeBackupProviderConfig(config)
+        val (before, after) = repo.mergeBackupProviderConfig(config, parsed.presentTopLevelFields)
         report.imported = maxOf(0, after - before)
         // Everything the package carried that did not newly insert was already
         // present and left untouched — skipped, not updated.
@@ -889,6 +902,7 @@ class BackupImporter(
         internal data class LenientProviderConfig(
             val config: com.openminis.app.data.model.ProviderConfig,
             val droppedInstances: Int,
+            val presentTopLevelFields: Set<String> = emptySet(),
         )
 
         /**
@@ -930,6 +944,7 @@ class BackupImporter(
                         com.openminis.app.data.model.ProviderConfig.serializer(), root,
                     ),
                     droppedInstances = 0,
+                    presentTopLevelFields = root.keys,
                 )
             }
 
@@ -977,6 +992,7 @@ class BackupImporter(
                     com.openminis.app.data.model.ProviderConfig.serializer(), patched,
                 ),
                 droppedInstances = dropped,
+                presentTopLevelFields = root.keys,
             )
         }
 

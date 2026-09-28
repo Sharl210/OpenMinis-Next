@@ -1039,11 +1039,13 @@ internal fun ThinkingBlock(block: AssistantBlock, isStreaming: Boolean, isLast: 
                         modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
                     )
                 }
-                Text(
-                    text = displayContent,
-                    fontSize = 13.sp,
-                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.45f),
-                    lineHeight = 19.sp,
+                // Reuse the existing throttled Markdown renderer rather than a
+                // single Compose Text. The content is already tail-bounded above,
+                // so streaming Markdown never receives the full unbounded block.
+                StreamingMarkdownText(
+                    content = displayContent,
+                    isStreaming = isStreaming,
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
                 )
             }
         }

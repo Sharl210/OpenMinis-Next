@@ -1,6 +1,9 @@
 package com.openminis.app.ui.browser
 
 import com.openminis.app.R
+import com.openminis.app.browser.BrowserAction
+import com.openminis.app.browser.BrowserActionInput
+import kotlinx.coroutines.delay
 import androidx.compose.ui.res.stringResource
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.LinearEasing
@@ -45,6 +48,8 @@ import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.StarBorder
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -84,6 +89,38 @@ import com.openminis.app.browser.UserAgentProfile
 import com.openminis.app.ui.chat.StandardChatSheet
 import kotlinx.coroutines.launch
 
+
+private val START_ELEMENT_PICKER_JS = """
+(function(){
+  if(window.__openminisPickerActive)return;
+  window.__openminisPickerActive=true; window.__openminisPickedElement=null;
+  function cssPath(el){
+    if(el.id && document.querySelectorAll('#'+CSS.escape(el.id)).length===1)return '#'+CSS.escape(el.id);
+    var bits=[]; var n=el;
+    while(n && n.nodeType===1 && n!==document.documentElement){
+      var tag=n.tagName.toLowerCase();
+      var stable=n.getAttribute('data-testid')||n.getAttribute('name')||n.getAttribute('aria-label');
+      if(stable){bits.unshift(tag+'['+(n.hasAttribute('data-testid')?'data-testid':n.hasAttribute('name')?'name':'aria-label')+'="'+CSS.escape(stable)+'"]');break;}
+      var ix=1, sib=n; while((sib=sib.previousElementSibling))if(sib.tagName===n.tagName)ix++;
+      bits.unshift(tag+':nth-of-type('+ix+')'); n=n.parentElement;
+    }
+    return bits.join(' > ');
+  }
+  function onPick(ev){
+    ev.preventDefault(); ev.stopPropagation(); if(ev.stopImmediatePropagation)ev.stopImmediatePropagation();
+    var el=ev.target && ev.target.nodeType===1?ev.target:ev.target.parentElement; if(!el)return;
+    var attrs={}; ['id','name','role','aria-label','data-testid','href','type','title'].forEach(function(k){var v=el.getAttribute(k);if(v)attrs[k]=v.slice(0,300)});
+    var path=[]; var n=el; while(n&&n.nodeType===1&&n!==document.documentElement){var tag=n.tagName.toLowerCase(),i=1,s=n;while((s=s.previousElementSibling))if(s.tagName===n.tagName)i++;path.unshift(tag+':nth-of-type('+i+')');n=n.parentElement;}
+    window.__openminisPickedElement={url:location.href,title:document.title,domPath:path.join(' > '),stableSelector:cssPath(el),attributes:attrs,visibleText:(el.innerText||el.textContent||'').trim().replace(/\s+/g,' ').slice(0,500)};
+    window.__openminisPickerActive=false; document.removeEventListener('click',onPick,true); window.__openminisPickerHandler=null;
+  }
+  window.__openminisPickerHandler=onPick;
+  document.addEventListener('click',onPick,true);
+})();
+""".trimIndent()
+private const val READ_PICKED_ELEMENT_JS = "return JSON.stringify(window.__openminisPickedElement || null)"
+private const val CANCEL_ELEMENT_PICKER_JS = "if(window.__openminisPickerHandler)document.removeEventListener('click',window.__openminisPickerHandler,true); window.__openminisPickerActive=false; true"
+
 /**
  * Bottom sheet presenting the browser tab pool with tab bar, URL bar,
  * WebView, and navigation controls. Mirrors iOS BrowserSheetView.
@@ -92,6 +129,7 @@ import kotlinx.coroutines.launch
 fun BrowserSheet(
     tabPool: BrowserTabPool,
     onDismiss: () -> Unit,
+    onElementSelected: (String) -> Unit = {},
 ) {
     val tabs by tabPool.tabs.collectAsState()
     val selectedTabId by tabPool.selectedTabId.collectAsState()
@@ -126,6 +164,8 @@ fun BrowserSheet(
     val canBookmarkCurrentPage = currentURL.isNotBlank() && currentURL != "about:blank" && !isAgentBusy
     // [T-android-browser-download-ux] Downloads panel + badge state.
     var showDownloads by remember { mutableStateOf(false) }
+    var elementPickerActive by remember { mutableStateOf(false) }
+    var pickedElement by remember { mutableStateOf<BrowserElementSelectionPayload?>(null) }
     val downloadEntries by tabPool.downloads.collectAsState()
 
     val accent = MaterialTheme.colorScheme.primary
@@ -198,8 +238,8 @@ fun BrowserSheet(
                         val title = tab.manager.pageTitle.collectAsState().value
                         val domain = tab.manager.currentURL.collectAsState().value
                             .let { url -> try { java.net.URI(url).host } catch (_: Exception) { null } }
-                        val displayTitle = title.ifEmpty { domain ?: "Tab ${tab.id}" }
-                            .take(20)
+                        val displayTitle = "${tab.id} · ${title.ifEmpty { domain ?: "Tab ${tab.id}" }}"
+                            .take(28)
                         val isSelected = tab.id == selectedTabId
 
                         TabChip(
@@ -497,8 +537,76 @@ fun BrowserSheet(
                         onClick = { selectedTab?.manager?.reload() },
                     )
                 }
+                ToolbarIcon(
+                    icon = Icons.Default.Edit,
+                    contentDesc = stringResource(R.string.browser_pick_element),
+                    enabled = selectedTab != null && !isAgentBusy && !elementPickerActive,
+                    tint = if (elementPickerActive) accent else MaterialTheme.colorScheme.onSurfaceVariant,
+                    onClick = {
+                        val tab = selectedTab ?: return@ToolbarIcon
+                        val manager = tab.manager
+                        scope.launch {
+                            val armed = manager.execute(BrowserActionInput(action = BrowserAction.EXECUTE_JS, script = START_ELEMENT_PICKER_JS))
+                            if (!armed.success) return@launch
+                            elementPickerActive = true
+                            repeat(240) {
+                                delay(250)
+                                if (tabPool.selectedTabId.value != tab.id) {
+                                    manager.execute(BrowserActionInput(action = BrowserAction.EXECUTE_JS, script = CANCEL_ELEMENT_PICKER_JS))
+                                    elementPickerActive = false
+                                    return@launch
+                                }
+                                val result = manager.execute(BrowserActionInput(action = BrowserAction.EXECUTE_JS, script = READ_PICKED_ELEMENT_JS))
+                                val picked = if (result.success && result.text.trim() != "null") {
+                                    runCatching { org.json.JSONObject(result.text.trim()) }.getOrNull()
+                                } else null
+                                if (picked != null) {
+                                    pickedElement = BrowserElementSelectionPayload(
+                                        pageId = tab.pageId,
+                                        runtimeTabId = tab.id,
+                                        url = picked.optString("url", currentURL),
+                                        title = picked.optString("title", pageTitle),
+                                        domPath = picked.optString("domPath"),
+                                        stableSelector = picked.optString("stableSelector"),
+                                        attributes = picked.optJSONObject("attributes")?.let { attrs ->
+                                            attrs.keys().asSequence().associateWith { key -> attrs.optString(key) }
+                                        }.orEmpty(),
+                                        visibleText = picked.optString("visibleText"),
+                                    )
+                                    elementPickerActive = false
+                                    return@launch
+                                }
+                            }
+                            manager.execute(BrowserActionInput(action = BrowserAction.EXECUTE_JS, script = CANCEL_ELEMENT_PICKER_JS))
+                            elementPickerActive = false
+                        }
+                    },
+                )
             }
         }
+    }
+
+    pickedElement?.let { payload ->
+        AlertDialog(
+            onDismissRequest = { pickedElement = null },
+            title = { Text(stringResource(R.string.browser_element_confirm_title)) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text("${payload.title} · ${payload.runtimeTabId}", style = MaterialTheme.typography.labelMedium)
+                    Text(payload.stableSelector, style = MaterialTheme.typography.bodySmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                    if (payload.visibleText.isNotBlank()) Text(payload.visibleText, style = MaterialTheme.typography.bodySmall, maxLines = 3, overflow = TextOverflow.Ellipsis)
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    onElementSelected(payload.toPromptSnippet())
+                    pickedElement = null
+                }) { Text(stringResource(R.string.browser_element_send)) }
+            },
+            dismissButton = {
+                TextButton(onClick = { pickedElement = null }) { Text(stringResource(R.string.browser_element_cancel)) }
+            },
+        )
     }
 
     if (showDownloads) {

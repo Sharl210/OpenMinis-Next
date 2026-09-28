@@ -1202,6 +1202,12 @@
     <string name="chat_attach_add_file">添加文件</string>
     <string name="add_models_to_group_all_in_group">所有模型都已在這個群組裡。</string>
     <string name="add_models_to_group_no_match">沒有符合的模型。</string>
+    <string name="chat_queued_withdraw">撤回排隊訊息</string>
+    <string name="chat_queued_withdraw_and_edit">撤回並編輯</string>
+    <string name="chat_queued_withdraw_failed">無法撤回；該訊息已開始處理。</string>
+    <string name="chat_edit_writeback">更新訊息</string>
+    <string name="chat_edit_writeback_success">訊息已更新</string>
+    <string name="chat_edit_writeback_failed">訊息更新失敗</string>
     <string name="chat_longpress_edit">編輯</string>
     <string name="chat_longpress_delete_from_here">從此處刪除</string>
     <string name="chat_delete_from_here_confirm">刪除</string>
@@ -1795,4 +1801,8 @@
     <string name="round_injection_interval">觸發輪次</string>
     <string name="round_injection_interval_description">週期注入之間的模型呼叫次數</string>
     <string name="round_injection_interval_suffix">次</string>
+    <string name="model_groups_title_prompt">標題生成提示詞</string>
+    <string name="model_groups_compaction_prompt">對話壓縮提示詞</string>
+    <string name="model_groups_prompt_reset">恢復預設</string>
+    <string name="model_groups_prompt_save">儲存提示詞</string>
 </resources>

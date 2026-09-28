@@ -394,6 +394,23 @@ class GeminiProviderTest {
         throw AssertionError("Expected TransientError")
     }
 
+
+    @Test
+    fun `sendMessage preserves non2xx diagnostics`() = runBlocking {
+        server.enqueue(MockResponse().setResponseCode(418).addHeader("x-diag", "gemini").setBody("teapot"))
+        try {
+            provider.sendMessage(listOf(LLMMessage(LLMMessage.Role.USER, "diagnostic")), null, 100)
+            throw AssertionError("Expected provider error")
+        } catch (e: LLMError.ProviderError) {
+            val d = e.diagnostics ?: throw AssertionError("missing diagnostics")
+            assertEquals(418, d.statusCode)
+            assertEquals("gemini", d.responseHeaders["x-diag"])
+            assertEquals("teapot", d.errorResponse)
+            assertTrue(d.requestBody?.contains("diagnostic") == true)
+            assertTrue(d.debugInfo?.contains("Gemini") == true)
+        }
+    }
+
     // -- Provider metadata --
 
     @Test

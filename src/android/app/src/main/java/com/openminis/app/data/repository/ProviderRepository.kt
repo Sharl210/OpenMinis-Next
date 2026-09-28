@@ -1520,6 +1520,14 @@ class ProviderRepository(private val context: Context) {
     fun group(id: String): ModelGroup? =
         _config.value.modelGroups.find { it.id == id }
 
+    fun availableRoleEntries(): List<ModelEntry> {
+        val config = _config.value
+        val enabledInstanceIds = config.instances.filter { it.isEnabled }.map { it.id }.toSet()
+        return config.modelEntries.filter { entry ->
+            entry.providerInstanceId in enabledInstanceIds && !entry.isHidden
+        }
+    }
+
     var defaultPrimaryGroupId: String?
         get() = _config.value.defaultPrimaryGroupId
         set(value) = synchronized(configLock) {
@@ -1536,7 +1544,64 @@ class ProviderRepository(private val context: Context) {
             saveConfig(config)
         }
 
-    // --- Voice groups [T-android-provider-voice] ---
+    var primaryModelEntryId: String?
+        get() = _config.value.primaryModelEntryId
+        set(value) = synchronized(configLock) {
+            ensureConfigLoaded()
+            val config = workingCopy()
+            config.primaryModelEntryId = value
+            saveConfig(config)
+        }
+
+    var titleModelEntryId: String?
+        get() = _config.value.titleModelEntryId
+        set(value) = synchronized(configLock) {
+            ensureConfigLoaded()
+            val config = workingCopy()
+            config.titleModelEntryId = value
+            saveConfig(config)
+        }
+
+    var compactionModelEntryId: String?
+        get() = _config.value.compactionModelEntryId
+        set(value) = synchronized(configLock) {
+            ensureConfigLoaded()
+            val config = workingCopy()
+            config.compactionModelEntryId = value
+            saveConfig(config)
+        }
+
+    var titlePrompt: String?
+        get() = _config.value.titlePrompt
+        set(value) = synchronized(configLock) {
+            ensureConfigLoaded()
+            val config = workingCopy()
+            config.titlePrompt = value?.trim()?.takeIf { it.isNotEmpty() }
+            saveConfig(config)
+        }
+
+    var compactionPrompt: String?
+        get() = _config.value.compactionPrompt
+        set(value) = synchronized(configLock) {
+            ensureConfigLoaded()
+            val config = workingCopy()
+            config.compactionPrompt = value?.trim()?.takeIf { it.isNotEmpty() }
+            saveConfig(config)
+        }
+
+    fun resetTitlePrompt() { titlePrompt = null }
+    fun resetCompactionPrompt() { compactionPrompt = null }
+
+    fun setSubAgentModelNote(id: String, note: String?) = synchronized(configLock) {
+        ensureConfigLoaded()
+        val config = workingCopy()
+        if (note.isNullOrBlank()) config.subAgentModelNotes.remove(id)
+        else config.subAgentModelNotes[id] = note.trim()
+        saveConfig(config)
+    }
+
+    fun subAgentModelNote(id: String): String? = _config.value.subAgentModelNotes[id]
+
 
     var voiceInputGroupId: String?
         get() = _config.value.voiceInputGroupId
@@ -2714,7 +2779,25 @@ class ProviderRepository(private val context: Context) {
      * counting iOS uses (fix 93cad55ae: union-by-id already-present is SKIPPED,
      * not "updated").
      */
-    fun mergeBackupProviderConfig(remote: ProviderConfig): Pair<Int, Int> {
+    fun mergeBackupProviderConfig(remote: ProviderConfig): Pair<Int, Int> =
+        mergeBackupProviderConfig(
+            remote,
+            scalarFieldsPresent = setOf(
+                ProviderConfig.BACKUP_SCALAR_TITLE_PROMPT,
+                ProviderConfig.BACKUP_SCALAR_COMPACTION_PROMPT,
+                ProviderConfig.BACKUP_SCALAR_TITLE_MODEL_ENTRY_ID,
+                ProviderConfig.BACKUP_SCALAR_COMPACTION_MODEL_ENTRY_ID,
+            ),
+        )
+
+    /**
+     * Same provider union merge, with explicit presence for nullable scalar fields.
+     * Missing fields from older backups preserve the live value; present nulls clear it.
+     */
+    fun mergeBackupProviderConfig(
+        remote: ProviderConfig,
+        scalarFieldsPresent: Set<String>,
+    ): Pair<Int, Int> {
         ensureConfigLoaded()
         return synchronized(configLock) {
             val local = _config.value
@@ -2756,7 +2839,11 @@ class ProviderRepository(private val context: Context) {
             val mergedAgentGroups =
                 (local.agentLoopGroupIds + remote.agentLoopGroupIds).distinct()
 
-            val merged = local.copy(
+            val merged = ProviderConfig.mergeBackupScalars(
+                local,
+                remote,
+                scalarFieldsPresent,
+            ).copy(
                 instances = orderedInstances,
                 modelEntries = mergedEntries,
                 modelGroups = orderedGroups,

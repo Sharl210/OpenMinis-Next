@@ -157,6 +157,7 @@ data class ChatMessage(
     // Mirrors iOS ChatMessage.isQueued / queuedPromptId.
     val isQueued: Boolean = false,
     val queuedPromptId: String? = null,
+    val queuedDelivery: QueuedPromptDelivery? = null,
     // Set to true when this message belongs to a range that has been folded
     // into a compact summary marker. Mirrors iOS ChatMessage.isCompactedHistory:
     // the message stays in the UI, but renders at reduced opacity so the user
@@ -259,6 +260,7 @@ data class QueuedPrompt(
     val id: String,
     val text: String,
     val attachments: List<InputAttachment> = emptyList(),
+    val delivery: QueuedPromptDelivery = QueuedPromptDelivery.QUEUE,
 )
 
 /**

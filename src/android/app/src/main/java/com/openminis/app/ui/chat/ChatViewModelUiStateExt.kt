@@ -122,13 +122,13 @@ internal fun ChatViewModel.dismissMemorySheet() {
 }
 
 internal fun ChatViewModel.addAttachment(attachment: InputAttachment) {
-    _attachments.value = _attachments.value + attachment
+    setComposerAttachments(attachments.value + attachment)
 }
 
 internal fun ChatViewModel.removeAttachment(id: String) {
-    _attachments.value = _attachments.value.filter { it.id != id }
+    setComposerAttachments(attachments.value.filter { it.id != id })
 }
 
 internal fun ChatViewModel.clearAttachments() {
-    _attachments.value = emptyList()
+    setComposerAttachments(emptyList())
 }

@@ -4084,7 +4084,7 @@ fun ChatScreen(
                                 // option reappears. Gating execution alone
                                 // wasn't enough — users still saw a tappable
                                 // Retry that silently no-op'd.
-                                onRetry = if (isStreaming) null else ({
+                                onRetry = if (isStreaming || item.message.isQueued) null else ({
                                     coroutineScope.launch {
                                         tracedScrollToItem("RETRY-FROM-MSG", 0, 0)
                                     }
@@ -4096,7 +4096,7 @@ fun ChatScreen(
                                 // leaves agentHistory describing messages that
                                 // no longer exist. Opens a confirmation rather
                                 // than cutting straight away — there is no undo.
-                                onDeleteFromHere = if (isStreaming) null else ({
+                                onDeleteFromHere = if (isStreaming || item.message.isQueued) null else ({
                                     deleteFromHereTargetId = item.message.id
                                 }),
                                 // T187: long-press → Edit pulls the user message
@@ -4107,7 +4107,6 @@ fun ChatScreen(
                                 onEdit = if (isStreaming || item.message.isQueued) null else ({
                                     val prefill = viewModel.editMessage(item.message.id)
                                     if (prefill != null) {
-                                        viewModel.setInputText(prefill)
                                         coroutineScope.launch {
                                             tracedScrollToItem("EDIT-MSG", 0, 0)
                                         }
@@ -4115,7 +4114,10 @@ fun ChatScreen(
                                     }
                                 }),
                                 onWithdraw = if (item.message.isQueued) {
-                                    { safeMutate { viewModel.withdrawQueuedMessage(item.message.id) } }
+                                    { safeMutate { if (viewModel.withdrawQueuedMessage(item.message.id)) inputFocusRequester.requestFocus() } }
+                                } else null,
+                                onDiscardQueued = if (item.message.isQueued) {
+                                    { safeMutate { viewModel.discardQueuedMessage(item.message.id) } }
                                 } else null,
                                 onPreviewFile = { uri, name ->
                                     // T150: turn the persisted file:// URI back
@@ -5705,7 +5707,7 @@ fun ChatScreen(
                             // empty inputText becomes visible.
                             val toSend = inputText
                             lastSendTimeMs = System.currentTimeMillis()
-                            viewModel.setInputText("")
+                            viewModel.clearInputTextForSend()
                             releaseComposerAfterSend()
                             viewModel.sendMessage(toSend)
                             noteSendForInputModePref()
@@ -6184,7 +6186,6 @@ fun ChatScreen(
                                 color = ChatColors.inputBg,
                                 modifier = Modifier.clickable {
                                     viewModel.cancelEdit()
-                                    viewModel.setInputText("")
                                 },
                             ) {
                                 Text(
@@ -6871,6 +6872,7 @@ fun ChatScreen(
         BrowserSheet(
             tabPool = viewModel.browserTabPool,
             onDismiss = { viewModel.dismissBrowserSheet() },
+            onElementSelected = { viewModel.appendToInputText(it) },
         )
     }
 

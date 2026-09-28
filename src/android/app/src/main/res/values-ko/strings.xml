@@ -1201,6 +1201,12 @@
     <string name="chat_attach_add_file">파일 추가</string>
     <string name="add_models_to_group_all_in_group">모든 모델이 이미 이 그룹에 포함되어 있습니다.</string>
     <string name="add_models_to_group_no_match">일치하는 모델이 없습니다.</string>
+    <string name="chat_queued_withdraw">Withdraw queued message</string>
+    <string name="chat_queued_withdraw_and_edit">Withdraw and edit</string>
+    <string name="chat_queued_withdraw_failed">Unable to withdraw; the prompt has already started.</string>
+    <string name="chat_edit_writeback">Update message</string>
+    <string name="chat_edit_writeback_success">Message updated</string>
+    <string name="chat_edit_writeback_failed">Message update failed</string>
     <string name="chat_longpress_edit">편집</string>
     <string name="chat_longpress_delete_from_here">여기서부터 삭제</string>
     <string name="chat_delete_from_here_confirm">삭제</string>
@@ -1794,4 +1800,8 @@
     <string name="round_injection_interval">트리거 간격</string>
     <string name="round_injection_interval_description">주기적 주입 사이의 모델 호출 횟수</string>
     <string name="round_injection_interval_suffix">회</string>
+    <string name="model_groups_title_prompt">제목 생성 프롬프트</string>
+    <string name="model_groups_compaction_prompt">대화 압축 프롬프트</string>
+    <string name="model_groups_prompt_reset">기본값으로 재설정</string>
+    <string name="model_groups_prompt_save">프롬프트 저장</string>
 </resources>

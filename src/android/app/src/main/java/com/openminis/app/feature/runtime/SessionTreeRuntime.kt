@@ -23,9 +23,94 @@ enum class RuntimeNodeStatus {
     ABNORMAL_INTERRUPTION,
 }
 
-enum class RuntimeDelivery { QUEUE, STEER, NOTIFY, TEAM_PEER }
+data class RuntimeStopReport(
+    val nodeId: String,
+    val statusCode: Int? = null,
+    val errorResponse: String? = null,
+    val responseHeaders: Map<String, String> = emptyMap(),
+    val debugInfo: String? = null,
+    val lastSentBody: String? = null,
+    val completedNormally: Boolean = false,
+) {
+    val lastSentBodyTail: String?
+        get() = lastSentBody?.takeLast(MAX_TAIL_CHARS)
 
-enum class RuntimeControlOperationType { STOP_DESCENDANT }
+    companion object {
+        const val MAX_TAIL_CHARS = 200
+    }
+}
+
+/** Stable metadata contract for parent notifications; normal completion is deliberately terse. */
+data class RuntimeSystemMessageMetadata(
+    val kind: String,
+    val childNodeId: String,
+    val statusCode: Int? = null,
+    val errorResponse: String? = null,
+    val responseHeaders: Map<String, String> = emptyMap(),
+    val debugInfo: String? = null,
+    val lastSentBodyTail: String? = null,
+) {
+    fun toJson(): String = org.json.JSONObject().apply {
+        put("kind", kind)
+        put("childNodeId", childNodeId)
+        statusCode?.let { put("statusCode", it) }
+        errorResponse?.let { put("errorResponse", it) }
+        if (responseHeaders.isNotEmpty()) put("responseHeaders", org.json.JSONObject(responseHeaders))
+        debugInfo?.let { put("debugInfo", it) }
+        lastSentBodyTail?.let { put("lastSentBodyTail", it) }
+    }.toString()
+
+    companion object {
+        fun from(report: RuntimeStopReport): RuntimeSystemMessageMetadata = RuntimeSystemMessageMetadata(
+            kind = if (report.completedNormally) "child_completed" else "child_abnormal_stop",
+            childNodeId = report.nodeId,
+            statusCode = if (report.completedNormally) null else report.statusCode,
+            errorResponse = if (report.completedNormally) null else report.errorResponse,
+            responseHeaders = if (report.completedNormally) emptyMap() else report.responseHeaders,
+            debugInfo = if (report.completedNormally) null else report.debugInfo,
+            lastSentBodyTail = if (report.completedNormally) null else report.lastSentBodyTail,
+        )
+    }
+}
+
+
+enum class RuntimeControlOperationType { STOP_DESCENDANT, DELETE_SUBTREE }
+
+data class DeleteSubtreeRequest(
+    val initiatorNodeId: String,
+    val executorNodeId: String,
+    val targetNodeId: String,
+    val rootId: String? = null,
+    val operationId: String = UUID.randomUUID().toString(),
+    val idempotencyKey: String = operationId,
+) {
+    init {
+        require(initiatorNodeId.isNotBlank() && executorNodeId.isNotBlank() && targetNodeId.isNotBlank())
+        require(operationId.isNotBlank() && idempotencyKey.isNotBlank())
+    }
+}
+
+enum class DeleteSubtreeResult { DELETED, REJECTED, BUSY, NOT_FOUND }
+
+data class DeleteSubtreeReceipt(
+    val operationId: String,
+    val idempotencyKey: String,
+    val result: DeleteSubtreeResult,
+    val initiatorNodeId: String,
+    val executorNodeId: String,
+    val targetNodeId: String,
+    val rootId: String?,
+    val oldParentId: String?,
+    val affectedNodeIds: List<String>,
+    val reason: String? = null,
+    val createdAtMillis: Long,
+    val eventId: String? = null,
+)
+
+data class DeleteSubtreeOperation(
+    val request: DeleteSubtreeRequest,
+    val receipt: DeleteSubtreeReceipt,
+)
 
 data class RuntimeStopRequest(
     val actorNodeId: String,
@@ -64,6 +149,8 @@ data class RuntimeStopReceipt(
 enum class RuntimeEdgeKind { PARENT_CHILD, SUBSCRIPTION, TEAM_PEER }
 
 enum class RuntimeEdgePermission { SEND, NOTIFY, STEER }
+
+enum class RuntimeDelivery { TEAM_PEER, STEER, QUEUE, NOTIFY }
 
 data class RuntimeTopologyEdge(
     val id: String,
@@ -140,6 +227,8 @@ data class RuntimeSessionNode(
     val abnormal: Boolean = false,
     val role: String = "child",
     val task: String = "",
+    /** Immutable ancestry snapshot captured at birth; old records default to an empty list. */
+    val birthChain: List<String> = emptyList(),
 )
 
 data class RuntimeEvent(
@@ -263,7 +352,11 @@ class RuntimeSessionTree(
     private val subscriptions = LinkedHashMap<String, RuntimeSubscription>()
     private val controlReceipts = LinkedHashMap<String, RuntimeStopReceipt>()
     private val controlOperationIdByIdempotencyKey = LinkedHashMap<String, String>()
+    private val deletionReceipts = LinkedHashMap<String, DeleteSubtreeReceipt>()
+    private val deletionOperationIdByIdempotencyKey = LinkedHashMap<String, String>()
     private val pendingStopOperationByNodeId = LinkedHashMap<String, String>()
+    private val pendingStopReportByNodeId = LinkedHashMap<String, RuntimeStopReport>()
+    private val stopNotificationSentForNodeIds = mutableSetOf<String>()
     private val rootIds = LinkedHashSet<String>()
     /** Legacy representative root retained for source and JSON compatibility. */
     private var rootId: String? = null
@@ -293,6 +386,7 @@ class RuntimeSessionTree(
             updatedAtMillis = now,
             role = "root/supervisor",
             task = task,
+            birthChain = listOf(sessionId),
         )
         nodes[node.id] = node
         children[node.id] = mutableListOf()
@@ -334,6 +428,7 @@ class RuntimeSessionTree(
             updatedAtMillis = now,
             role = "child",
             task = task,
+            birthChain = parent.birthChain.ifEmpty { listOf(parent.rootId) } + childId,
         )
         nodes[node.id] = node
         children.getOrPut(parent.id) { mutableListOf() }.add(node.id)
@@ -461,11 +556,18 @@ class RuntimeSessionTree(
     fun resume(nodeId: String): Boolean = updateStatus(nodeId, RuntimeNodeStatus.RUNNING, "resumed")
 
     @Synchronized
-    fun complete(nodeId: String, failed: Boolean = false): Boolean = updateStatus(
-        nodeId,
-        if (failed) RuntimeNodeStatus.FAILED else RuntimeNodeStatus.SUCCEEDED,
-        if (failed) "failed" else "completed",
-    )
+    fun complete(nodeId: String, failed: Boolean = false, report: RuntimeStopReport? = null): Boolean {
+        val changed = updateStatus(
+            nodeId,
+            if (failed) RuntimeNodeStatus.FAILED else RuntimeNodeStatus.SUCCEEDED,
+            if (failed) "failed" else "completed",
+        )
+        if (changed) {
+            pendingStopReportByNodeId[nodeId] = report ?: RuntimeStopReport(nodeId = nodeId, completedNormally = !failed)
+            maybeNotifyWhenSettled(nodeId)
+        }
+        return changed
+    }
 
     @Synchronized
     fun stopDescendant(request: RuntimeStopRequest): RuntimeStopReceipt {
@@ -625,7 +727,77 @@ class RuntimeSessionTree(
     }
 
     @Synchronized
-    fun stopReceipts(): List<RuntimeStopReceipt> = controlReceipts.values.toList()
+    fun deleteSubtree(request: DeleteSubtreeRequest): DeleteSubtreeReceipt {
+        deletionOperationIdByIdempotencyKey[request.idempotencyKey]?.let { previous ->
+            deletionReceipts[previous]?.let { return it }
+        }
+        deletionReceipts[request.operationId]?.let { return it }
+        val now = clock()
+        val target = nodes[request.targetNodeId]
+        val executor = nodes[request.executorNodeId]
+        val initiator = nodes[request.initiatorNodeId]
+        val affected = target?.let { listOf(it.id) + descendantsOf(it.id) } ?: emptyList()
+        fun reject(result: DeleteSubtreeResult, reason: String): DeleteSubtreeReceipt {
+            val receipt = DeleteSubtreeReceipt(request.operationId, request.idempotencyKey, result,
+                request.initiatorNodeId, request.executorNodeId, request.targetNodeId,
+                target?.rootId, target?.parentId, affected, reason, now)
+            deletionReceipts[request.operationId] = receipt
+            deletionOperationIdByIdempotencyKey[request.idempotencyKey] = request.operationId
+            record(request.executorNodeId, "subtree_delete_rejected", now, reason)
+            return receipt
+        }
+        if (target == null || executor == null || initiator == null) return reject(DeleteSubtreeResult.NOT_FOUND, "unknown initiator, executor, or target")
+        if (executor.rootId != target.rootId || initiator.rootId != target.rootId || (request.rootId != null && request.rootId != target.rootId)) {
+            return reject(DeleteSubtreeResult.REJECTED, "cross-root deletion is not authorized")
+        }
+        if (executor.id == target.id || !isAncestor(executor.id, target.id)) {
+            return reject(DeleteSubtreeResult.REJECTED, "executor must be a strict ancestor of target")
+        }
+        if (!affected.all { id -> nodes[id]?.status?.isTerminal() == true }) {
+            return reject(DeleteSubtreeResult.BUSY, "target subtree is still running or waiting for children")
+        }
+        val oldParentId = target.parentId
+        val snapshot = affected.mapNotNull(nodes::get)
+        affected.forEach { id ->
+            nodes.remove(id)
+            children.remove(id)
+            transcripts.remove(id)
+            pendingStopOperationByNodeId.remove(id)
+            pendingStopReportByNodeId.remove(id)
+            stopNotificationSentForNodeIds.remove(id)
+        }
+        children.values.forEach { it.removeAll(affected.toSet()) }
+        topologyEdges.entries.removeIf { it.value.fromNodeId in affected || it.value.toNodeId in affected }
+        subscriptions.entries.removeIf { it.value.subscriberNodeId in affected || it.value.publisherNodeId in affected }
+        inbox.removeAll { it.fromNodeId in affected || it.toNodeId in affected }
+        deliveryReceipts.removeAll { it.fromNodeId in affected || it.toNodeId in affected }
+        rootIds.removeAll(affected)
+        val scope = affected.joinToString(",")
+        record(request.executorNodeId, "subtree_deleted", now, "operationId=${request.operationId};target=${target.id};affected=$scope")
+        oldParentId?.let { parentId ->
+            val metadata = JSONObject().put("kind", "child_subtree_deleted")
+                .put("targetNodeId", target.id).put("initiatorNodeId", request.initiatorNodeId)
+                .put("executorNodeId", request.executorNodeId).put("affectedNodeIds", JSONArray(affected)).toString()
+            inbox += RuntimeEnvelope(UUID.randomUUID().toString(), target.id, parentId, RuntimeDelivery.NOTIFY,
+                "Subtree ${target.id} deleted.", now, taskIntent = metadata)
+        }
+        val resultMetadata = JSONObject().put("kind", "subtree_delete_result")
+            .put("operationId", request.operationId).put("success", true).put("targetNodeId", target.id)
+            .put("affectedNodeIds", JSONArray(affected)).toString()
+        inbox += RuntimeEnvelope(UUID.randomUUID().toString(), request.executorNodeId, request.executorNodeId,
+            RuntimeDelivery.NOTIFY, "Subtree deletion completed.", now, taskIntent = resultMetadata)
+        val event = record(request.executorNodeId, "subtree_delete_result", now, resultMetadata)
+        val receipt = DeleteSubtreeReceipt(request.operationId, request.idempotencyKey, DeleteSubtreeResult.DELETED,
+            request.initiatorNodeId, request.executorNodeId, request.targetNodeId, target.rootId, oldParentId,
+            snapshot.map { it.id }, createdAtMillis = now, eventId = event.id)
+        deletionReceipts[request.operationId] = receipt
+        deletionOperationIdByIdempotencyKey[request.idempotencyKey] = request.operationId
+        return receipt
+    }
+
+    @Synchronized
+    fun deleteSubtreeReceipt(operationId: String): DeleteSubtreeReceipt? = deletionReceipts[operationId]
+
 
     @Synchronized
     fun stopReceipt(operationId: String): RuntimeStopReceipt? = controlReceipts[operationId]
@@ -659,10 +831,61 @@ class RuntimeSessionTree(
                 if (reason.isNotBlank()) append(reason)
             },
         )
+        val stopReport = RuntimeStopReport(
+            nodeId = nodeId,
+            completedNormally = false,
+            debugInfo = reason.takeIf { it.isNotBlank() },
+        )
+        pendingStopReportByNodeId[nodeId] = stopReport
+        maybeNotifyWhenSettled(nodeId)
         return true
     }
 
-    /** Converts stale active nodes to recoverable abnormal interruptions. */
+    /** Notify only after this node and its complete recursive subtree are terminal. */
+    private fun maybeNotifyWhenSettled(nodeId: String) {
+        val node = nodes[nodeId] ?: return
+        if (!node.status.isTerminal() || hasActiveDescendants(nodeId)) return
+        if (!stopNotificationSentForNodeIds.contains(nodeId)) {
+            pendingStopReportByNodeId.remove(nodeId)?.let { notifyParentOnStop(nodeId, it) }
+        }
+        node.parentId?.let { maybeNotifyWhenSettled(it) }
+    }
+
+    private fun hasActiveDescendants(nodeId: String): Boolean = descendantsOf(nodeId).any { id ->
+        val status = nodes[id]?.status ?: return@any false
+        !status.isTerminal()
+    }
+
+    /** Sends at most one system notification to the direct parent; roots only get an audit event. */
+    private fun notifyParentOnStop(nodeId: String, report: RuntimeStopReport) {
+        if (!stopNotificationSentForNodeIds.add(nodeId)) return
+        val node = nodes[nodeId] ?: return
+        val metadata = RuntimeSystemMessageMetadata.from(report)
+        val parentId = node.parentId
+        if (parentId == null) {
+            record(nodeId, "child_stop_notification_unroutable", clock(), metadata.toJson())
+            return
+        }
+        val now = clock()
+        val envelope = RuntimeEnvelope(
+            id = UUID.randomUUID().toString(),
+            fromNodeId = nodeId,
+            toNodeId = parentId,
+            delivery = RuntimeDelivery.NOTIFY,
+            payload = if (report.completedNormally) "Child ${nodeId} completed." else "Child ${nodeId} stopped abnormally.",
+            createdAtMillis = now,
+            taskIntent = metadata.toJson(),
+            capabilitySnapshot = capabilitySnapshot(parentId),
+            senderCapabilitySnapshot = capabilitySnapshot(nodeId),
+        )
+        inbox += envelope
+        record(parentId, "child_stop_notification_enqueued", now, metadata.toJson())
+        deliveryReceipts += RuntimeMessageReceipt(
+            id = UUID.randomUUID().toString(), messageId = envelope.id,
+            fromNodeId = nodeId, toNodeId = parentId, delivery = RuntimeDelivery.NOTIFY,
+            accepted = true, createdAtMillis = now, status = RuntimeReceiptStatus.ENQUEUED,
+        )
+    }
     @Synchronized
     fun reconcileLeases(nowMillis: Long = clock()): List<String> {
         val stale = nodes.values.filter {
@@ -1156,6 +1379,7 @@ class RuntimeSessionTree(
     private fun nodeJson(node: RuntimeSessionNode) = JSONObject().apply {
         put("id", node.id); put("parentId", node.parentId); put("rootId", node.rootId); put("depth", node.depth)
         put("status", node.status.name); put("delegationMode", node.delegationMode.name); put("createdAtMillis", node.createdAtMillis); put("updatedAtMillis", node.updatedAtMillis)
+        put("birthChain", JSONArray(node.birthChain))
         put("leaseUntilMillis", node.leaseUntilMillis); put("abnormal", node.abnormal)
         put("model", JSONObject().apply { put("provider", node.model.provider); put("model", node.model.model); put("note", node.model.note); put("capabilities", JSONArray(node.model.capabilities.toList())) })
     }
@@ -1325,6 +1549,9 @@ class RuntimeSessionTree(
             updatedAtMillis = json.optLong("updatedAtMillis"),
             leaseUntilMillis = if (json.isNull("leaseUntilMillis")) null else json.optLong("leaseUntilMillis"),
             abnormal = json.optBoolean("abnormal"),
+            birthChain = json.optJSONArray("birthChain")?.let { array ->
+                buildList { for (i in 0 until array.length()) add(array.optString(i)) }
+            } ?: emptyList(),
         )
     }
 

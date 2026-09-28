@@ -1201,6 +1201,12 @@
     <string name="chat_attach_add_file">Ajouter un fichier</string>
     <string name="add_models_to_group_all_in_group">Tous les modèles font déjà partie de ce groupe.</string>
     <string name="add_models_to_group_no_match">Aucun modèle correspondant trouvé.</string>
+    <string name="chat_queued_withdraw">Withdraw queued message</string>
+    <string name="chat_queued_withdraw_and_edit">Withdraw and edit</string>
+    <string name="chat_queued_withdraw_failed">Unable to withdraw; the prompt has already started.</string>
+    <string name="chat_edit_writeback">Update message</string>
+    <string name="chat_edit_writeback_success">Message updated</string>
+    <string name="chat_edit_writeback_failed">Message update failed</string>
     <string name="chat_longpress_edit">Modifier</string>
     <string name="chat_longpress_delete_from_here">Supprimer à partir d’ici</string>
     <string name="chat_delete_from_here_confirm">Supprimer</string>
@@ -1797,4 +1803,8 @@
     <string name="round_injection_interval">Intervalle de déclenchement</string>
     <string name="round_injection_interval_description">Nombre d’appels du modèle entre deux injections</string>
     <string name="round_injection_interval_suffix">appels</string>
+    <string name="model_groups_title_prompt">Prompt de génération du titre</string>
+    <string name="model_groups_compaction_prompt">Prompt de compression de la conversation</string>
+    <string name="model_groups_prompt_reset">Rétablir les valeurs par défaut</string>
+    <string name="model_groups_prompt_save">Enregistrer le prompt</string>
 </resources>

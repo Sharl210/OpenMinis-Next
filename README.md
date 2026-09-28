@@ -28,6 +28,17 @@ experience and release direction have diverged substantially from upstream.
 Upstream features may be studied and independently adapted when useful; this
 repository does not imply an upstream sync or endorsement relationship.
 
+### Architecture inspiration
+
+The runtime architecture is inspired by the coordination ideas of the
+telecommunications **IP Multimedia Subsystem (IMS)**: registered endpoints,
+a central control plane, explicit routing, capability and policy checks,
+durable events and delivery receipts, and incremental retrieval instead of
+blindly copying an entire context into every message. This is an architectural
+analogy that helps explain the design; it is **not** a claim that this project
+implements 3GPP IMS protocols, carrier-network functions, or IMS
+interoperability.
+
 We sincerely thank the OpenMinis maintainers and contributors for the original
 project, its architecture, and the open-source work that made this development
 possible. OpenMinis remains the upstream reference and is credited here with

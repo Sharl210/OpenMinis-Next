@@ -36,6 +36,11 @@ object AgentTools {
             add(ReadImageTool.definition())
         }
         add(browserUseDefinition())
+        add(BrowserDevToolsTools.definition())
+        add(stopDescendantDefinition())
+        add(deleteSubtreeDefinition())
+        add(webSearchDefinition())
+        add(webFetchDefinition())
         if (memoryEnabled) {
             add(memoryWriteDefinition())
             add(memoryGetDefinition())
@@ -113,7 +118,61 @@ object AgentTools {
         propertyOrdering = listOf("tool_title", "action", "tab_id", "url", "selector", "text", "coordinate_x", "coordinate_y", "direction", "amount", "scroll_count", "item_selector", "script", "user_agent", "max_depth", "keywords", "fuzzy", "cookies", "timeout", "viewport_width", "viewport_height", "reset", "item_id", "query", "title"),
     )
 
-    // Aligned with iOS AIChatViewModel.swift:5059-5067
+    private fun stopDescendantDefinition(): AgentToolDefinition = AgentToolDefinition(
+        name = "stop_descendant",
+        description = "Request the central runtime to stop a descendant agent. Authorization, ancestry, root, idempotency, receipt, and audit are enforced by the runtime tree; rejection is returned as failure.",
+        parameters = mapOf(
+            "tool_title" to AgentToolParam("string", "A concise title for this stop request."),
+            "target_session_id" to AgentToolParam("string", "Target descendant session or runtime node ID."),
+            "root_id" to AgentToolParam("string", "Optional expected runtime root ID."),
+            "reason" to AgentToolParam("string", "Reason recorded in the runtime audit."),
+            "operation_id" to AgentToolParam("string", "Optional idempotent operation ID."),
+            "idempotency_key" to AgentToolParam("string", "Optional idempotency key."),
+        ),
+        required = listOf("tool_title", "target_session_id"),
+        propertyOrdering = listOf("tool_title", "target_session_id", "root_id", "reason", "operation_id", "idempotency_key"),
+    )
+
+
+    private fun deleteSubtreeDefinition(): AgentToolDefinition = AgentToolDefinition(
+        name = "delete_subtree",
+        description = "Delete a completed descendant session and its entire runtime subtree. The current session is the trusted executor; self-delete and unrelated targets are rejected. Returns a structured receipt; the target's parent receives a separate runtime notification.",
+        parameters = mapOf(
+            "tool_title" to AgentToolParam("string", "A concise title for this deletion request."),
+            "target_session_id" to AgentToolParam("string", "Target descendant session or runtime node ID."),
+            "root_id" to AgentToolParam("string", "Optional expected runtime root ID."),
+            "operation_id" to AgentToolParam("string", "Optional operation ID."),
+            "idempotency_key" to AgentToolParam("string", "Optional idempotency key."),
+        ),
+        required = listOf("tool_title", "target_session_id"),
+        propertyOrdering = listOf("tool_title", "target_session_id", "root_id", "operation_id", "idempotency_key"),
+    )
+
+    private fun webSearchDefinition(): AgentToolDefinition = AgentToolDefinition(
+        name = "web_search",
+        description = "Search public web sources without a paid API key. Results are source data; do not bypass login, CAPTCHA, paywalls, access controls, or certificate validation. robots.txt is not a hard blocker.",
+        parameters = mapOf(
+            "tool_title" to AgentToolParam("string", "A concise title for this search."),
+            "query" to AgentToolParam("string", "Search query."),
+            "max_results" to AgentToolParam("integer", "Maximum results; server clamps to configured bounds."),
+            "timeout_ms" to AgentToolParam("integer", "Overall timeout; server clamps to configured bounds."),
+        ),
+        required = listOf("tool_title", "query"),
+        propertyOrdering = listOf("tool_title", "query", "max_results", "timeout_ms"),
+    )
+
+    private fun webFetchDefinition(): AgentToolDefinition = AgentToolDefinition(
+        name = "web_fetch",
+        description = "Fetch bounded text from an HTTP(S) page. Server enforces timeout, response-size, redirect, and public-address checks; it never bypasses technical access controls.",
+        parameters = mapOf(
+            "tool_title" to AgentToolParam("string", "A concise title for this fetch."),
+            "url" to AgentToolParam("string", "HTTP(S) URL to fetch."),
+            "timeout_ms" to AgentToolParam("integer", "Request timeout; server clamps to configured bounds."),
+            "max_bytes" to AgentToolParam("integer", "Maximum response bytes; server clamps to configured bounds."),
+        ),
+        required = listOf("tool_title", "url"),
+        propertyOrdering = listOf("tool_title", "url", "timeout_ms", "max_bytes"),
+    )
     private fun memoryWriteDefinition(): AgentToolDefinition = AgentToolDefinition(
         name = "memory_write",
         description = "Write a memory entry to today's daily log (YYYY-MM-DD.md). Memories persist across all sessions. " +

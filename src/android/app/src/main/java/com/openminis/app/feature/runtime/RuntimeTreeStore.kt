@@ -4,6 +4,10 @@ import android.content.Context
 import com.openminis.app.data.NextDataRoot
 import java.io.File
 import java.nio.charset.StandardCharsets
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption.ATOMIC_MOVE
+import java.nio.file.StandardCopyOption.REPLACE_EXISTING
+import java.util.UUID
 
 /**
  * Small durable boundary for the recursive runtime tree.
@@ -15,6 +19,14 @@ import java.nio.charset.StandardCharsets
 class RuntimeTreeStore private constructor(
     private val file: File,
     config: RuntimeTreeConfig = RuntimeTreeConfig(),
+    private val replaceFile: (File, File) -> Unit = { source, target ->
+        Files.move(
+            source.toPath(),
+            target.toPath(),
+            ATOMIC_MOVE,
+            REPLACE_EXISTING,
+        )
+    },
 ) {
     private val tree = RuntimeSessionTree(config)
     private val lock = Any()
@@ -50,11 +62,12 @@ class RuntimeTreeStore private constructor(
     private fun persistLocked(): Boolean {
         return runCatching {
             file.parentFile?.mkdirs()
-            val tmp = File(file.parentFile, "${file.name}.tmp")
-            tmp.writeText(tree.toJson(), StandardCharsets.UTF_8)
-            if (!tmp.renameTo(file)) {
-                file.delete()
-                check(tmp.renameTo(file)) { "runtime tree rename failed" }
+            val tmp = File(file.parentFile, "${file.name}.${UUID.randomUUID()}.tmp")
+            try {
+                tmp.writeText(tree.toJson(), StandardCharsets.UTF_8)
+                replaceFile(tmp, file)
+            } finally {
+                if (tmp.exists()) tmp.delete()
             }
             true
         }.getOrDefault(false)
@@ -73,5 +86,12 @@ class RuntimeTreeStore private constructor(
          */
         fun openNext(context: Context, config: RuntimeTreeConfig = RuntimeTreeConfig()): RuntimeTreeStore =
             RuntimeTreeStore(NextDataRoot.runtimeTreeFile(context.applicationContext.filesDir), config)
+
+        internal fun openForTest(
+            file: File,
+            config: RuntimeTreeConfig = RuntimeTreeConfig(),
+            replaceFile: (File, File) -> Unit,
+        ): RuntimeTreeStore = RuntimeTreeStore(file, config, replaceFile)
+
     }
 }

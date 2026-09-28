@@ -39,9 +39,12 @@ class ChatRepository(internal val dao: ChatDao) {
         return session
     }
 
+    suspend fun insertSession(session: ChatSessionEntity) {
+        dao.insertSession(session)
+    }
+
     suspend fun getSession(id: String): ChatSessionEntity? = dao.getSession(id)
 
-    /** All persisted token_usage JSON strings for a session (one per LLM call). */
     suspend fun sessionTokenUsages(sessionId: String): List<String> = dao.tokenUsages(sessionId)
 
     /**
@@ -97,6 +100,23 @@ class ChatRepository(internal val dao: ChatDao) {
         dao.updateSessionTitle(id, title, System.currentTimeMillis())
     }
 
+    suspend fun updateSessionTitleAndCategoryWithModelSnapshot(
+        id: String,
+        title: String,
+        category: String?,
+        entryId: String?,
+        modelId: String?,
+        displayName: String?,
+        providerType: String?,
+        generatedAt: Long?,
+    ) {
+        dao.updateSessionTitleAndCategoryWithModelSnapshot(
+            id, title, category, entryId, modelId, displayName, providerType, generatedAt,
+            System.currentTimeMillis(),
+        )
+    }
+
+
     suspend fun updateSessionTitleAndCategory(id: String, title: String, category: String?) {
         dao.updateSessionTitleAndCategory(id, title, category, System.currentTimeMillis())
     }
@@ -110,9 +130,12 @@ class ChatRepository(internal val dao: ChatDao) {
     }
 
     suspend fun deleteSession(id: String) {
-        dao.deleteMessages(id)
-        dao.deleteSession(id)
+        dao.deleteSessionIfPresent(id)
     }
+
+    /** Deletes an already-authorized Chat Room session subtree atomically. */
+    suspend fun deleteSessionSubtree(sessionIds: List<String>): Int =
+        dao.deleteSessionSubtree(sessionIds)
 
     // ─── Session groups ("folders") ────────────────────────────────────────
     // [T-android-session-grouping] Ported from iOS ChatStore's Folders section.
@@ -359,6 +382,20 @@ class ChatRepository(internal val dao: ChatDao) {
      */
     suspend fun updateMessageParts(id: String, partsJson: String) =
         dao.updateMessageParts(id, partsJson)
+
+    /** Replace one persisted human-user row in place; returns false on role/id mismatch. */
+    suspend fun replaceUserMessageInPlace(messageId: String, partsJson: String): Boolean {
+        val capped = if (partsJson.length > MAX_MESSAGE_PARTS_JSON_LENGTH) {
+            buildTruncatedPartsJson(partsJson)
+        } else {
+            partsJson
+        }
+        return dao.replaceUserMessagePartsInPlace(
+            id = messageId,
+            partsJson = capped,
+            updatedAt = System.currentTimeMillis(),
+        ) == 1
+    }
 
     /** [T-error-persist-android] Set/clear the error sticker on a row by id. */
     suspend fun updateMessageErrorInfo(messageId: String, errorInfo: String?) =

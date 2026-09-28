@@ -5,6 +5,7 @@ import androidx.room.Dao
 import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
+import androidx.room.Transaction
 import androidx.room.RawQuery
 import androidx.sqlite.db.SupportSQLiteQuery
 import kotlinx.coroutines.flow.Flow
@@ -74,6 +75,9 @@ interface ChatDao {
     @Query("UPDATE sessions SET title = :title, category = COALESCE(:category, category), updated_at = :updatedAt WHERE id = :id")
     suspend fun updateSessionTitleAndCategory(id: String, title: String, category: String?, updatedAt: Long)
 
+    @Query("UPDATE sessions SET title = :title, category = COALESCE(:category, category), title_model_entry_id = :entryId, title_model_id = :modelId, title_model_display_name = :displayName, title_provider_type = :providerType, title_generated_at = :generatedAt, updated_at = :updatedAt WHERE id = :id")
+    suspend fun updateSessionTitleAndCategoryWithModelSnapshot(id: String, title: String, category: String?, entryId: String?, modelId: String?, displayName: String?, providerType: String?, generatedAt: Long?, updatedAt: Long)
+
     @Query("UPDATE sessions SET updated_at = :updatedAt WHERE id = :id")
     suspend fun touchSession(id: String, updatedAt: Long)
 
@@ -87,7 +91,40 @@ interface ChatDao {
     suspend fun updateSessionBinding(id: String, binding: String, modelId: String, updatedAt: Long = System.currentTimeMillis())
 
     @Query("DELETE FROM sessions WHERE id = :id")
-    suspend fun deleteSession(id: String)
+    suspend fun deleteSession(id: String): Int
+
+    @Query("SELECT COUNT(*) FROM sessions WHERE id IN (:ids)")
+    suspend fun countSessions(ids: List<String>): Int
+
+    @Query("DELETE FROM sessions WHERE id IN (:ids)")
+    suspend fun deleteSessions(ids: List<String>): Int
+
+    @Transaction
+    suspend fun deleteSessionIfPresent(id: String): Int {
+        if (countSessions(listOf(id)) == 0) return 0
+        val deleted = deleteSessions(listOf(id))
+        check(deleted == 1) { "session deletion affected $deleted of 1 rows" }
+        return deleted
+    }
+
+    /**
+     * Atomically deletes a runtime-authorized, frozen set of sessions.
+     * Empty input is an idempotent no-op; duplicate IDs are collapsed. Unknown
+     * IDs or a changed row count abort the transaction, rolling back all deletes.
+     */
+    @Transaction
+    suspend fun deleteSessionSubtree(sessionIds: List<String>): Int {
+        val ids = sessionIds.distinct()
+        if (ids.isEmpty()) return 0
+        require(ids.all(String::isNotBlank)) { "session IDs must not be blank" }
+        val deleted = ids.chunked(500).sumOf { chunk ->
+            check(countSessions(chunk) == chunk.size) { "one or more sessions no longer exist" }
+            val affected = deleteSessions(chunk)
+            check(affected == chunk.size) { "session deletion affected $affected of ${chunk.size} rows" }
+            affected
+        }
+        return deleted
+    }
 
     // Full-text search across session titles and message content
     @Query("""
@@ -226,6 +263,13 @@ interface ChatDao {
     @Query("SELECT COUNT(*) FROM messages")
     suspend fun totalMessageCount(): Int
 
+    @Query("SELECT COUNT(*) FROM messages WHERE session_id IN (:ids)")
+    suspend fun countMessagesForSessions(ids: List<String>): Int
+
+    @Query("SELECT COUNT(*) FROM compact_markers WHERE session_id IN (:ids)")
+    suspend fun countCompactMarkersForSessions(ids: List<String>): Int
+
+
     @Query("SELECT token_usage FROM messages WHERE session_id = :sessionId AND token_usage IS NOT NULL")
     suspend fun tokenUsages(sessionId: String): List<String>
 
@@ -325,6 +369,14 @@ interface ChatDao {
     // target tool_use — that's an UPDATE of an existing row, not a delete.
     @Query("UPDATE messages SET parts_json = :partsJson, updated_at = :updatedAt WHERE id = :id")
     suspend fun updateMessageParts(id: String, partsJson: String, updatedAt: Long = System.currentTimeMillis())
+
+    /** Replace one persisted human-user row without deleting later rows. */
+    @Query("UPDATE messages SET parts_json = :partsJson, updated_at = :updatedAt WHERE id = :id AND role = 'user'")
+    suspend fun replaceUserMessagePartsInPlace(
+        id: String,
+        partsJson: String,
+        updatedAt: Long = System.currentTimeMillis(),
+    ): Int
 
     // [T-error-persist-android] Write/clear the terminal error sticker on a
     // specific message row by id. Used when the persisted DB id is known

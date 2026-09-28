@@ -53,4 +53,9 @@ data class ChatSessionEntity(
      * in its old section.
      */
     @ColumnInfo(name = "folder_id") val folderId: String? = null,
+    @ColumnInfo(name = "title_model_entry_id") val titleModelEntryId: String? = null,
+    @ColumnInfo(name = "title_model_id") val titleModelId: String? = null,
+    @ColumnInfo(name = "title_model_display_name") val titleModelDisplayName: String? = null,
+    @ColumnInfo(name = "title_provider_type") val titleProviderType: String? = null,
+    @ColumnInfo(name = "title_generated_at") val titleGeneratedAt: Long? = null,
 )

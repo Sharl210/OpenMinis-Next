@@ -36,6 +36,13 @@ object ExecutionCoordinator {
     private lateinit var appContext: Context
     var envVarRepository: EnvVarRepository? = null
 
+    @Volatile
+    private var currentMountedSessionId: String? = null
+
+    /** Session whose persistent shell was most recently mounted. */
+    val mountedSessionId: String?
+        get() = currentMountedSessionId
+
     /** Thread-safe per-session shell registry. */
     private val shells = ConcurrentHashMap<String, PersistentShell>()
 
@@ -93,7 +100,7 @@ object ExecutionCoordinator {
 
             // Get or create shell — protected by globalLock to avoid duplicate creation
             val shell = getOrCreateShell(sessionId)
-
+            currentMountedSessionId = sessionId
             // Inject user-defined environment variables as a *full snapshot*
             // (T124a). Pass the previously-injected key set so applyEnvironment
             // can `unset` anything the user has since removed from settings;
@@ -233,6 +240,7 @@ object ExecutionCoordinator {
         // restarts from a clean baseline, so the next applyEnvironment
         // shouldn't try to `unset` keys that don't exist in the new shell.
         lastInjectedKeys.remove(sessionId)
+        if (currentMountedSessionId == sessionId) currentMountedSessionId = null
         shell?.stop()
         if (shell != null) Log.i(TAG, "[$sessionId] Shell terminated")
     }
@@ -246,6 +254,7 @@ object ExecutionCoordinator {
             val shell = shells.remove(sessionId)
             // T124a: snapshot belongs to the now-dead shell.
             lastInjectedKeys.remove(sessionId)
+            if (currentMountedSessionId == sessionId) currentMountedSessionId = null
             shell?.stop()
             Log.i(TAG, "[$sessionId] Shell stopped by user")
         } else {
@@ -253,6 +262,7 @@ object ExecutionCoordinator {
             shells.values.forEach { it.stop() }
             shells.clear()
             lastInjectedKeys.clear()
+            currentMountedSessionId = null
             ShellExecutor.destroyCurrent()
         }
     }

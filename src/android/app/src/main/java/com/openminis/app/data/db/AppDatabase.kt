@@ -15,7 +15,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         WebAppShortcutEntity::class,
         FolderEntity::class,
     ],
-    version = 12,
+    version = 13,
     // [T-android-downgrade-compat] Kept ON so MigrationTestHelper and CI can
     // validate every migration (and its downgrade counterpart) against the
     // committed schema json. Without it the upgrade/downgrade chain has no
@@ -301,10 +301,27 @@ abstract class AppDatabase : RoomDatabase() {
          * [com.openminis.app.data.db.DatabaseVersionGuard], which is the
          * backstop for exactly this case.
          */
+        val MIGRATION_12_13 = object : Migration(12, 13) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE sessions ADD COLUMN title_model_entry_id TEXT")
+                db.execSQL("ALTER TABLE sessions ADD COLUMN title_model_id TEXT")
+                db.execSQL("ALTER TABLE sessions ADD COLUMN title_model_display_name TEXT")
+                db.execSQL("ALTER TABLE sessions ADD COLUMN title_provider_type TEXT")
+                db.execSQL("ALTER TABLE sessions ADD COLUMN title_generated_at INTEGER")
+                db.execSQL("ALTER TABLE compact_markers ADD COLUMN model_role TEXT")
+                db.execSQL("ALTER TABLE compact_markers ADD COLUMN model_entry_id TEXT")
+                db.execSQL("ALTER TABLE compact_markers ADD COLUMN model_id TEXT")
+                db.execSQL("ALTER TABLE compact_markers ADD COLUMN model_display_name TEXT")
+                db.execSQL("ALTER TABLE compact_markers ADD COLUMN provider_type TEXT")
+                db.execSQL("ALTER TABLE compact_markers ADD COLUMN provider_instance_id TEXT")
+                db.execSQL("ALTER TABLE compact_markers ADD COLUMN effective_compaction_entry_id TEXT")
+                db.execSQL("ALTER TABLE compact_markers ADD COLUMN model_generated_at INTEGER")
+            }
+        }
+
         val MIGRATION_12_11 = object : Migration(12, 11) {
             override fun migrate(db: SupportSQLiteDatabase) {
-                // Intentionally empty. See the doc comment above — the four
-                // columns added by MIGRATION_11_12 are left in place.
+                // Keep additive columns on downgrade.
             }
         }
 
@@ -321,7 +338,7 @@ abstract class AppDatabase : RoomDatabase() {
                     .addMigrations(
                         MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6,
                         MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10, MIGRATION_10_11,
-                        MIGRATION_11_12, MIGRATION_12_11,
+                        MIGRATION_11_12, MIGRATION_12_13, MIGRATION_12_11,
                     )
                     .build()
                     .also { INSTANCE = it }

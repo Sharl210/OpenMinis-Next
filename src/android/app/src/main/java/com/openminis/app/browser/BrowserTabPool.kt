@@ -33,10 +33,10 @@ class BrowserTabPool(private val context: Context) {
 
     companion object {
         private const val TAG = "BrowserTabPool"
-        const val MAX_TABS = 10
+        const val MAX_TABS = 20
         private const val IDLE_CHECK_INTERVAL_MS = 60_000L  // 60 seconds
         /** Default idle timeout — matches iOS BrowserTabPool.idleTimeout (15 minutes). */
-        const val DEFAULT_IDLE_TIMEOUT_MINUTES = 15
+        const val DEFAULT_IDLE_TIMEOUT_MINUTES = 2
         /** SharedPreferences key for the user-configurable idle timeout. */
         const val PREF_IDLE_TIMEOUT_MINUTES = "idle_timeout_minutes"
         /** Minimum permitted idle timeout (minutes). Protects against runaway eviction. */
@@ -47,7 +47,8 @@ class BrowserTabPool(private val context: Context) {
         /** Global custom viewport width SharedPreferences key (0 = use UA default). */
         const val PREF_GLOBAL_VIEWPORT_WIDTH = "browser_custom_viewport_width"
         /** Global custom viewport height SharedPreferences key (0 = use UA default). */
-        const val PREF_GLOBAL_VIEWPORT_HEIGHT = "browser_custom_viewport_height"
+                const val PREF_GLOBAL_VIEWPORT_HEIGHT = "browser_custom_viewport_height"
+        private const val TAB_STATE_SCHEMA_VERSION = 2
 
         /**
          * [T-browser-use-per-tab-serial-android] Max time a browser_use call
@@ -111,6 +112,7 @@ class BrowserTabPool(private val context: Context) {
 
     data class Tab(
         val id: Int,
+        val pageId: String,
         val manager: BrowserUseManager,
         var inUse: Boolean = false,
         var lastActivityDate: Date = Date(),
@@ -158,6 +160,9 @@ class BrowserTabPool(private val context: Context) {
 
     private var sessionId: String? = null
     private val savedURLs = mutableMapOf<Int, String>()
+    private val persistedPageIds = mutableMapOf<Int, String>()
+    private val savedTitles = mutableMapOf<Int, String>()
+    private val persistedTabRecords = mutableMapOf<Int, BrowserTabRecord>()
 
     /**
      * Global custom viewport. `0` means "use the UA profile default".
@@ -249,8 +254,11 @@ class BrowserTabPool(private val context: Context) {
     // -- Session --
 
     fun setSession(sessionId: String) {
-        this.sessionId = sessionId
-        loadSavedState()
+        synchronized(downloadMetadataLock) {
+            this.sessionId = sessionId
+            loadSavedState()
+            loadDownloadMetadataLocked()
+        }
     }
 
     // -- Downloads --
@@ -284,6 +292,10 @@ class BrowserTabPool(private val context: Context) {
         val startedAt: Long,
         /** Terminal entries only: false until the user opens the panel. */
         val seen: Boolean = false,
+        val sessionId: String,
+        val sourceUrl: String? = null,
+        val tabId: Int? = null,
+        val pageId: String? = null,
     )
 
     /** Newest-first. */
@@ -292,6 +304,16 @@ class BrowserTabPool(private val context: Context) {
 
     private val downloadJobs = java.util.concurrent.ConcurrentHashMap<Long, Job>()
     private val nextDownloadId = java.util.concurrent.atomic.AtomicLong(1)
+    private val downloadMetadataLock = Any()
+    private data class DownloadBinding(
+        val sessionId: String,
+        val workspace: File,
+        val metadataFile: File,
+    )
+    private val downloadBindings = ConcurrentHashMap<Long, DownloadBinding>()
+    private val downloadRegistries = mutableMapOf<String, MutableList<DownloadEntry>>()
+    private val lastDownloadMetadataPersistAtBySession = mutableMapOf<String, Long>()
+    private val downloadMetadataMaxEntries = BrowserDownloadMetadataStore.MAX_ENTRIES
 
     /**
      * Posts a user-visible download notice into the owning chat. Wired by
@@ -301,7 +323,90 @@ class BrowserTabPool(private val context: Context) {
 
     private val downloadScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
-    private fun registerDownload(dest: File, totalBytes: Long): Long {
+    /** Test seam; production keeps the direct File.writeBytes implementation. */
+    internal var blobDownloadWriter: suspend (File, ByteArray) -> Unit = { file, bytes ->
+        file.writeBytes(bytes)
+    }
+
+    private fun downloadMetadataFile(): File? {
+        val sid = sessionId ?: return null
+        return File(File(context.filesDir, "browser_tabs"), "$sid.downloads.json")
+    }
+
+    private fun persistDownloadMetadata(force: Boolean = false) {
+        val sid = sessionId ?: return
+        val binding = DownloadBinding(
+            sessionId = sid,
+            workspace = sessionWorkspaceDir() ?: return,
+            metadataFile = downloadMetadataFile() ?: return,
+        )
+        persistSessionMetadataLocked(binding, downloadRegistries[sid].orEmpty(), force)
+    }
+
+    private fun persistSessionMetadataLocked(
+        binding: DownloadBinding,
+        entries: List<DownloadEntry>,
+        force: Boolean,
+    ) {
+        val now = System.currentTimeMillis()
+        val last = lastDownloadMetadataPersistAtBySession[binding.sessionId] ?: 0L
+        if (!force && now - last < 1_000L) return
+        lastDownloadMetadataPersistAtBySession[binding.sessionId] = now
+        val records = entries.mapNotNull { entry ->
+            val destination = entry.destination ?: return@mapNotNull null
+            val relative = runCatching {
+                BrowserDownloadMetadataStore.relativePath(binding.workspace, destination)
+            }.getOrNull() ?: return@mapNotNull null
+            BrowserDownloadMetadataStore.Record(
+                id = entry.id,
+                filename = entry.filename,
+                destinationRelativePath = relative,
+                bytesDone = entry.bytesDone,
+                totalBytes = entry.totalBytes,
+                state = entry.state.name,
+                failureReason = entry.failureReason,
+                startedAt = entry.startedAt,
+                seen = entry.seen,
+                sourceUrl = entry.sourceUrl,
+                tabId = entry.tabId,
+                pageId = entry.pageId,
+            )
+        }.take(downloadMetadataMaxEntries)
+        BrowserDownloadMetadataStore.save(binding.metadataFile, binding.workspace, records)
+    }
+
+    private fun loadDownloadMetadataLocked() {
+        val sid = sessionId ?: return
+        val workspace = sessionWorkspaceDir() ?: return
+        val file = downloadMetadataFile() ?: return
+        val restored = BrowserDownloadMetadataStore.load(file, workspace)
+        val entries = restored.map { record ->
+            DownloadEntry(
+                id = record.id,
+                filename = record.filename,
+                destination = File(workspace, record.destinationRelativePath),
+                bytesDone = record.bytesDone,
+                totalBytes = record.totalBytes,
+                state = runCatching { DownloadState.valueOf(record.state) }.getOrDefault(DownloadState.FAILED),
+                failureReason = record.failureReason,
+                startedAt = record.startedAt,
+                seen = record.seen,
+                sessionId = sessionId ?: "",
+                sourceUrl = record.sourceUrl,
+                tabId = record.tabId,
+                pageId = record.pageId,
+            )
+        }
+        _downloads.value = entries.take(downloadMetadataMaxEntries)
+        downloadRegistries[sid] = _downloads.value.toMutableList()
+        val next = (entries.maxOfOrNull { it.id } ?: 0L) + 1L
+        nextDownloadId.updateAndGet { maxOf(it, next) }
+        persistDownloadMetadata(force = true)
+    }
+
+    private fun registerDownload(dest: File, totalBytes: Long, sourceUrl: String? = null): Long {
+        val boundSession = sessionId ?: return -1L
+        val workspace = dest.parentFile ?: return -1L
         val id = nextDownloadId.getAndIncrement()
         val entry = DownloadEntry(
             id = id,
@@ -311,26 +416,54 @@ class BrowserTabPool(private val context: Context) {
             totalBytes = totalBytes,
             state = DownloadState.DOWNLOADING,
             startedAt = System.currentTimeMillis(),
+            sessionId = boundSession,
+            sourceUrl = sourceUrl,
         )
-        _downloads.value = listOf(entry) + _downloads.value
+        synchronized(downloadMetadataLock) {
+            downloadBindings[id] = DownloadBinding(
+                sessionId = boundSession,
+                workspace = workspace,
+                metadataFile = File(File(context.filesDir, "browser_tabs"), "$boundSession.downloads.json"),
+            )
+            downloadRegistries.getOrPut(boundSession) { mutableListOf() }
+                .apply { add(0, entry) }
+                .also { while (it.size > downloadMetadataMaxEntries) it.removeLast() }
+            if (boundSession == sessionId) _downloads.value = downloadRegistries[boundSession].orEmpty()
+            persistSessionMetadataLocked(downloadBindings[id]!!, downloadRegistries[boundSession].orEmpty(), force = true)
+        }
         _activeDownload.value = DownloadUiState(dest.name, if (totalBytes > 0) 0f else -1f)
         return id
     }
 
-    private fun updateDownloadEntry(id: Long, transform: (DownloadEntry) -> DownloadEntry) {
-        _downloads.value = _downloads.value.map { if (it.id == id) transform(it) else it }
+    private fun updateDownloadEntry(id: Long, force: Boolean = true, transform: (DownloadEntry) -> DownloadEntry) {
+        synchronized(downloadMetadataLock) {
+            val binding = downloadBindings[id] ?: return
+            val registry = downloadRegistries[binding.sessionId] ?: return
+            val index = registry.indexOfFirst { it.id == id }
+            if (index < 0) return
+            val updated = transform(registry[index])
+            registry[index] = updated
+            if (binding.sessionId == sessionId) {
+                _downloads.value = registry.toList()
+            }
+            persistSessionMetadataLocked(binding, registry, force)
+        }
     }
 
     private fun updateDownloadProgress(id: Long, name: String, copied: Long, total: Long) {
-        updateDownloadEntry(id) { it.copy(bytesDone = copied, totalBytes = total) }
-        _activeDownload.value = DownloadUiState(
-            name,
-            if (total > 0) (copied.toFloat() / total).coerceIn(0f, 1f) else -1f,
-        )
+        val binding = downloadBindings[id]
+        updateDownloadEntry(id, force = false) { it.copy(bytesDone = copied, totalBytes = total) }
+        if (binding?.sessionId == sessionId) {
+            _activeDownload.value = DownloadUiState(
+                name,
+                if (total > 0) (copied.toFloat() / total).coerceIn(0f, 1f) else -1f,
+            )
+        }
     }
 
     private fun settleDownload(id: Long, state: DownloadState, reason: String? = null, bytes: Long? = null) {
         downloadJobs.remove(id)
+        val binding = downloadBindings[id]
         updateDownloadEntry(id) {
             it.copy(
                 state = state,
@@ -338,7 +471,8 @@ class BrowserTabPool(private val context: Context) {
                 bytesDone = bytes ?: it.bytesDone,
             )
         }
-        _activeDownload.value = null
+        downloadBindings.remove(id)
+        if (binding?.sessionId == sessionId) _activeDownload.value = null
     }
 
     /** Cancel an in-flight download; the coroutine's CancellationException
@@ -353,16 +487,26 @@ class BrowserTabPool(private val context: Context) {
         entries.count { it.state == DownloadState.DOWNLOADING || !it.seen }
 
     /** Panel opened — terminal entries stop counting toward the badge. */
-    fun markDownloadsSeen() {
-        _downloads.value = _downloads.value.map {
+    fun markDownloadsSeen() = synchronized(downloadMetadataLock) {
+        val sid = sessionId ?: return@synchronized
+        val registry = downloadRegistries[sid] ?: return@synchronized
+        val updated = registry.map {
             if (it.state != DownloadState.DOWNLOADING) it.copy(seen = true) else it
-        }
+        }.toMutableList()
+        downloadRegistries[sid] = updated
+        _downloads.value = updated
+        persistDownloadMetadata(force = true)
     }
 
     /** "Clear" in the panel: drops ALL finished records (completed AND failed,
      *  iOS v3 semantics) — in-flight rows untouched. */
-    fun clearFinishedDownloads() {
-        _downloads.value = _downloads.value.filter { it.state == DownloadState.DOWNLOADING }
+    fun clearFinishedDownloads() = synchronized(downloadMetadataLock) {
+        val sid = sessionId ?: return@synchronized
+        val registry = downloadRegistries[sid] ?: return@synchronized
+        val updated = registry.filter { it.state == DownloadState.DOWNLOADING }.toMutableList()
+        downloadRegistries[sid] = updated
+        _downloads.value = updated
+        persistDownloadMetadata(force = true)
     }
 
 
@@ -403,7 +547,7 @@ class BrowserTabPool(private val context: Context) {
         val name = android.webkit.URLUtil.guessFileName(url, contentDisposition, mimeType)
         val dest = uniqueFile(dir, name)
         onDownloadEvent?.invoke("Downloading ${middleTruncated(dest.name)}…")
-        val id = registerDownload(dest, contentLength)
+        val id = registerDownload(dest, contentLength, sourceUrl = url)
         val job = downloadScope.launch {
             try {
                 val conn = java.net.URL(url).openConnection() as java.net.HttpURLConnection
@@ -468,7 +612,7 @@ class BrowserTabPool(private val context: Context) {
         val id = registerDownload(dest, data.size.toLong())
         val job = downloadScope.launch {
             try {
-                dest.writeBytes(data)
+                blobDownloadWriter(dest, data)
                 finishDownload(id, dest)
             } catch (e: kotlinx.coroutines.CancellationException) {
                 runCatching { dest.delete() }
@@ -519,6 +663,17 @@ class BrowserTabPool(private val context: Context) {
      *   `BrowserTabPool.execute(action:singleTab:)`. Explicit tab_id always
      *   routes to that tab regardless of this flag.
      */
+    /** Resolve a DevTools target only when all three identities match the live pool. */
+    suspend fun resolveDevToolsTarget(
+        requestedSessionId: String,
+        tabId: Int,
+        pageId: String,
+    ): BrowserUseManager? = withContext(Dispatchers.Main) {
+        val expectedSession = sessionId?.trim().orEmpty()
+        if (expectedSession.isBlank() || requestedSessionId.trim() != expectedSession) return@withContext null
+        _tabs.value.firstOrNull { it.id == tabId && it.pageId == pageId.trim() }?.manager
+    }
+
     suspend fun execute(
         input: BrowserActionInput,
         singleTab: Boolean = false,
@@ -835,7 +990,7 @@ class BrowserTabPool(private val context: Context) {
         manager.onCloseWindow = { handleCloseWindow(manager) }
         wireDownloadHandlers(manager)
 
-        val tab = Tab(id = id, manager = manager)
+        val tab = Tab(id = id, pageId = persistedPageIds.remove(id) ?: java.util.UUID.randomUUID().toString(), manager = manager)
         tabs.add(tab)
         _tabs.value = tabs.toList()
 
@@ -938,7 +1093,7 @@ class BrowserTabPool(private val context: Context) {
         manager.onCloseWindow = { handleCloseWindow(manager) }
         wireDownloadHandlers(manager)
 
-        val tab = Tab(id = id, manager = manager)
+        val tab = Tab(id = id, pageId = java.util.UUID.randomUUID().toString(), manager = manager)
         currentTabs.add(tab)
         _tabs.value = currentTabs
         _selectedTabId.value = id
@@ -1185,10 +1340,20 @@ class BrowserTabPool(private val context: Context) {
         val now = System.currentTimeMillis()
         val currentTabs = _tabs.value.toMutableList()
         val timeoutMs = idleTimeoutMs
-        val toRemove = currentTabs.filter { !it.inUse && (now - it.lastActivityDate.time) >= timeoutMs }
+        val toRemove = currentTabs.filter { tab ->
+            BrowserIdleSleepStateMachine.state(
+                inUse = tab.inUse,
+                idleMs = now - tab.lastActivityDate.time,
+                timeoutMs = timeoutMs,
+            ) == BrowserIdleState.SLEEPING
+        }
         for (tab in toRemove) {
             val url = tab.manager.currentURL.value
             if (url.isNotEmpty()) savedURLs[tab.id] = url
+            persistedPageIds[tab.id] = tab.pageId
+            val title = tab.manager.pageTitle.value
+            if (title.isNotEmpty()) savedTitles[tab.id] = title
+            persistedTabRecords[tab.id] = BrowserTabRecord(tab.pageId, title, url)
             currentTabs.remove(tab)
             Log.i(TAG, "Evicted idle tab ${tab.id}")
         }
@@ -1315,14 +1480,29 @@ class BrowserTabPool(private val context: Context) {
             val file = File(dir, "$sid.json")
             val json = JSONObject()
             val urlsJson = JSONObject()
+            val recordsJson = org.json.JSONArray()
             for (tab in _tabs.value) {
                 val url = tab.manager.currentURL.value
+                val title = tab.manager.pageTitle.value
+                BrowserTabPersistence.mergeLive(
+                    records = persistedTabRecords,
+                    runtimeId = tab.id,
+                    live = BrowserTabRecord(tab.pageId, title, url),
+                )
                 if (url.isNotEmpty()) urlsJson.put(tab.id.toString(), url)
+                val persisted = persistedTabRecords[tab.id]
+                recordsJson.put(JSONObject().put("runtimeId", tab.id).put("pageId", persisted?.pageId ?: tab.pageId)
+                    .put("title", persisted?.title.orEmpty()).put("url", persisted?.url.orEmpty()))
             }
             for ((id, url) in savedURLs) {
                 urlsJson.put(id.toString(), url)
+                val pageId = persistedPageIds[id] ?: java.util.UUID.randomUUID().toString().also { persistedPageIds[id] = it }
+                recordsJson.put(JSONObject().put("runtimeId", id).put("pageId", pageId)
+                    .put("title", savedTitles[id].orEmpty()).put("url", url))
             }
+            json.put("schemaVersion", TAB_STATE_SCHEMA_VERSION)
             json.put("tabURLs", urlsJson)
+            json.put("pages", recordsJson)
             json.put("selectedTabId", _selectedTabId.value)
             // Persist session viewport override alongside tab URLs so reopening
             // the session restores the override. Mirrors iOS `PersistedTabs`.
@@ -1351,7 +1531,21 @@ class BrowserTabPool(private val context: Context) {
                 }
                 _selectedTabId.value = json.optInt("selectedTabId", 0)
             }
-            // Restore session viewport override. 0/missing = no override; fall
+            val pages = json.optJSONArray("pages")
+            if (pages != null) {
+                for (index in 0 until pages.length()) {
+                    val page = pages.optJSONObject(index) ?: continue
+                    val runtimeId = page.optInt("runtimeId", -1)
+                    val pageId = page.optString("pageId", "").trim()
+                    if (runtimeId < 0 || pageId.isEmpty()) continue
+                    persistedPageIds[runtimeId] = pageId
+                    val pageTitle = page.optString("title", "")
+                    savedTitles[runtimeId] = pageTitle
+                    val pageUrl = page.optString("url", "")
+                    persistedTabRecords[runtimeId] = BrowserTabRecord(pageId, pageTitle, pageUrl)
+                    if (pageUrl.isNotEmpty()) savedURLs[runtimeId] = pageUrl
+                }
+            }
             // back to the global custom viewport / UA profile default.
             val w = json.optInt("sessionViewportWidth", 0)
             val h = json.optInt("sessionViewportHeight", 0)

@@ -9,6 +9,9 @@ import com.openminis.app.data.db.ChatSessionEntity
 import com.openminis.app.data.db.FolderEntity
 import com.openminis.app.data.model.LLMMessage
 import com.openminis.app.data.model.ThinkingLevel
+import com.openminis.app.data.model.ActualModelRequestSnapshot
+import com.openminis.app.data.model.ModelRole
+import com.openminis.app.data.model.ModelRoleSelectionResolver
 import com.openminis.app.data.repository.ChatRepository
 import com.openminis.app.data.repository.ProviderRepository
 import com.openminis.app.logging.AppLogger
@@ -878,7 +881,8 @@ class SessionListViewModel(
                 // The sub-entry must pass the same T334 modality filter; when no
                 // sub-group is configured / all members disabled it's null and we
                 // fall through to the existing primary-first ordering.
-                val subEntry = providerRepository.resolveTitleSubEntry()
+                val explicitTitle = ModelRoleSelectionResolver.explicitTitleEntry(providerRepository.config.value)
+                val subEntry = (explicitTitle ?: providerRepository.resolveTitleSubEntry())
                     ?.takeIf { sub -> titleEligible.any { it == sub } }
                 val primary = titleEligible.firstOrNull { it.model.id == session.modelId }
                     ?.takeIf { it != subEntry }
@@ -939,7 +943,9 @@ class SessionListViewModel(
                             // the auto path via TITLE_GEN_SYSTEM_PROMPT (iOS-aligned
                             // wording). Passed bare — AnthropicProvider handles the
                             // OAuth Claude Code prefix at the provider layer.
-                            systemPrompt = com.openminis.app.ui.chat.TITLE_GEN_SYSTEM_PROMPT,
+                            systemPrompt = providerRepository.titlePrompt
+                                ?.takeIf { it.isNotBlank() }
+                                ?: com.openminis.app.ui.chat.TITLE_GEN_SYSTEM_PROMPT,
                             maxTokens = titleMaxTokens,
                             // [T-android-titlegen-temperature] null (not 0.3) so
                             // buildRequestBody omits the field — the gpt-5.x
@@ -952,7 +958,15 @@ class SessionListViewModel(
                         )
                         val (title, category) = parseTitleResponse(response.text)
                         if (title.isNotEmpty()) {
-                            chatRepository.updateSessionTitleAndCategory(id, title, category)
+                            val providerType = providerRepository.instance(entry.providerInstanceId)?.providerType?.name
+                            if (providerType != null) {
+                                chatRepository.updateSessionTitleAndCategoryWithModelSnapshot(
+                                    id, title, category, entry.id, entry.model.id,
+                                    entry.model.displayName, providerType, System.currentTimeMillis(),
+                                )
+                            } else {
+                                chatRepository.updateSessionTitleAndCategory(id, title, category)
+                            }
                             AppLogger.info(
                                 "TitleGen",
                                 "outcome=set origin=$origin session=${id.take(8)} " +
@@ -1022,7 +1036,18 @@ class SessionListViewModel(
             )
             return false
         }
-        chatRepository.updateSessionTitle(id, cleaned)
+        val entry = ModelRoleSelectionResolver.explicitTitleEntry(providerRepository.config.value)
+            ?: providerRepository.resolveTitleSubEntry()
+            ?: providerRepository.config.value.modelEntries.firstOrNull { it.model.id == chatRepository.getSession(id)?.modelId }
+        val providerType = entry?.let { providerRepository.instance(it.providerInstanceId)?.providerType?.name }
+        if (entry != null && providerType != null) {
+            chatRepository.updateSessionTitleAndCategoryWithModelSnapshot(
+                id, cleaned, null, entry.id, entry.model.id, entry.model.displayName,
+                providerType, System.currentTimeMillis(),
+            )
+        } else {
+            chatRepository.updateSessionTitle(id, cleaned)
+        }
         // Length only — never the prompt text itself.
         AppLogger.info(
             "TitleGen",

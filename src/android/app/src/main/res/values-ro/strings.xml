@@ -1202,6 +1202,12 @@
     <string name="chat_attach_add_file">Adaugă un fișier</string>
     <string name="add_models_to_group_all_in_group">Toate modelele sunt deja în acest grup.</string>
     <string name="add_models_to_group_no_match">Nu s-a găsit niciun model potrivit.</string>
+    <string name="chat_queued_withdraw">Withdraw queued message</string>
+    <string name="chat_queued_withdraw_and_edit">Withdraw and edit</string>
+    <string name="chat_queued_withdraw_failed">Unable to withdraw; the prompt has already started.</string>
+    <string name="chat_edit_writeback">Update message</string>
+    <string name="chat_edit_writeback_success">Message updated</string>
+    <string name="chat_edit_writeback_failed">Message update failed</string>
     <string name="chat_longpress_edit">Editează</string>
     <string name="chat_longpress_delete_from_here">Șterge de aici înainte</string>
     <string name="chat_delete_from_here_confirm">Șterge</string>
@@ -1799,4 +1805,8 @@
     <string name="round_injection_interval">Interval de declanșare</string>
     <string name="round_injection_interval_description">Numărul de apeluri ale modelului dintre injectările periodice</string>
     <string name="round_injection_interval_suffix">apeluri</string>
+    <string name="model_groups_title_prompt">Title generation prompt</string>
+    <string name="model_groups_compaction_prompt">Conversation compaction prompt</string>
+    <string name="model_groups_prompt_reset">Reset to default</string>
+    <string name="model_groups_prompt_save">Save prompt</string>
 </resources>

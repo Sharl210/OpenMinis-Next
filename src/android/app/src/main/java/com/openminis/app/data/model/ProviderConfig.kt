@@ -403,7 +403,17 @@ data class ProviderConfig(
     val modelEntries: MutableList<ModelEntry> = mutableListOf(),
     val modelGroups: MutableList<ModelGroup> = mutableListOf(),
     var defaultPrimaryGroupId: String? = null,
+    /** Explicit primary-agent model entry; null keeps legacy primary group routing. */
+    var primaryModelEntryId: String? = null,
     var defaultSubGroupId: String? = null,
+    /** Explicit title-generation model entry; null keeps the legacy subgroup resolver. */
+    var titleModelEntryId: String? = null,
+    /** Explicit compaction model entry; null falls back to the primary model. */
+    var compactionModelEntryId: String? = null,
+    /** User-customizable title prompt; null means use the built-in default. */
+    var titlePrompt: String? = null,
+    /** User-customizable compaction prompt; null means use the built-in default. */
+    var compactionPrompt: String? = null,
     // [T-android-provider-voice] Voice Input / Voice Output group bindings —
     // mirrors iOS ProviderConfig.voiceInputGroupId / voiceOutputGroupId
     // (per-device, provider_local_kv on iOS; meta KV rows here). Old persisted
@@ -421,6 +431,8 @@ data class ProviderConfig(
     // command) — mirrors iOS agentLoopModelEntryIds / agentLoopGroupIds.
     val agentLoopModelEntryIds: MutableList<String> = mutableListOf(),
     val agentLoopGroupIds: MutableList<String> = mutableListOf(),
+    /** Optional human notes keyed by child-agent model entry or group id. */
+    val subAgentModelNotes: MutableMap<String, String> = mutableMapOf(),
     // T273: bumped by ProviderRepository.saveConfig on every mutation so
     // data-class structural equals returns false even when callers mutate
     // inner MutableLists in place. Without this, MutableStateFlow's
@@ -441,6 +453,26 @@ data class ProviderConfig(
 ) {
     companion object {
         private val revisionSeq = java.util.concurrent.atomic.AtomicLong(1L)
+
+        const val BACKUP_SCALAR_PRIMARY_MODEL_ENTRY_ID = "primaryModelEntryId"
+        const val BACKUP_SCALAR_SUBAGENT_GROUP_ID = "defaultSubGroupId"
+        const val BACKUP_SCALAR_TITLE_PROMPT = "titlePrompt"
+        const val BACKUP_SCALAR_COMPACTION_PROMPT = "compactionPrompt"
+        const val BACKUP_SCALAR_TITLE_MODEL_ENTRY_ID = "titleModelEntryId"
+        const val BACKUP_SCALAR_COMPACTION_MODEL_ENTRY_ID = "compactionModelEntryId"
+
+        fun mergeBackupScalars(
+            local: ProviderConfig,
+            remote: ProviderConfig,
+            presentFields: Set<String>,
+        ): ProviderConfig = local.copy(
+            titlePrompt = if (BACKUP_SCALAR_TITLE_PROMPT in presentFields) remote.titlePrompt else local.titlePrompt,
+            compactionPrompt = if (BACKUP_SCALAR_COMPACTION_PROMPT in presentFields) remote.compactionPrompt else local.compactionPrompt,
+            primaryModelEntryId = if (BACKUP_SCALAR_PRIMARY_MODEL_ENTRY_ID in presentFields) remote.primaryModelEntryId else local.primaryModelEntryId,
+            defaultSubGroupId = if (BACKUP_SCALAR_SUBAGENT_GROUP_ID in presentFields) remote.defaultSubGroupId else local.defaultSubGroupId,
+            titleModelEntryId = if (BACKUP_SCALAR_TITLE_MODEL_ENTRY_ID in presentFields) remote.titleModelEntryId else local.titleModelEntryId,
+            compactionModelEntryId = if (BACKUP_SCALAR_COMPACTION_MODEL_ENTRY_ID in presentFields) remote.compactionModelEntryId else local.compactionModelEntryId,
+        )
 
         /** Monotonic, process-unique id for a ProviderConfig value. */
         fun nextRevision(): Long = revisionSeq.getAndIncrement()

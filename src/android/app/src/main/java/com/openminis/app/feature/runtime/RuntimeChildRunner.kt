@@ -4,6 +4,8 @@ import android.content.Context
 import com.openminis.app.data.model.AgentContentPart
 import com.openminis.app.data.model.LLMMessage
 import com.openminis.app.data.model.ModelAttributionSnapshot
+import com.openminis.app.data.model.LLMError
+import com.openminis.app.data.model.LLMRequestDiagnostics
 import com.openminis.app.data.model.ModelEntry
 import com.openminis.app.data.repository.ChatRepository
 import com.openminis.app.data.repository.ProviderRepository
@@ -92,9 +94,23 @@ class RuntimeChildRunner(
                 SessionActivityTracker.publishLastReply(childSessionId, result.output)
                 SessionActivityTracker.finishDelegatedChild(parentSessionId, childSessionId)
             },
-            onFailure = {
-                SessionActivityTracker.finishDelegatedChild(parentSessionId, childSessionId, failed = true)
+            onFailure = { error ->
+                val diagnostics = (error as? LLMError)?.diagnostics
+                SessionActivityTracker.finishDelegatedChild(
+                    parentSessionId,
+                    childSessionId,
+                    failed = true,
+                    report = RuntimeStopReport(
+                        nodeId = childSessionId,
+                        statusCode = diagnostics?.statusCode,
+                        errorResponse = diagnostics?.errorResponse,
+                        responseHeaders = diagnostics?.responseHeaders ?: emptyMap(),
+                        debugInfo = diagnostics?.debugInfo ?: error.message,
+                        lastSentBody = diagnostics?.requestBody ?: request.prompt,
+                    ),
+                )
             },
+
         ) {
             withContext(Dispatchers.IO) {
                 chatRepository.appendMessage(

@@ -375,7 +375,22 @@ class AnthropicProviderTest {
         assertEquals(false, AnthropicProvider.supportsThinking("claude-3-5-sonnet"))
     }
 
-    // -- Provider metadata --
+
+    @Test
+    fun `sendMessage preserves non2xx diagnostics`() = runBlocking {
+        server.enqueue(MockResponse().setResponseCode(418).addHeader("x-diag", "anthropic").setBody("teapot"))
+        try {
+            provider.sendMessage(listOf(LLMMessage(LLMMessage.Role.USER, "diagnostic")), null, 100)
+            throw AssertionError("Expected provider error")
+        } catch (e: LLMError.ProviderError) {
+            val d = e.diagnostics ?: throw AssertionError("missing diagnostics")
+            assertEquals(418, d.statusCode)
+            assertEquals("anthropic", d.responseHeaders["x-diag"])
+            assertEquals("teapot", d.errorResponse)
+            assertTrue(d.requestBody?.contains("diagnostic") == true)
+            assertTrue(d.debugInfo?.contains("Anthropic") == true)
+        }
+    }
 
     @Test
     fun `provider name is Anthropic`() {

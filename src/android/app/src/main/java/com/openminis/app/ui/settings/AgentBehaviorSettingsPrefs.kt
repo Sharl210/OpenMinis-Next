@@ -27,6 +27,10 @@ class AgentBehaviorSettingsPrefs(context: Context) {
         maxRetryAttempts = normalizeMaxRetryAttempts(
             prefs.getInt(KEY_MAX_RETRY_ATTEMPTS, DEFAULT_MAX_RETRY_ATTEMPTS),
         ),
+        webSearchMaxResults = prefs.getInt(KEY_WEB_SEARCH_MAX_RESULTS, DEFAULT_WEB_SEARCH_MAX_RESULTS)
+            .coerceIn(MIN_WEB_SEARCH_MAX_RESULTS, MAX_WEB_SEARCH_MAX_RESULTS),
+        webRequestTimeoutMs = prefs.getLong(KEY_WEB_REQUEST_TIMEOUT_MS, DEFAULT_WEB_REQUEST_TIMEOUT_MS)
+            .coerceIn(MIN_WEB_REQUEST_TIMEOUT_MS, MAX_WEB_REQUEST_TIMEOUT_MS),
     )
 
     fun save(settings: AgentBehaviorSettings) {
@@ -41,6 +45,8 @@ class AgentBehaviorSettingsPrefs(context: Context) {
             )
             .putBoolean(KEY_AUTO_RETRY_ENABLED, settings.autoRetryEnabled)
             .putInt(KEY_MAX_RETRY_ATTEMPTS, normalizeMaxRetryAttempts(settings.maxRetryAttempts))
+            .putInt(KEY_WEB_SEARCH_MAX_RESULTS, settings.webSearchMaxResults.coerceIn(MIN_WEB_SEARCH_MAX_RESULTS, MAX_WEB_SEARCH_MAX_RESULTS))
+            .putLong(KEY_WEB_REQUEST_TIMEOUT_MS, settings.webRequestTimeoutMs.coerceIn(MIN_WEB_REQUEST_TIMEOUT_MS, MAX_WEB_REQUEST_TIMEOUT_MS))
             .apply()
     }
 
@@ -53,12 +59,16 @@ class AgentBehaviorSettingsPrefs(context: Context) {
         private const val KEY_COMPACT_THRESHOLD_TOKENS = "compact_threshold_tokens"
         private const val KEY_AUTO_RETRY_ENABLED = "auto_retry_enabled"
         private const val KEY_MAX_RETRY_ATTEMPTS = "max_retry_attempts"
+        private const val KEY_WEB_SEARCH_MAX_RESULTS = "web_search_max_results"
+        private const val KEY_WEB_REQUEST_TIMEOUT_MS = "web_request_timeout_ms"
 
         const val DEFAULT_RECURSION_DEPTH = 2
         const val DEFAULT_PARALLEL_AGENT_LIMIT = 5
         const val DEFAULT_COMPACT_THRESHOLD_TOKENS = 150
         const val DEFAULT_AUTO_RETRY_ENABLED = true
         const val DEFAULT_MAX_RETRY_ATTEMPTS = -1
+        const val DEFAULT_WEB_SEARCH_MAX_RESULTS = 10
+        const val DEFAULT_WEB_REQUEST_TIMEOUT_MS = 20_000L
 
         const val MIN_RECURSION_DEPTH = 0
         const val MAX_RECURSION_DEPTH = 2
@@ -68,6 +78,10 @@ class AgentBehaviorSettingsPrefs(context: Context) {
         const val MAX_COMPACT_THRESHOLD_TOKENS = 150
         const val MIN_RETRY_ATTEMPTS = -1
         const val MAX_RETRY_ATTEMPTS = 150
+        const val MIN_WEB_SEARCH_MAX_RESULTS = 1
+        const val MAX_WEB_SEARCH_MAX_RESULTS = 50
+        const val MIN_WEB_REQUEST_TIMEOUT_MS = 1_000L
+        const val MAX_WEB_REQUEST_TIMEOUT_MS = 120_000L
 
         /**
          * -1 = unlimited, 0 = disabled, positive = bounded retries.
@@ -90,4 +104,6 @@ data class AgentBehaviorSettings(
     val compactThresholdTokens: Int = AgentBehaviorSettingsPrefs.DEFAULT_COMPACT_THRESHOLD_TOKENS,
     val autoRetryEnabled: Boolean = AgentBehaviorSettingsPrefs.DEFAULT_AUTO_RETRY_ENABLED,
     val maxRetryAttempts: Int = AgentBehaviorSettingsPrefs.DEFAULT_MAX_RETRY_ATTEMPTS,
+    val webSearchMaxResults: Int = AgentBehaviorSettingsPrefs.DEFAULT_WEB_SEARCH_MAX_RESULTS,
+    val webRequestTimeoutMs: Long = AgentBehaviorSettingsPrefs.DEFAULT_WEB_REQUEST_TIMEOUT_MS,
 )

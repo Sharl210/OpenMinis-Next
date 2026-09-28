@@ -424,67 +424,44 @@ class BrowserUseManager(
         }
     }
 
-    /** Resolve minis:// URLs to local workspace files. */
+    /** Resolve minis:// URLs to the current session's allowed local workspace only. */
     private fun interceptMinisURL(uri: android.net.Uri): android.webkit.WebResourceResponse? {
+        fun reject(reason: String): android.webkit.WebResourceResponse =
+            android.webkit.WebResourceResponse(
+                "text/plain", "UTF-8", 403, "Forbidden", emptyMap(),
+                "minis:// request rejected: $reason".byteInputStream(),
+            )
         try {
-            // minis://workspace/foo.html → /var/minis/workspace/foo.html, then
-            // resolve to the host file via PRoot bind mounts (per-session
-            // workspace lives under filesDir/minis-sessions/<sid>/workspace/).
-            val host = uri.host ?: return null
-            val path = uri.path ?: ""
-            val linuxPath = "/var/minis/$host$path"
-
-            // [T-android-minis-url-session-scope] Resolve against THIS session
-            // first, and only then fall back to the global bind-mount map.
-            //
-            // `workspace`, `attachments`, `offloads` and `browser` live under
-            // `minis-sessions/<sid>/`, but the global map only gains a
-            // `/var/minis/workspace` entry while some session's PRoot shell is
-            // running — and it is last-writer-wins across sessions. So the old
-            // global-only lookup failed in two ordinary situations: the shell
-            // had exited (path fell through to the rootfs copy of
-            // /var/minis/workspace, which is empty), or another session had
-            // booted more recently and the mount pointed at ITS workspace.
-            //
-            // Measured on a GEM-W09: `minis://workspace/jump-jump.html` 404'd
-            // while the file sat intact at 5969 bytes in
-            // minis-sessions/145d6883…/workspace/. The rootfs directory the
-            // resolver actually reached contained nothing but `.` and `..`.
-            // That is also why the failure looked intermittent and looked like
-            // it depended on subdirectory depth — it depends on neither, only
-            // on whether the global mount happens to point at the right
-            // session at that moment.
-            val sessionId = sessionIdProvider()
-            val ctx = appContext
-            val localFile = if (sessionId != null && ctx != null) {
-                com.openminis.app.sandbox.PRootKernel
-                    .resolveSessionHostPath(sessionId, linuxPath, ctx)
-                    ?.takeIf { it.isFile }
-                    ?: com.openminis.app.sandbox.PRootKernel.resolveHostPath(linuxPath)
-            } else {
-                com.openminis.app.sandbox.PRootKernel.resolveHostPath(linuxPath)
-            }
-            if (localFile == null || !localFile.exists() || !localFile.isFile) {
-                return android.webkit.WebResourceResponse("text/plain", "UTF-8", 404, "Not Found",
-                    emptyMap(), "File not found: $host$path".byteInputStream())
-            }
+            val host = uri.host ?: return reject("missing host")
+            val rawPath = uri.encodedPath ?: uri.path ?: return reject("missing path")
+            val validated = MinisLocalPathPolicy.resolve(host, rawPath)
+                .getOrElse { return reject(it.message ?: "invalid local path") }
+            val validatedUri = android.net.Uri.parse(validated)
+            val sessionId = sessionIdProvider() ?: return reject("session is unavailable")
+            val ctx = appContext ?: return reject("session context is unavailable")
+            // The policy currently allows more than the session workspace, but this
+            // interceptor intentionally serves only the current session workspace.
+            if (validatedUri.host != "workspace") return reject("host is not session workspace")
+            val linuxPath = "/var/minis/workspace${validatedUri.path ?: "/"}"
+            val localFile = com.openminis.app.sandbox.PRootKernel
+                .resolveSessionHostPath(sessionId, linuxPath, ctx)
+                ?.takeIf { file ->
+                    val root = File(ctx.filesDir, "minis-sessions/$sessionId/workspace").canonicalFile
+                    val candidate = file.canonicalFile
+                    candidate.toPath().startsWith(root.toPath()) && candidate.isFile
+                }
+                ?: return reject("session workspace path is unavailable")
             val mimeType = guessMimeType(localFile.name)
-            // For HTML mainframe responses, inject a `<meta viewport>` matching
-            // the agent's session viewport when the page doesn't declare one.
-            // Without this, Android WebView falls back to a hardcoded 980 CSS
-            // px width regardless of the WebView's measured size, making
-            // `set_viewport` look like a no-op for `minis://` HTML pages.
             val stream = if (mimeType == "text/html" && lastAppliedViewport != null) {
                 ensureMetaViewport(localFile.readBytes(), lastAppliedViewport!!.first)
             } else {
                 localFile.inputStream()
             }
             return android.webkit.WebResourceResponse(mimeType, "UTF-8", 200, "OK",
-                mapOf("Access-Control-Allow-Origin" to "*"),
-                stream)
+                mapOf("Access-Control-Allow-Origin" to "*"), stream)
         } catch (e: Exception) {
             Log.w(TAG, "minis:// intercept error: ${e.message}")
-            return null
+            return reject(e.message ?: "invalid local path")
         }
     }
 
@@ -649,6 +626,78 @@ class BrowserUseManager(
     fun drainInterceptedDialogReport(): String? = dialogQueue.drainReport()
 
     // -- Execute Action --
+
+    /**
+     * AI-only diagnostics bridge. Scope is checked before touching the WebView.
+     * Unsupported diagnostics are explicit failures rather than fabricated data.
+     */
+    suspend fun executeDevTools(
+        request: com.openminis.app.tools.BrowserDevToolsTools.Request,
+        authorizedScope: com.openminis.app.tools.BrowserDevToolsTools.Scope,
+    ): com.openminis.app.tools.BrowserDevToolsTools.Result {
+        val normalized = request.normalized()
+        val auth = com.openminis.app.tools.BrowserDevToolsTools.authorize(normalized, authorizedScope)
+        if (auth.status != com.openminis.app.tools.BrowserDevToolsTools.Status.OK) return auth
+        val currentSession = sessionIdProvider()?.trim().orEmpty()
+        if (currentSession.isBlank() || currentSession != normalized.sessionId) {
+            return com.openminis.app.tools.BrowserDevToolsTools.Result(
+                com.openminis.app.tools.BrowserDevToolsTools.Status.DENIED,
+                "browser session is not authorized",
+                authorizedScope,
+            )
+        }
+        return try {
+            when (normalized.action) {
+                com.openminis.app.tools.BrowserDevToolsTools.Action.DOM -> {
+                    val result = execute(BrowserActionInput(BrowserAction.GET_BACKBONE, maxDepth = 8))
+                    com.openminis.app.tools.BrowserDevToolsTools.Result(
+                        if (result.success) com.openminis.app.tools.BrowserDevToolsTools.Status.OK else com.openminis.app.tools.BrowserDevToolsTools.Status.EXCEPTION,
+                        result.text,
+                        authorizedScope,
+                    )
+                }
+                com.openminis.app.tools.BrowserDevToolsTools.Action.SCREENSHOT -> {
+                    val result = execute(BrowserActionInput(BrowserAction.SCREENSHOT))
+                    com.openminis.app.tools.BrowserDevToolsTools.Result(
+                        if (result.success) com.openminis.app.tools.BrowserDevToolsTools.Status.OK else com.openminis.app.tools.BrowserDevToolsTools.Status.EXCEPTION,
+                        result.text,
+                        authorizedScope,
+                    )
+                }
+                com.openminis.app.tools.BrowserDevToolsTools.Action.SCRIPT_DEBUG -> {
+                    try {
+                        val result = kotlinx.coroutines.withTimeout(normalized.timeoutMs) {
+                            execute(BrowserActionInput(BrowserAction.EXECUTE_JS, script = normalized.script))
+                        }
+                        com.openminis.app.tools.BrowserDevToolsTools.Result(
+                            if (result.success) com.openminis.app.tools.BrowserDevToolsTools.Status.OK else com.openminis.app.tools.BrowserDevToolsTools.Status.EXCEPTION,
+                            result.text,
+                            authorizedScope,
+                        )
+                    } catch (_: kotlinx.coroutines.TimeoutCancellationException) {
+                        com.openminis.app.tools.BrowserDevToolsTools.timeoutResult(authorizedScope)
+                    } catch (_: kotlinx.coroutines.CancellationException) {
+                        com.openminis.app.tools.BrowserDevToolsTools.cancelledResult(authorizedScope)
+                    } catch (error: Throwable) {
+                        com.openminis.app.tools.BrowserDevToolsTools.exceptionResult(authorizedScope, error)
+                    }
+                }
+                com.openminis.app.tools.BrowserDevToolsTools.Action.ACCESSIBILITY,
+                com.openminis.app.tools.BrowserDevToolsTools.Action.CONSOLE,
+                com.openminis.app.tools.BrowserDevToolsTools.Action.NETWORK,
+                com.openminis.app.tools.BrowserDevToolsTools.Action.STORAGE ->
+                    com.openminis.app.tools.BrowserDevToolsTools.Result(
+                        com.openminis.app.tools.BrowserDevToolsTools.Status.UNSUPPORTED,
+                        "UNSUPPORTED: ${normalized.action.wire}",
+                        authorizedScope,
+                    )
+            }
+        } catch (_: kotlinx.coroutines.CancellationException) {
+            com.openminis.app.tools.BrowserDevToolsTools.cancelledResult(authorizedScope)
+        } catch (error: Throwable) {
+            com.openminis.app.tools.BrowserDevToolsTools.exceptionResult(authorizedScope, error)
+        }
+    }
 
     suspend fun execute(input: BrowserActionInput): BrowserActionResult {
         val prevUrl = withContext(Dispatchers.Main) { webView.url }

@@ -65,6 +65,12 @@ class ChatEditDraftState(initialDraft: ChatDraftSnapshot = ChatDraftSnapshot()) 
     /** The singleton edit buffer, or null outside edit mode. */
     fun editDraft(): ChatDraftSnapshot? = activeEdit?.draft?.frozen()
 
+    /** Replace the ordinary buffer before entering edit mode. */
+    fun setOrdinaryDraft(snapshot: ChatDraftSnapshot) {
+        check(activeEdit == null) { "cannot replace ordinary draft while editing" }
+        ordinaryDraft = snapshot.frozen()
+    }
+
     /** Update whichever buffer the composer is currently displaying. */
     fun updateCurrentDraft(text: String, attachments: List<InputAttachment>) {
         val next = ChatDraftSnapshot(text, attachments).frozen()
@@ -179,3 +185,62 @@ data class QueuedPromptWithdrawal(
     val state: QueuedPromptState,
     val reason: String? = null,
 )
+
+/**
+ * Keyed lifecycle ledger shared by QUEUE and STEER deliveries. The lock makes
+ * claim and withdrawal a single winner; a failed execution can roll back its
+ * claim without losing the prompt.
+ */
+class QueuedPromptLedger {
+    private val states = LinkedHashMap<String, QueuedPromptState>()
+
+    @Synchronized
+    fun register(promptId: String, messageId: String, delivery: QueuedPromptDelivery) {
+        require(promptId.isNotBlank()) { "promptId must not be blank" }
+        check(promptId !in states) { "prompt already registered: $promptId" }
+        states[promptId] = QueuedPromptState(messageId, delivery)
+    }
+
+    @Synchronized
+    fun state(promptId: String): QueuedPromptState? = states[promptId]
+
+    @Synchronized
+    fun claim(promptId: String): Boolean {
+        val current = states[promptId] ?: return false
+        if (current.lifecycle != QueuedPromptLifecycle.ENQUEUED) return false
+        states[promptId] = current.claim()
+        return true
+    }
+
+    @Synchronized
+    fun rollbackClaim(promptId: String): Boolean {
+        val current = states[promptId] ?: return false
+        if (current.lifecycle != QueuedPromptLifecycle.CLAIMED) return false
+        states[promptId] = current.copy(lifecycle = QueuedPromptLifecycle.ENQUEUED)
+        return true
+    }
+
+    @Synchronized
+    fun consume(promptId: String): Boolean {
+        val current = states[promptId] ?: return false
+        if (current.lifecycle != QueuedPromptLifecycle.CLAIMED) return false
+        states[promptId] = current.consume()
+        return true
+    }
+
+    @Synchronized
+    fun withdrawForEdit(promptId: String): QueuedPromptWithdrawal? {
+        val current = states[promptId] ?: return null
+        val result = current.withdrawForEdit()
+        if (result.accepted) states[promptId] = result.state
+        return result
+    }
+
+    @Synchronized
+    fun restoreEdited(promptId: String): Boolean {
+        val current = states[promptId] ?: return false
+        if (current.lifecycle != QueuedPromptLifecycle.WITHDRAWN_EDIT) return false
+        states[promptId] = current.copy(lifecycle = QueuedPromptLifecycle.ENQUEUED)
+        return true
+    }
+}

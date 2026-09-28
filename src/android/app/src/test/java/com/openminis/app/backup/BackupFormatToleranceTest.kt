@@ -155,4 +155,21 @@ class BackupFormatToleranceTest {
         assertEquals(BackupCategory.VOICE_CORRECTIONS, BackupCategory.fromKey("voice_corrections"))
         assertNull(BackupCategory.fromKey("something_from_the_future"))
     }
+    @Test
+    fun `provider config parser tracks presence separately from nullable value`() {
+        val legacy = BackupImporter.parseProviderConfigLeniently("""{"instances":[]}""")
+        val fields = setOf(
+            "titlePrompt", "compactionPrompt", "titleModelEntryId", "compactionModelEntryId",
+        )
+        assertTrue(fields.none { it in legacy.presentTopLevelFields })
+
+        val explicitNull = BackupImporter.parseProviderConfigLeniently(
+            """{"instances":[],"titlePrompt":null,"compactionPrompt":null,"titleModelEntryId":null,"compactionModelEntryId":null}"""
+        )
+        assertTrue(fields.all { it in explicitNull.presentTopLevelFields })
+        assertNull(explicitNull.config.titlePrompt)
+        assertNull(explicitNull.config.compactionPrompt)
+        assertNull(explicitNull.config.titleModelEntryId)
+        assertNull(explicitNull.config.compactionModelEntryId)
+    }
 }

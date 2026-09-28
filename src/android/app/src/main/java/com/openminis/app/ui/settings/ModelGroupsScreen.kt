@@ -39,6 +39,7 @@ import androidx.compose.material.icons.filled.MovieCreation
 import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExposedDropdownMenuBox
@@ -74,6 +75,8 @@ import com.openminis.app.data.repository.ProviderRepository
 import com.openminis.app.R
 import com.openminis.app.ui.components.MinisOutlinedButton
 import com.openminis.app.ui.components.MinisTextButton
+import com.openminis.app.ui.chat.COMPACTION_DEFAULT_SYSTEM_PROMPT
+import com.openminis.app.ui.chat.TITLE_GEN_SYSTEM_PROMPT
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Delete
 import com.openminis.app.ui.components.SwipeRowAction
@@ -297,15 +300,50 @@ fun ModelGroupsScreen(
                 }
                 item("defaults_section_card") {
                     SectionCard {
+                        ModelEntryDropdown(
+                            label = stringResource(R.string.model_groups_primary_agent_model),
+                            entries = providerRepository.availableRoleEntries(),
+                            selectedId = config.primaryModelEntryId,
+                            onSelect = { providerRepository.primaryModelEntryId = it },
+                        )
+                        SectionDivider()
+                        ModelEntryDropdown(
+                            label = stringResource(R.string.model_groups_title_generation_model),
+                            entries = providerRepository.availableRoleEntries(),
+                            selectedId = config.titleModelEntryId,
+                            onSelect = { providerRepository.titleModelEntryId = it },
+                        )
+                        SectionDivider()
+                        ModelEntryDropdown(
+                            label = stringResource(R.string.model_groups_compaction_model),
+                            entries = providerRepository.availableRoleEntries(),
+                            selectedId = config.compactionModelEntryId,
+                            onSelect = { providerRepository.compactionModelEntryId = it },
+                        )
+                        SectionDivider()
+                        PromptEditor(
+                            label = stringResource(R.string.model_groups_title_prompt),
+                            value = config.titlePrompt ?: TITLE_GEN_SYSTEM_PROMPT,
+                            onValueChange = { providerRepository.titlePrompt = it },
+                            onReset = { providerRepository.resetTitlePrompt() },
+                        )
+                        SectionDivider()
+                        PromptEditor(
+                            label = stringResource(R.string.model_groups_compaction_prompt),
+                            value = config.compactionPrompt ?: COMPACTION_DEFAULT_SYSTEM_PROMPT,
+                            onValueChange = { providerRepository.compactionPrompt = it },
+                            onReset = { providerRepository.resetCompactionPrompt() },
+                        )
+                        SectionDivider()
                         GroupDropdown(
-                            label = "Default Primary",
+                            label = stringResource(R.string.model_groups_legacy_primary_group),
                             groups = groups,
                             selectedId = config.defaultPrimaryGroupId,
                             onSelect = { providerRepository.defaultPrimaryGroupId = it },
                         )
                         SectionDivider()
                         GroupDropdown(
-                            label = "Default Sub",
+                            label = stringResource(R.string.model_groups_default_sub),
                             groups = groups,
                             selectedId = config.defaultSubGroupId,
                             onSelect = { providerRepository.defaultSubGroupId = it },
@@ -479,6 +517,38 @@ private fun BadgeLabel(text: String, color: androidx.compose.ui.graphics.Color) 
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
+private fun ModelEntryDropdown(
+    label: String,
+    entries: List<com.openminis.app.data.model.ModelEntry>,
+    selectedId: String?,
+    onSelect: (String?) -> Unit,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    val selected = entries.firstOrNull { it.id == selectedId }
+    val selectedName = selected?.let { "${it.model.displayName} (${it.model.id})" } ?: "Use current default"
+    ExposedDropdownMenuBox(expanded = expanded, onExpandedChange = { expanded = it }, modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)) {
+        OutlinedTextField(
+            value = selectedName,
+            onValueChange = {},
+            readOnly = true,
+            label = { Text(label) },
+            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded) },
+            modifier = Modifier.menuAnchor(MenuAnchorType.PrimaryNotEditable).fillMaxWidth(),
+        )
+        ExposedDropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            DropdownMenuItem(text = { Text(stringResource(R.string.model_groups_use_current_default)) }, onClick = { onSelect(null); expanded = false })
+            entries.forEach { entry ->
+                DropdownMenuItem(
+                    text = { Text("${entry.model.displayName} (${entry.model.id})") },
+                    onClick = { onSelect(entry.id); expanded = false },
+                )
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
 private fun GroupDropdown(
     label: String,
     groups: List<ModelGroup>,
@@ -615,6 +685,8 @@ private fun LazyListScope.agentLoopModelsSectionItems(
                             title = group.name,
                             subtitle = subtitle,
                             badge = stringResource(R.string.agent_loop_section_group_badge),
+                            note = config.subAgentModelNotes[group.id].orEmpty(),
+                            onNoteChange = { providerRepository.setSubAgentModelNote(group.id, it) },
                             onRemove = { providerRepository.removeAgentLoopGroup(group.id) },
                             dragHandleModifier = Modifier.then(
                                 with(this@ReorderableItem) {
@@ -648,6 +720,8 @@ private fun LazyListScope.agentLoopModelsSectionItems(
                             title = entry.model.displayName,
                             subtitle = instanceLabel,
                             badge = null,
+                            note = config.subAgentModelNotes[entry.id].orEmpty(),
+                            onNoteChange = { providerRepository.setSubAgentModelNote(entry.id, it) },
                             onRemove = { providerRepository.removeAgentLoopEntry(entry.id) },
                             dragHandleModifier = Modifier.then(
                                 with(this@ReorderableItem) {
@@ -717,6 +791,8 @@ private fun AgentLoopRow(
     title: String,
     subtitle: String?,
     badge: String?,
+    note: String = "",
+    onNoteChange: (String) -> Unit = {},
     onRemove: () -> Unit,
     dragHandleModifier: Modifier = Modifier,
 ) {
@@ -762,6 +838,13 @@ private fun AgentLoopRow(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
+            OutlinedTextField(
+                value = note,
+                onValueChange = onNoteChange,
+                label = { Text(stringResource(R.string.model_groups_model_note_child_agents)) },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+            )
         }
         IconButton(
             onClick = onRemove,
@@ -1033,5 +1116,33 @@ private fun GroupRow(
             contentDescription = null,
             tint = MaterialTheme.colorScheme.onSurfaceVariant,
         )
+    }
+}
+
+@Composable
+private fun PromptEditor(
+    label: String,
+    value: String,
+    onValueChange: (String) -> Unit,
+    onReset: () -> Unit,
+) {
+    var draft by remember(value) { mutableStateOf(value) }
+    Column(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
+        OutlinedTextField(
+            value = draft,
+            onValueChange = { draft = it },
+            label = { Text(label) },
+            modifier = Modifier.fillMaxWidth(),
+            minLines = 3,
+            maxLines = 8,
+        )
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+            MinisTextButton(onClick = { draft = ""; onReset() }) {
+                Text(stringResource(R.string.model_groups_prompt_reset))
+            }
+            MinisOutlinedButton(onClick = { onValueChange(draft) }) {
+                Text(stringResource(R.string.model_groups_prompt_save))
+            }
+        }
     }
 }

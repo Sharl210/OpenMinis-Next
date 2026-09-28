@@ -294,6 +294,7 @@ internal fun UserMessageBubble(
     // capability).
     onDeleteFromHere: (() -> Unit)? = null,
     onWithdraw: (() -> Unit)? = null,
+    onDiscardQueued: (() -> Unit)? = null,
     onPreviewFile: (Uri, String) -> Unit = { _, _ -> },
 ) {
     var showMenu by remember { mutableStateOf(false) }
@@ -368,9 +369,23 @@ internal fun UserMessageBubble(
                     // Queued: transparent bg + dashed border + dimmed text +
                     // a red withdraw button alongside. Mirrors iOS
                     // AIChatView.swift queued-bubble overlay.
-                    val secondaryTextColor = ChatColors.secondaryText
-                    val userBubbleColor = ChatColors.userBubble
-                    Row(
+                        val secondaryTextColor = ChatColors.secondaryText
+                        val userBubbleColor = ChatColors.userBubble
+                        if (isQueued) {
+                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Start) {
+                                Text(
+                                    text = when (message.queuedDelivery) {
+                                        QueuedPromptDelivery.STEER -> stringResource(R.string.chat_queue_steer_badge)
+                                        QueuedPromptDelivery.QUEUE -> stringResource(R.string.chat_queue_queue_badge)
+                                        null -> "QUEUE"
+                                    },
+                                    color = secondaryTextColor,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    modifier = Modifier.padding(start = 10.dp, bottom = 2.dp),
+                                )
+                            }
+                        }
+                        Row(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(6.dp),
                     ) {
@@ -448,7 +463,7 @@ internal fun UserMessageBubble(
                             ) {
                                 Icon(
                                     imageVector = Icons.Filled.Cancel,
-                                    contentDescription = "Withdraw queued message",
+                                    contentDescription = stringResource(R.string.chat_queued_withdraw),
                                     tint = Color(0xFFFF3B30),
                                     modifier = Modifier.size(24.dp),
                                 )
@@ -500,8 +515,21 @@ internal fun UserMessageBubble(
                         leadingIcon = { Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(18.dp)) },
                     )
                 }
-                // T187: Edit replaces the original turn with edited text. Same
-                // gating as retry — caller passes null while streaming.
+                if (onWithdraw != null) {
+                    DropdownMenuItem(
+                        text = { Text(stringResource(R.string.chat_queued_withdraw_and_edit)) },
+                        onClick = { showMenu = false; onWithdraw() },
+                        leadingIcon = { Icon(Icons.Default.Edit, contentDescription = null, modifier = Modifier.size(18.dp)) },
+                    )
+                }
+                if (onDiscardQueued != null) {
+                    DropdownMenuItem(
+                        text = { Text(stringResource(R.string.chat_queued_withdraw)) },
+                        onClick = { showMenu = false; onDiscardQueued() },
+                        leadingIcon = { Icon(Icons.Default.Cancel, contentDescription = null, modifier = Modifier.size(18.dp)) },
+                    )
+                }
+                // T187: Edit replaces the original user row in place.
                 if (onEdit != null) {
                     DropdownMenuItem(
                         text = { Text(stringResource(R.string.chat_longpress_edit)) },

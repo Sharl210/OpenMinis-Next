@@ -13,6 +13,7 @@ import com.openminis.app.data.model.ProviderType
 import com.openminis.app.data.model.RoutingStrategy
 import com.openminis.app.data.model.ThinkingLevel
 import kotlinx.serialization.builtins.ListSerializer
+import kotlinx.serialization.builtins.MapSerializer
 import kotlinx.serialization.builtins.serializer
 import kotlinx.serialization.json.Json
 
@@ -38,7 +39,11 @@ data class ProviderConfigSnapshot(
 
 object ProviderConfigMetaKeys {
     const val DEFAULT_PRIMARY_GROUP_ID = "default_primary_group_id"
+    const val PRIMARY_MODEL_ENTRY_ID = "primary_model_entry_id"
     const val DEFAULT_SUB_GROUP_ID = "default_sub_group_id"
+    const val SUB_AGENT_MODEL_NOTES = "sub_agent_model_notes"
+    const val TITLE_MODEL_ENTRY_ID = "title_model_entry_id"
+    const val COMPACTION_MODEL_ENTRY_ID = "compaction_model_entry_id"
     // [T-android-provider-voice] Voice Input / Voice Output group bindings
     // (mirrors iOS provider_local_kv voiceInputGroupId / voiceOutputGroupId).
     // Meta KV rows are additive — no Room schema migration needed.
@@ -172,6 +177,21 @@ fun ProviderConfig.toSnapshot(
     defaultSubGroupId?.let {
         metaRows.add(ProviderConfigMetaEntity(ProviderConfigMetaKeys.DEFAULT_SUB_GROUP_ID, it))
     }
+    primaryModelEntryId?.let {
+        metaRows.add(ProviderConfigMetaEntity(ProviderConfigMetaKeys.PRIMARY_MODEL_ENTRY_ID, it))
+    }
+    if (subAgentModelNotes.isNotEmpty()) {
+        metaRows.add(ProviderConfigMetaEntity(
+            ProviderConfigMetaKeys.SUB_AGENT_MODEL_NOTES,
+            jsonForBlobs.encodeToString(MapSerializer(String.serializer(), String.serializer()), subAgentModelNotes),
+        ))
+    }
+    titleModelEntryId?.let {
+        metaRows.add(ProviderConfigMetaEntity(ProviderConfigMetaKeys.TITLE_MODEL_ENTRY_ID, it))
+    }
+    compactionModelEntryId?.let {
+        metaRows.add(ProviderConfigMetaEntity(ProviderConfigMetaKeys.COMPACTION_MODEL_ENTRY_ID, it))
+    }
     voiceInputGroupId?.let {
         metaRows.add(ProviderConfigMetaEntity(ProviderConfigMetaKeys.VOICE_INPUT_GROUP_ID, it))
     }
@@ -271,7 +291,14 @@ fun ProviderConfigSnapshot.toProviderConfig(jsonForBlobs: Json): ProviderConfig 
         modelEntries = entries,
         modelGroups = groups,
         defaultPrimaryGroupId = metaMap[ProviderConfigMetaKeys.DEFAULT_PRIMARY_GROUP_ID],
+        primaryModelEntryId = metaMap[ProviderConfigMetaKeys.PRIMARY_MODEL_ENTRY_ID],
         defaultSubGroupId = metaMap[ProviderConfigMetaKeys.DEFAULT_SUB_GROUP_ID],
+        titleModelEntryId = metaMap[ProviderConfigMetaKeys.TITLE_MODEL_ENTRY_ID],
+        subAgentModelNotes = metaMap[ProviderConfigMetaKeys.SUB_AGENT_MODEL_NOTES]
+            ?.let { raw -> runCatching { jsonForBlobs.decodeFromString<Map<String, String>>(raw) }.getOrDefault(emptyMap()) }
+            ?.toMutableMap() ?: mutableMapOf(),
+
+        compactionModelEntryId = metaMap[ProviderConfigMetaKeys.COMPACTION_MODEL_ENTRY_ID],
         voiceInputGroupId = metaMap[ProviderConfigMetaKeys.VOICE_INPUT_GROUP_ID],
         voiceOutputGroupId = metaMap[ProviderConfigMetaKeys.VOICE_OUTPUT_GROUP_ID],
         visionGroupId = metaMap[ProviderConfigMetaKeys.VISION_GROUP_ID],

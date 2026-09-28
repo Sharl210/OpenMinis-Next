@@ -15,6 +15,12 @@ class RuntimeSessionCoordinator private constructor(
     private val activeRuntimeIds = LinkedHashMap<String, String>()
     private var generation = 0L
 
+    fun communicationGateway(repository: RuntimeCommunicationRepository): RuntimeCommunicationGateway =
+        RuntimeCommunicationGateway(
+            repository = repository,
+            authorizedSend = { actor, target, payload, delivery -> send(actor, target, payload, delivery) },
+        )
+
     @Synchronized
     fun startRoot(
         sessionId: String,
@@ -81,9 +87,13 @@ class RuntimeSessionCoordinator private constructor(
     }
 
     @Synchronized
-    fun finishChild(childSessionId: String, failed: Boolean = false) {
+    fun finishChild(
+        childSessionId: String,
+        failed: Boolean = false,
+        report: RuntimeStopReport? = null,
+    ) {
         val runtimeId = activeRuntimeIds.remove(childSessionId) ?: childSessionId
-        store.update { complete(runtimeId, failed = failed) }
+        store.update { complete(runtimeId, failed = failed, report = report) }
     }
 
     @Synchronized
@@ -147,8 +157,92 @@ class RuntimeSessionCoordinator private constructor(
         delivery: RuntimeDelivery,
     ): RuntimeDeliveryReceipt = send(fromSessionId, toSessionId, payload, delivery)
 
+    /** Delete a completed descendant subtree while preserving initiator/executor provenance. */
     @Synchronized
-    fun reconcile(): List<String> = store.reconcile()
+    fun deleteSubtree(
+        initiatorSessionId: String,
+        executorSessionId: String,
+        targetSessionId: String,
+        rootId: String? = null,
+        operationId: String? = null,
+        idempotencyKey: String? = null,
+    ): DeleteSubtreeReceipt {
+        val initiator = activeRuntimeIds[initiatorSessionId] ?: initiatorSessionId
+        val executor = activeRuntimeIds[executorSessionId] ?: executorSessionId
+        val target = activeRuntimeIds[targetSessionId] ?: targetSessionId
+        val operation = operationId ?: java.util.UUID.randomUUID().toString()
+        val key = idempotencyKey ?: operation
+        var receipt: DeleteSubtreeReceipt? = null
+        val persisted = store.update {
+            receipt = deleteSubtree(
+                DeleteSubtreeRequest(
+                    initiatorNodeId = initiator,
+                    executorNodeId = executor,
+                    targetNodeId = target,
+                    rootId = rootId,
+                    operationId = operation,
+                    idempotencyKey = key,
+                ),
+            )
+        }
+        return receipt ?: DeleteSubtreeReceipt(
+            operationId = operation,
+            idempotencyKey = key,
+            result = DeleteSubtreeResult.REJECTED,
+            initiatorNodeId = initiator,
+            executorNodeId = executor,
+            targetNodeId = target,
+            rootId = rootId,
+            oldParentId = null,
+            affectedNodeIds = emptyList(),
+            reason = if (persisted) "runtime delete produced no receipt" else "runtime tree persistence failed",
+            createdAtMillis = System.currentTimeMillis(),
+        )
+    }
+    @Synchronized
+    fun stopDescendant(
+        actorSessionId: String,
+        targetSessionId: String,
+        rootId: String? = null,
+        reason: String = "",
+        operationId: String? = null,
+        idempotencyKey: String? = null,
+    ): RuntimeStopReceipt {
+        val actor = activeRuntimeIds[actorSessionId] ?: actorSessionId
+        val target = activeRuntimeIds[targetSessionId] ?: targetSessionId
+        val operation = operationId ?: java.util.UUID.randomUUID().toString()
+        val key = idempotencyKey ?: operation
+        var receipt: RuntimeStopReceipt? = null
+        val persisted = store.update {
+            receipt = stopDescendant(
+                RuntimeStopRequest(
+                    actorNodeId = actor,
+                    targetNodeId = target,
+                    rootId = rootId,
+                    reason = reason,
+                    operationId = operation,
+                    idempotencyKey = key,
+                ),
+            )
+        }
+        return receipt ?: RuntimeStopReceipt(
+            operationId = operationId.orEmpty(),
+            idempotencyKey = idempotencyKey ?: operationId.orEmpty(),
+            type = RuntimeControlOperationType.STOP_DESCENDANT,
+            actorNodeId = actor,
+            targetNodeId = target,
+            rootId = rootId,
+            accepted = false,
+            stateBefore = null,
+            stateAfter = null,
+            affectedNodeIds = emptyList(),
+            actorCapabilitySnapshot = null,
+            targetCapabilitySnapshot = null,
+            createdAtMillis = System.currentTimeMillis(),
+            reason = if (persisted) "runtime stop produced no receipt" else "runtime tree persistence failed",
+        )
+    }
+
 
     @Synchronized
     fun export(format: String, zip: Boolean = false): RuntimeExport =
@@ -160,7 +254,7 @@ class RuntimeSessionCoordinator private constructor(
 
         fun open(context: Context, config: RuntimeTreeConfig = RuntimeTreeConfig()): RuntimeSessionCoordinator =
             RuntimeSessionCoordinator(RuntimeTreeStore.open(context, config)).also { coordinator ->
-                val stale = coordinator.reconcile()
+                val stale = coordinator.store.reconcile()
                 if (stale.isNotEmpty()) Log.w(TAG, "Recovered ${stale.size} stale runtime node(s): ${stale.joinToString()}")
             }
     }

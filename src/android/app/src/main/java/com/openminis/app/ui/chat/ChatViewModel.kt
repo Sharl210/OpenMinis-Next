@@ -28,6 +28,9 @@ import com.openminis.app.logging.AppLogger
 import com.openminis.app.data.FileMentionIndex
 import com.openminis.app.data.db.CompactMarkerEntity
 import com.openminis.app.data.model.AgentContentPart
+import com.openminis.app.data.model.ActualModelRequestSnapshot
+import com.openminis.app.data.model.ModelRole
+import com.openminis.app.data.model.ModelRoleRequestSnapshot
 import com.openminis.app.data.model.AgentToolDefinition
 import com.openminis.app.data.model.LLMError
 import com.openminis.app.data.model.LLMMessage
@@ -37,6 +40,7 @@ import com.openminis.app.data.model.LLMUsage
 import com.openminis.app.data.model.MessagePartsCodec
 import com.openminis.app.data.model.MessageProvenance
 import com.openminis.app.data.model.ModelGroup
+import com.openminis.app.data.model.ModelRoleSelectionResolver
 import com.openminis.app.data.model.RoutingStrategy
 import com.openminis.app.data.model.hasImageInput
 import com.openminis.app.data.model.ThinkingLevel
@@ -56,17 +60,27 @@ import com.openminis.app.sandbox.ExecutionCoordinator
 import com.openminis.app.terminal.MinisOpenUrlBroker
 import com.openminis.app.terminal.MinisUrlMarker
 import com.openminis.app.tools.AgentTools
+import com.openminis.app.tools.BrowserDevToolsTools
 import com.openminis.app.tools.FileEditTool
 import com.openminis.app.tools.FileReadTool
 import com.openminis.app.tools.FileWriteTool
 import com.openminis.app.tools.MemoryTools
 import com.openminis.app.tools.ReadImageTool
 import com.openminis.app.tools.ToolExecutionResult
+import com.openminis.app.web.DuckDuckGoHtmlAdapter
+import com.openminis.app.web.PublicSearchService
+import com.openminis.app.web.PublicWebFetcher
+import com.openminis.app.web.SearchOptions
+import com.openminis.app.web.SearchResult
+import com.openminis.app.web.WebFetchOptions
+import com.openminis.app.web.WebFetchResult
 import com.openminis.app.offload.OffloadPermissionManager
 import com.openminis.app.feature.runtime.AgentRetryPolicy
 import com.openminis.app.feature.runtime.AgentRuntimeConfig
 import com.openminis.app.feature.runtime.RuntimeFailure
+import com.openminis.app.feature.runtime.DeleteSubtreeResult
 import com.openminis.app.feature.runtime.RuntimeChildRunner
+import com.openminis.app.feature.runtime.RuntimeSessionCoordinator
 import com.openminis.app.feature.runtime.RuntimeDelegationParser
 import com.openminis.app.feature.runtime.RuntimeModelSnapshot
 import com.openminis.app.feature.runtime.RoundInjectionCoordinator
@@ -93,6 +107,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.yield
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 
@@ -108,6 +123,9 @@ class ChatViewModel(
     val skillRepository: com.openminis.app.data.repository.SkillRepository? = null,
     val mcpRepository: com.openminis.app.data.repository.MCPRepository? = null,
 ) : ViewModel() {
+    private val runtimeCoordinator: RuntimeSessionCoordinator by lazy {
+        RuntimeSessionCoordinator.open(context.applicationContext)
+    }
 
     companion object {
         internal const val TAG = "ChatViewModel"
@@ -756,6 +774,27 @@ class ChatViewModel(
 
     fun setInputText(value: String) {
         _inputText.value = value
+        editDraftState.updateCurrentDraft(value, _attachments.value)
+    }
+
+    /** Clear only the rendered field before a send; active edit state remains intact. */
+    fun clearInputTextForSend() {
+        _inputText.value = ""
+        if (!editDraftState.isEditing) {
+            editDraftState.updateCurrentDraft("", _attachments.value)
+        }
+    }
+
+    /** Update the composer attachment buffer and the active singleton draft together. */
+    internal fun setComposerAttachments(value: List<InputAttachment>) {
+        val frozen = value.toList()
+        _attachments.value = frozen
+        editDraftState.updateCurrentDraft(_inputText.value, frozen)
+    }
+
+    private fun applyDraftSnapshot(snapshot: ChatDraftSnapshot) {
+        _inputText.value = snapshot.text
+        _attachments.value = snapshot.attachments.toList()
     }
 
     /**
@@ -863,13 +902,22 @@ class ChatViewModel(
     }
 
     /**
-     * T187: id of a user message currently being re-edited via the
-     * long-press → Edit context menu. While non-null, the composer
-     * shows an "Exit Edit Mode" pill, and the next sendMessage()
-     * call truncates the conversation from this message (inclusive)
-     * before persisting the new content as a fresh user turn.
-     * Mirrors iOS AIChatViewModel.editingMessageIndex.
+     * Composer state is kept as two independent snapshots: ordinary input and
+     * the singleton edit buffer. The send button commits the latter in place.
      */
+    private val editDraftState = ChatEditDraftState()
+    private val editAuditLog by lazy { ChatEditAuditLog(context) }
+    private val queuedPromptLedger = QueuedPromptLedger()
+    private val queuedPromptLock = Any()
+
+    private data class WithdrawnQueuedPrompt(
+        val prompt: QueuedPrompt,
+        val message: ChatMessage,
+        val index: Int,
+    )
+
+    private val withdrawnQueuedPrompts = mutableMapOf<String, WithdrawnQueuedPrompt>()
+
     private val _editingMessageId = MutableStateFlow<String?>(null)
     val editingMessageId: StateFlow<String?> = _editingMessageId.asStateFlow()
 
@@ -1214,7 +1262,12 @@ class ChatViewModel(
             val childResult = result.getOrNull()
             val output = childResult?.output ?: "Delegated child failed: ${result.exceptionOrNull()?.message ?: "unknown error"}"
             val snapshot = childResult?.modelSnapshot
-            val assistantParts = "[{\"type\":\"text\",\"value\":${escapeJson(output)}}]"
+            var assistantParts = "[{\"type\":\"text\",\"value\":${escapeJson(output)}}]"
+            childResult?.modelSnapshot?.let { snapshot ->
+                actualRequestMetadata(ModelRole.CHILD, snapshot.providerInstanceId)?.let { meta ->
+                    assistantParts = prependRequestMetadata(assistantParts, meta)
+                }
+            }
             val persisted = withContext(Dispatchers.IO) {
                 chatRepository.appendMessage(
                     parentSession,
@@ -1287,6 +1340,30 @@ class ChatViewModel(
      * Both fields here are updated by that same fallback path, so they always
      * describe the model that actually responded.
      */
+    private fun prependRequestMetadata(partsJson: String, metadataPart: String): String {
+        val out = JSONArray().put(JSONObject(metadataPart))
+        runCatching { JSONArray(partsJson) }.getOrNull()?.let { parts ->
+            for (index in 0 until parts.length()) parts.opt(index)?.let(out::put)
+        }
+        return out.toString()
+    }
+
+    /** Captures immutable role selection and actual provider entry for persisted request metadata. */
+    private fun actualRequestMetadata(role: ModelRole, explicitEntryId: String? = null): String? {
+        val config = providerRepository.config.value
+        val selection = ModelRoleRequestSnapshot.from(config)
+        val entryId = explicitEntryId ?: when (role) {
+            ModelRole.PRIMARY, ModelRole.CHILD -> _activeEntryId.value ?: selection.primaryEntryId
+            ModelRole.TITLE -> selection.titleEntryId
+            ModelRole.COMPACTION -> selection.compactionEntryId ?: selection.primaryEntryId
+        } ?: return null
+        val entry = config.modelEntries.firstOrNull { it.id == entryId } ?: return null
+        val instance = providerRepository.instance(entry.providerInstanceId) ?: return null
+        return ModelRoleRequestSnapshot.withMetadata(
+            "[]", ActualModelRequestSnapshot.capture(role, entry, instance.providerType.name), selection,
+        ).removePrefix("[").removeSuffix("]")
+    }
+
     private fun currentModelSnapshot(): com.openminis.app.data.model.ModelAttributionSnapshot? {
         val model = currentModel ?: return null
         val entry = _activeEntryId.value?.let { id ->
@@ -2326,6 +2403,12 @@ class ChatViewModel(
             // the queued-prompt drain below; failure/cancel/empty-summary paths
             // keep today's behavior (queued bubbles stay pending + cancellable).
             var compactSucceeded = false
+            // Each compaction run owns a fresh attribution snapshot; never leak the
+            // previous run when the explicit role entry is absent or provider creation falls back.
+            compactionRequestEntry = null
+            compactionRequestModel = null
+            compactionRequestProviderTypeRaw = null
+            compactionRequestProviderInstanceId = null
             // Distinguishes "we gave up on time" from other failures so the
             // user-facing message can say so and invite a retry.
             var timedOut = false
@@ -2419,7 +2502,14 @@ class ChatViewModel(
                     boundaryMessageId = null,
                     firstKeptMessageId = null,
                     lastCompactedMessageId = lastCompactedDbId,
-                    version = 2,
+                    modelRole = "COMPACTION",
+                    modelEntryId = compactionRequestEntry?.id,
+                    modelId = compactionRequestModel?.id,
+                    modelDisplayName = compactionRequestModel?.displayName,
+                    providerType = compactionRequestProviderTypeRaw,
+                    providerInstanceId = compactionRequestProviderInstanceId,
+                    effectiveCompactionEntryId = compactionRequestEntry?.id,
+                    modelGeneratedAt = System.currentTimeMillis(),
                 )
                 runCatching { chatRepository.dao.insertCompactMarker(marker) }
                     .onFailure {
@@ -3350,17 +3440,25 @@ class ChatViewModel(
                     "was done\", NOT as an ongoing goal or todo list."
             )
         }
-        val model = currentModel
+        val roleEntry = ModelRoleSelectionResolver.explicitCompactionEntry(providerRepository.config.value)
+        compactionRequestEntry = roleEntry
+        val roleProvider = roleEntry?.let(::createRoleProvider)
+        val provider = roleProvider ?: currentProvider
+            ?: throw IllegalStateException("No LLM provider available for compaction")
+        val model = roleProvider?.model ?: currentModel
+        compactionRequestModel = model
+        compactionRequestProviderTypeRaw = roleEntry?.let { providerRepository.instance(it.providerInstanceId)?.providerType?.name }
+            ?: (compactionRequestModel?.provider ?: provider.name)
+        compactionRequestProviderInstanceId = roleEntry?.providerInstanceId
         val contextWindow = model?.contextWindow ?: 128_000
         val estimatedInput = userMessage.length / 4
         val maxOut = maxOf(1024, minOf(8192, contextWindow - estimatedInput))
-        val provider = currentProvider
-            ?: throw IllegalStateException("No LLM provider available for compaction")
         val response = provider.sendMessage(
             messages = listOf(
                 LLMMessage(role = LLMMessage.Role.USER, content = userMessage)
             ),
-            systemPrompt = compactSummarySystemPrompt,
+            systemPrompt = providerRepository.compactionPrompt
+                ?.takeIf { it.isNotBlank() } ?: compactSummarySystemPrompt,
             maxTokens = maxOut,
             // Mirror iOS AIChatViewModel.swift:12926 — null lets the
             // provider/model use its default. gpt-5.x family rejects any
@@ -5850,93 +5948,186 @@ class ChatViewModel(
     }
 
     /**
-     * T187: enter edit mode for [messageId]. Returns the cleaned text the
-     * caller should drop into the composer (with any
-     * `<user-attached-files>` XML stripped), or null when the message
-     * cannot be edited (streaming in progress, message missing, or not
-     * a user turn). Setting `_editingMessageId` is what flips the
-     * composer into edit-mode UI; the next sendMessage call sees the
-     * non-null id and truncates the conversation from that point.
-     * Mirrors iOS AIChatViewModel.editMessage(_:) (L2468).
+     * Enter ordinary or queued-message edit mode. Queued messages must first
+     * win the ledger withdrawal; claimed/consumed prompts remain untouched.
      */
     fun editMessage(messageId: String): String? {
-        if (_isStreaming.value) return null
+        if (_isStreaming.value && !_messages.value.any { it.id == messageId && it.isQueued }) return null
         val msg = _messages.value.firstOrNull { it.id == messageId } ?: return null
         if (msg.role != "user") return null
-        var text = msg.content
-        val startIdx = text.indexOf("<user-attached-files>")
-        if (startIdx >= 0) {
-            val endTag = "</user-attached-files>"
-            val endIdx = text.indexOf(endTag, startIdx)
-            text = if (endIdx >= 0) {
-                (text.substring(0, startIdx) + text.substring(endIdx + endTag.length)).trim()
-            } else {
-                text.substring(0, startIdx).trim()
+        val promptId = msg.queuedPromptId
+        if (msg.isQueued && promptId != null) {
+            val queuedPrompt = synchronized(queuedPromptLock) {
+                _promptQueue.value.firstOrNull { it.id == promptId }
+            } ?: return null
+            val queuedIndex = _messages.value.indexOfFirst { it.id == messageId }
+            if (queuedIndex < 0) return null
+            val withdrawal = synchronized(queuedPromptLock) {
+                queuedPromptLedger.withdrawForEdit(promptId)
+            } ?: return null
+            if (!withdrawal.accepted) {
+                editAuditLog.record(
+                    event = "WITHDRAW_FOR_EDIT_REJECTED",
+                    sessionId = activeSessionId,
+                    messageId = messageId,
+                    promptId = promptId,
+                    delivery = withdrawal.state.delivery,
+                    accepted = false,
+                    reason = withdrawal.reason,
+                )
+                return null
             }
+            synchronized(queuedPromptLock) {
+                withdrawnQueuedPrompts[messageId] = WithdrawnQueuedPrompt(queuedPrompt, msg, queuedIndex)
+                _promptQueue.value = _promptQueue.value.filterNot { it.id == promptId }
+            }
+            _messages.value = _messages.value.filterNot { it.id == messageId }
+            editAuditLog.record(
+                event = "WITHDRAW_FOR_EDIT",
+                sessionId = activeSessionId,
+                messageId = messageId,
+                promptId = promptId,
+                delivery = withdrawal.state.delivery,
+            )
         }
-        // [T-android-edit-loses-attachments] Restore the message's attachments
-        // into the composer alongside its text.
-        //
-        // Without this, editing a message that carried an image silently
-        // dropped it: the composer showed only the text, and re-sending
-        // produced a turn the model could no longer see the picture in. The
-        // XML strip above is what makes the loss invisible — the
-        // `<user-attached-files>` block naming the files is removed from the
-        // text, so nothing on screen hints that anything was attached.
-        //
-        // iOS has done this since AIChatViewModel.editMessage (L3891-3920);
-        // this side only ever returned the text. Android needs no copy step,
-        // unlike iOS: `imageUris`/`attachmentUris` on a restored message
-        // already point at files inside the app's own media store (see the
-        // `mediaRef` branch of loadSessionMessages, which resolves them
-        // against mediaStore.mediaBaseDir and skips any that no longer
-        // exist), and that is exactly what the send path re-reads.
-        //
-        // Ordering matches ChatMessage's own convention — images first, then
-        // files — so the composer's preview row shows them the same way the
-        // sent bubble did. Names come from `attachmentNames`, which is built
-        // image-first to align with these two lists; it is indexed
-        // defensively anyway, since a row persisted by an older build could
-        // be short.
-        val restored = mutableListOf<InputAttachment>()
+        val target = ChatDraftSnapshot(
+            text = stripAttachedFilesXml(msg.content),
+            attachments = restoredInputAttachments(msg),
+        )
+        val draft = if (editDraftState.isEditing) {
+            editDraftState.switchEditingTarget(messageId, target)
+        } else {
+            editDraftState.beginEditing(messageId, target)
+        }
+        _editingMessageId.value = messageId
+        applyDraftSnapshot(draft)
+        AppLogger.info(TAG_STREAM, "✏️ editMessage id=${messageId.take(8)} text=${draft.text.length}ch attachments=${draft.attachments.size}")
+        return draft.text
+    }
+
+    private fun restoredInputAttachments(msg: ChatMessage): List<InputAttachment> = buildList {
         msg.imageUris.forEachIndexed { i, uri ->
             val name = msg.attachmentNames.getOrNull(i) ?: uri.lastPathSegment ?: "image"
-            restored.add(
-                InputAttachment(
-                    fileName = name,
-                    uri = uri,
-                    mimeType = guessMimeType(name, fallback = "image/*"),
-                    kind = InputAttachment.Kind.IMAGE,
-                ),
-            )
+            add(InputAttachment(fileName = name, uri = uri, mimeType = guessMimeType(name, "image/*"), kind = InputAttachment.Kind.IMAGE))
         }
         msg.attachmentUris.forEachIndexed { i, uri ->
-            // The non-image names occupy the suffix of attachmentNames, after
-            // the imageUris-many image entries.
-            val name = msg.attachmentNames.getOrNull(msg.imageUris.size + i)
-                ?: uri.lastPathSegment ?: "file"
-            restored.add(
-                InputAttachment(
-                    fileName = name,
-                    uri = uri,
-                    mimeType = guessMimeType(name, fallback = "application/octet-stream"),
-                    kind = InputAttachment.Kind.DOCUMENT,
-                ),
-            )
+            val name = msg.attachmentNames.getOrNull(msg.imageUris.size + i) ?: uri.lastPathSegment ?: "file"
+            add(InputAttachment(fileName = name, uri = uri, mimeType = guessMimeType(name, "application/octet-stream"), kind = InputAttachment.Kind.DOCUMENT))
         }
-        // Replace rather than append: edit mode reloads a specific message, so
-        // whatever the composer held was a different draft. Assigning even when
-        // empty keeps that true for a message that genuinely had no files.
-        _attachments.value = restored
-
-        _editingMessageId.value = messageId
-        AppLogger.info(
-            TAG_STREAM,
-            "✏️ editMessage id=${messageId.take(8)} text=${text.length}ch " +
-                "attachments=${restored.size}",
-        )
-        return text
     }
+
+    /** Exit edit mode and restore the ordinary composer snapshot. */
+    fun cancelEdit() {
+        val editingId = _editingMessageId.value
+        if (editingId != null) {
+            val withdrawn = withdrawnQueuedPrompts.remove(editingId)
+            if (withdrawn != null) {
+                synchronized(queuedPromptLock) {
+                    queuedPromptLedger.restoreEdited(withdrawn.prompt.id)
+                    _promptQueue.value = _promptQueue.value + withdrawn.prompt
+                }
+                val restoredMessages = _messages.value.toMutableList()
+                restoredMessages.add(withdrawn.index.coerceIn(0, restoredMessages.size), withdrawn.message)
+                _messages.value = restoredMessages
+                editAuditLog.record(
+                    event = "WITHDRAW_EDIT_CANCEL_RESTORE",
+                    sessionId = activeSessionId,
+                    messageId = editingId,
+                    promptId = withdrawn.prompt.id,
+                    delivery = withdrawn.prompt.delivery,
+                )
+            }
+            val restored = editDraftState.exitEditing()
+            applyDraftSnapshot(restored)
+            editAuditLog.record("EDIT_CANCEL", activeSessionId, editingId)
+        }
+        _editingMessageId.value = null
+    }
+
+    /**
+     * Commit edit without provider activity. Ordinary messages update the same
+     * Room row; withdrawn queued messages return to the same UI queue entry.
+     */
+    private fun commitEditIfActive(text: String): Boolean {
+        val editingId = _editingMessageId.value ?: return false
+        val replacement = ChatDraftSnapshot(text.trim(), _attachments.value.toList())
+        editDraftState.updateCurrentDraft(replacement.text, replacement.attachments)
+        viewModelScope.launch {
+            try {
+                val sid = ensureSession()
+                val prepared = prepareUserAttachments(replacement.attachments, sid)
+                val pasted = buildPastedParts(replacement.text, sid)
+                if (pasted != null) _pastedTexts.value = _pastedTexts.value.filterNot { it.id in pasted.consumedIds }
+                val partsJson = buildUserPartsJson(
+                    pasted?.modelText ?: replacement.text,
+                    prepared.mediaRefPartsJson,
+                    prepared.attachedFilesXml,
+                    bodyPartsJson = pasted?.partsJson,
+                )
+                val visibleText = pasted?.consumedIds?.fold(replacement.text) { acc, id ->
+                    acc.replace(PastedText.placeholderFor(id), "")
+                }?.trim() ?: replacement.text
+                val withdrawn = withdrawnQueuedPrompts.remove(editingId)
+                if (withdrawn != null) {
+                    val updatedPrompt = withdrawn.prompt.copy(
+                        text = replacement.text,
+                        attachments = replacement.attachments,
+                    )
+                    val visible = withdrawn.message.copy(
+                        content = visibleText,
+                        imageUris = prepared.imageUris,
+                        attachmentNames = prepared.attachmentNames + (pasted?.uiNames ?: emptyList()),
+                        attachmentUris = prepared.nonImageUris + (pasted?.uiUris ?: emptyList()),
+                        isQueued = true,
+                        queuedPromptId = updatedPrompt.id,
+                        queuedDelivery = updatedPrompt.delivery,
+                        provenance = MessageProvenance.TOOL_INJECTION,
+                    )
+                    synchronized(queuedPromptLock) {
+                        queuedPromptLedger.restoreEdited(updatedPrompt.id)
+                        _promptQueue.value = _promptQueue.value + updatedPrompt
+                    }
+                    val restoredMessages = _messages.value.toMutableList()
+                    restoredMessages.add(withdrawn.index.coerceIn(0, restoredMessages.size), visible)
+                    _messages.value = restoredMessages
+                    editAuditLog.record(
+                        event = "WITHDRAW_EDIT_COMMIT",
+                        sessionId = sid,
+                        messageId = editingId,
+                        promptId = updatedPrompt.id,
+                        delivery = updatedPrompt.delivery,
+                    )
+                } else {
+                    val updated = chatRepository.replaceUserMessageInPlace(editingId, partsJson)
+                    if (!updated) throw IllegalStateException("user message row not found: $editingId")
+                    val visible = ChatMessage(
+                        id = editingId,
+                        role = "user",
+                        content = visibleText,
+                        imageUris = prepared.imageUris,
+                        attachmentNames = prepared.attachmentNames + (pasted?.uiNames ?: emptyList()),
+                        attachmentUris = prepared.nonImageUris + (pasted?.uiUris ?: emptyList()),
+                        provenance = MessageProvenance.MANUAL_USER,
+                    )
+                    _messages.value = _messages.value.map { if (it.id == editingId) visible else it }
+                    agentHistory.removeAll { it.dbMessageId == editingId }
+                    chatRepository.loadMessages(sid).firstOrNull { it.id == editingId }?.let {
+                        agentHistory.add(it.toLLMMessage())
+                    }
+                    chatRepository.updateSessionPreview(sid, partsJson)
+                    editAuditLog.record("EDIT_COMMIT_IN_PLACE", sid, editingId)
+                }
+                editDraftState.commitEditing()
+                applyDraftSnapshot(editDraftState.currentDraft())
+                _editingMessageId.value = null
+            } catch (error: Exception) {
+                AppLogger.error(TAG_STREAM, "edit commit failed: ${error.message}")
+                _error.value = error.message ?: "Edit failed"
+            }
+        }
+        return true
+    }
+
 
     /**
      * [T-android-edit-attachments] Best-effort MIME for a restored attachment,
@@ -5954,119 +6145,6 @@ class ChatViewModel(
     }
 
     /**
-     * T187: leave edit mode without sending. Just clears the id flag —
-     * caller (ChatScreen) is responsible for clearing inputText. iOS
-     * parity: AIChatViewModel.cancelEdit (L2522).
-     */
-    fun cancelEdit() {
-        if (_editingMessageId.value != null) {
-            AppLogger.info(TAG_STREAM, "✏️ cancelEdit")
-            // [T-android-edit-loses-attachments] Drop the attachments
-            // editMessage restored, mirroring how the caller clears the text.
-            //
-            // Symmetry with editMessage is the whole point: it REPLACES the
-            // composer's attachments with the edited message's, so leaving
-            // them behind on cancel would strand files the user never picked
-            // in a composer they thought they had backed out of — and the next
-            // ordinary send would silently attach them.
-            //
-            // Guarded by the same non-null check as the log so a stray call
-            // outside edit mode cannot wipe a draft's real attachments.
-            _attachments.value = emptyList()
-        }
-        _editingMessageId.value = null
-    }
-
-    /**
-     * T187: drop the message at [messageId] *and* every later message
-     * (in UI, in agentHistory, and on disk) so the new sendMessage()
-     * call below this can persist the edited text as a fresh user
-     * turn at the same position. Reuses the cutoff-search machinery
-     * from retryFromMessage but offsets by `entity.sortOrder` (not
-     * +1) — retry preserves the original turn, edit replaces it.
-     */
-    private suspend fun truncateBeforeEdit(messageId: String) {
-        val messages = _messages.value
-        val index = messages.indexOfFirst { it.id == messageId }
-        if (index < 0) return
-
-        val deletedMessages = messages.subList(index, messages.size).toList()
-        // [T-android-uimessages-sublist-cme] Defensive: without `.toList()` this
-        // stores a live subList VIEW as `_messages.value`.
-        //
-        // Reproduced on device with this `.toList()` reverted (Pixel 4a): the
-        // truncation ran (8 messages → 4) and a further message was sent, and it
-        // did NOT crash — the next `+` copies the view into a plain ArrayList
-        // before anything can invalidate it. So this line is hardening, not the
-        // proven cause of the reported CME. See the long note on `uiMessages`.
-        // (`deletedMessages` above already copies; this line did not.)
-        val kept = messages.subList(0, index).toList()
-        _messages.value = kept
-        if (_streamingById.value.isNotEmpty()) {
-            val keptIds = kept.mapTo(mutableSetOf()) { it.id }
-            retainStreamFlushStates(keptIds)
-            _streamingById.value = _streamingById.value.filterKeys { it in keptIds }
-        }
-        revokeMemoryWritesInDeletedMessages(deletedMessages)
-
-        val sid = realSessionId.takeIf { it.isNotEmpty() } ?: sessionId
-        // Visible-user index of the *edited* message — count user turns
-        // strictly before `index`, which is the 0-based ordinal of the
-        // edited turn itself.
-        val visibleUserIndex = messages.subList(0, index).count { it.role == "user" }
-        val dbMessages = chatRepository.loadMessages(sid)
-        var visibleUserCount = 0
-        var cutoffSortOrder = -1
-        for (entity in dbMessages) {
-            if (entity.role == "user") {
-                val hasText = try {
-                    val arr = org.json.JSONArray(entity.partsJson)
-                    (0 until arr.length()).any { i ->
-                        val o = arr.getJSONObject(i)
-                        // [T-android-retry-attachment-loss] Exclude the now-
-                        // persisted <user-attached-files> XML text part so this
-                        // "is this a visible user bubble?" count stays identical
-                        // to pre-XML-persistence behaviour. An attachments-only
-                        // turn must NOT flip to hasText just because the XML
-                        // inventory is now a text part — that would shift the
-                        // retry/edit cutoff onto the wrong message.
-                        // [T-ios-retry-anchor-synthetic-user] Likewise exclude
-                        // resume()'s synthetic stop-continue <system-reminder>
-                        // user row — it has no UI bubble, so counting it shifts
-                        // the cutoff one user message too early.
-                        o.optString("type") == "text" &&
-                            stripAttachedFilesXml(o.optString("value", "")).isNotBlank() &&
-                            !o.optString("value", "").trimStart().startsWith("<system-reminder>")
-                    }
-                } catch (_: Exception) { true }
-                if (hasText) {
-                    if (visibleUserCount == visibleUserIndex) {
-                        // ChatDao.deleteMessagesAfter is `sort_order >= keepCount`
-                        // → passing this row's sortOrder deletes IT and everything
-                        // after, which is exactly what edit semantics want.
-                        cutoffSortOrder = entity.sortOrder
-                        break
-                    }
-                    visibleUserCount++
-                }
-            }
-        }
-        if (cutoffSortOrder >= 0) {
-            chatRepository.deleteMessagesAfter(sid, cutoffSortOrder)
-        }
-        agentHistory.clear()
-        toolLoopDetector.reset()
-        val remaining = chatRepository.loadMessages(sid)
-        for (entity in remaining) {
-            agentHistory.add(entity.toLLMMessage())
-        }
-        AppLogger.info(
-            TAG_STREAM,
-            "✏️ truncateBeforeEdit cutoffSortOrder=$cutoffSortOrder remaining=${remaining.size}"
-        )
-    }
-
-    /**
      * Enqueue a prompt to be injected into the currently running agent loop.
      * The message appears immediately in the chat with isQueued=true; when the
      * current agent loop finishes, drainQueuedPrompts() consumes the queue.
@@ -6077,12 +6155,24 @@ class ChatViewModel(
         val pendingAttachments = _attachments.value
         if ((trimmed.isBlank() && pendingAttachments.isEmpty()) || !_isStreaming.value) return
 
+        val delivery = when (AgentBehaviorSettingsPrefs(context).load().defaultSendStrategy) {
+            com.openminis.app.ui.settings.DefaultSendStrategy.STEER -> QueuedPromptDelivery.STEER
+            com.openminis.app.ui.settings.DefaultSendStrategy.QUEUE -> QueuedPromptDelivery.QUEUE
+        }
         val prompt = QueuedPrompt(
             id = "queued_${System.currentTimeMillis()}_${(Math.random() * 1_000_000).toInt()}",
             text = trimmed,
-            attachments = pendingAttachments,
+            attachments = pendingAttachments.toList(),
+            delivery = delivery,
         )
-        _promptQueue.value = _promptQueue.value + prompt
+        synchronized(queuedPromptLock) {
+            queuedPromptLedger.register(
+                promptId = prompt.id,
+                messageId = "queued_msg_${prompt.id}",
+                delivery = delivery,
+            )
+            _promptQueue.value = _promptQueue.value + prompt
+        }
 
         val attachmentNames = pendingAttachments.map { it.fileName }
         val imageUris = pendingAttachments.filter { it.isImage }.map { it.uri }
@@ -6096,27 +6186,82 @@ class ChatViewModel(
             attachmentUris = attachmentUris,
             isQueued = true,
             queuedPromptId = prompt.id,
-             provenance = MessageProvenance.TOOL_INJECTION,
+            queuedDelivery = prompt.delivery,
+            provenance = MessageProvenance.TOOL_INJECTION,
         )
         _messages.value = _messages.value + chatMsg
         clearAttachments()
-        Log.i(TAG, "Enqueued prompt (${trimmed.length}ch, ${pendingAttachments.size} attachments), queue=${_promptQueue.value.size}")
+        editAuditLog.record("QUEUE_ENQUEUED", activeSessionId, chatMsg.id, prompt.id, delivery)
+        Log.i(TAG, "Enqueued ${delivery.name} prompt (${trimmed.length}ch, ${pendingAttachments.size} attachments), queue=${_promptQueue.value.size}")
     }
 
-    /** Remove a queued prompt and its chat message by prompt id. */
-    fun removeQueuedPrompt(promptId: String) {
-        _promptQueue.value = _promptQueue.value.filterNot { it.id == promptId }
-        _messages.value = _messages.value.filterNot { it.queuedPromptId == promptId }
+    private fun claimQueued(delivery: QueuedPromptDelivery): List<QueuedPrompt> = synchronized(queuedPromptLock) {
+        val claimed = _promptQueue.value
+            .filter { it.delivery == delivery }
+            .filter { queuedPromptLedger.claim(it.id) }
+        if (claimed.isNotEmpty()) {
+            val ids = claimed.mapTo(HashSet()) { it.id }
+            _promptQueue.value = _promptQueue.value.filterNot { it.id in ids }
+        }
+        claimed
     }
 
-    /** Withdraw a queued message before it gets injected into the agent loop. */
-    fun withdrawQueuedMessage(messageId: String) {
-        val msg = _messages.value.firstOrNull { it.id == messageId } ?: return
-        if (!msg.isQueued) return
-        val pid = msg.queuedPromptId ?: return
-        _promptQueue.value = _promptQueue.value.filterNot { it.id == pid }
-        _messages.value = _messages.value.filterNot { it.id == messageId }
-        Log.i(TAG, "Withdrew queued message, queue=${_promptQueue.value.size}")
+    private fun rollbackQueued(prompts: List<QueuedPrompt>) {
+        if (prompts.isEmpty()) return
+        synchronized(queuedPromptLock) {
+            val restored = prompts.filter { queuedPromptLedger.rollbackClaim(it.id) }
+            if (restored.isNotEmpty()) {
+                val existing = _promptQueue.value.mapTo(HashSet()) { it.id }
+                _promptQueue.value = restored.filterNot { it.id in existing } + _promptQueue.value
+                val ids = restored.mapTo(HashSet()) { it.id }
+                _messages.value = _messages.value.map { message ->
+                    if (message.queuedPromptId in ids) message.copy(isQueued = true) else message
+                }
+            }
+        }
+    }
+
+    private fun consumeQueued(prompts: List<QueuedPrompt>) {
+        if (prompts.isEmpty()) return
+        synchronized(queuedPromptLock) {
+            prompts.forEach { queuedPromptLedger.consume(it.id) }
+            val ids = prompts.mapTo(HashSet()) { it.id }
+            _messages.value = _messages.value.map { message ->
+                if (message.queuedPromptId in ids) message.copy(isQueued = false, queuedPromptId = null)
+                else message
+            }
+        }
+    }
+
+    /** Remove only an unconsumed prompt; claimed/consumed prompts remain immutable. */
+    fun removeQueuedPrompt(promptId: String): Boolean {
+        val accepted = synchronized(queuedPromptLock) {
+            val result = queuedPromptLedger.withdrawForEdit(promptId) ?: return@synchronized false
+            if (!result.accepted) return@synchronized false
+            _promptQueue.value = _promptQueue.value.filterNot { it.id == promptId }
+            true
+        }
+        if (accepted) _messages.value = _messages.value.filterNot { it.queuedPromptId == promptId }
+        return accepted
+    }
+
+    /** Withdraw a queued message and enter the isolated edit buffer. */
+    fun withdrawQueuedMessage(messageId: String): Boolean = editMessage(messageId) != null
+
+    fun discardQueuedMessage(messageId: String): Boolean {
+        val msg = _messages.value.firstOrNull { it.id == messageId } ?: return false
+        val promptId = msg.queuedPromptId ?: return false
+        val accepted = synchronized(queuedPromptLock) {
+            val result = queuedPromptLedger.withdrawForEdit(promptId) ?: return@synchronized false
+            if (!result.accepted) return@synchronized false
+            _promptQueue.value = _promptQueue.value.filterNot { it.id == promptId }
+            true
+        }
+        if (accepted) {
+            _messages.value = _messages.value.filterNot { it.id == messageId }
+            editAuditLog.record("QUEUE_DISCARDED", activeSessionId, messageId, promptId, msg.queuedDelivery)
+        }
+        return accepted
     }
 
     /**
@@ -6147,9 +6292,8 @@ class ChatViewModel(
         finishedAccumulatedText: String,
         finishedAllToolBlocks: List<AssistantBlock>,
     ): InjectedTurn? {
-        if (_promptQueue.value.isEmpty()) return null
-        val queued = _promptQueue.value
-        _promptQueue.value = emptyList()
+        val queued = claimQueued(QueuedPromptDelivery.STEER)
+        if (queued.isEmpty()) return null
 
         // [T-android-queued-message-duplicated-on-inject] REMOVE the queued
         // placeholder bubbles (the ones enqueuePrompt added with
@@ -6191,6 +6335,7 @@ class ChatViewModel(
         // the caller falls through to a normal next-turn dispatch so the
         // loop doesn't spin.
         if (combinedParts.isEmpty()) {
+            rollbackQueued(queued)
             AppLogger.warning(
                 TAG_STREAM,
                 "injectQueuedPromptsAsNewTurn: ${queued.size} queued prompt(s) produced no content, skipping",
@@ -6314,6 +6459,7 @@ class ChatViewModel(
             "injectQueuedPromptsAsNewTurn: injected ${queued.size} queued prompt(s) as new turn, " +
                 "finishedId=$finishedAssistantId newId=$newAssistantId",
         )
+        consumeQueued(queued)
         return InjectedTurn(newAssistantId)
     }
 
@@ -6328,22 +6474,14 @@ class ChatViewModel(
         fallbackProviders: List<FallbackCandidate>,
         fallbackStrategy: com.openminis.app.data.model.FallbackStrategy,
     ) {
-        while (_promptQueue.value.isNotEmpty()) {
-            val queued = _promptQueue.value
-            _promptQueue.value = emptyList()
+        while (true) {
+            val queued = claimQueued(QueuedPromptDelivery.QUEUE)
+            if (queued.isEmpty()) break
             Log.i(TAG, "📨[DRAIN] Draining ${queued.size} queued prompt(s): " +
                 queued.joinToString(", ") { "${it.id}=\"${it.text.take(20)}...\"" })
 
-            // Flip isQueued=false on corresponding chat messages so they render as sent.
-            // T189: also clear queuedPromptId so a later retry of this bubble
-            // doesn't try to drop a phantom queue entry (and so the field state
-            // matches what retryFromMessage's truncate path now produces).
-            val queuedIds = queued.map { it.id }.toSet()
-            _messages.value = _messages.value.map { m ->
-                if (m.queuedPromptId != null && queuedIds.contains(m.queuedPromptId)) {
-                    m.copy(isQueued = false, queuedPromptId = null)
-                } else m
-            }
+            // Claim keeps the UI placeholder intact until persistence and the
+            // nested agent loop both succeed; failures restore the same prompt.
 
             // Build a combined user message (text + images from all queued prompts).
             // Persist as a single row.
@@ -6406,16 +6544,16 @@ class ChatViewModel(
                     fallbackStrategy = fallbackStrategy,
                 )
             } catch (e: CancellationException) {
+                rollbackQueued(queued)
                 Log.d(TAG, "Agent loop (queued-drain) cancelled")
-                // Cancel mid-drain: cancelStream() will check _promptQueue
-                // and call resumeQueueAfterCancel() if anything's still pending,
-                // so just propagate.
                 throw e
             } catch (e: Exception) {
+                rollbackQueued(queued)
                 Log.e(TAG, "Agent loop (queued-drain) error", e)
                 setInlineError(e.message ?: "Unknown error")
                 break
             }
+            consumeQueued(queued)
         }
     }
 
@@ -6429,8 +6567,9 @@ class ChatViewModel(
      *   re-entry with `skipCompactCheck`.
      */
     private fun sendMessage(text: String, skipContextCheck: Boolean) {
-        // [T-android-paste-mediaref] `[Pasted#N]` markers are NOT expanded here
-        // any more.
+        // Editing is a write-back operation, never a new provider turn.
+        if (commitEditIfActive(text)) return
+        // [T-android-paste-mediaref] `[Pasted#N]` markers are NOT expanded here any more.
         //
         // They used to be: this funnel substituted the full text inline, so the
         // persisted message held one enormous `text` part. That is the same
@@ -6530,23 +6669,11 @@ class ChatViewModel(
             flushAllStreamingDeltas()
         }
 
-        // T187: when the user is editing a previous message, truncate the
-        // conversation from that message (inclusive) before persisting the
-        // edited text as a fresh user turn. Snapshot + clear the id here so
-        // any error in the truncate path doesn't leave the composer stuck
-        // in edit mode.
-        val editingId = _editingMessageId.value
-        if (editingId != null) _editingMessageId.value = null
-
         viewModelScope.launch {
             var streamLaunched = false
             try {
             // Ensure session exists in DB (creates on first message for draft sessions)
             val activeSessionId = ensureSession()
-
-            if (editingId != null) {
-                truncateBeforeEdit(editingId)
-            }
 
             val prepared = prepareUserAttachments(currentAttachments, activeSessionId)
 
@@ -9601,6 +9728,11 @@ class ChatViewModel(
                 publishStreamingUpdates,
             )
             "browser_use" -> executeBrowserUseTool(argsJson)
+            BrowserDevToolsTools.TOOL_NAME -> executeBrowserDevToolsTool(argsJson)
+            "stop_descendant" -> executeStopDescendantTool(argsJson)
+            "delete_subtree" -> executeDeleteSubtreeTool(argsJson)
+            "web_search" -> executeWebSearchTool(argsJson)
+            "web_fetch" -> executeWebFetchTool(argsJson)
             "memory_write" -> executeMemoryWriteTool(argsJson)
             "memory_get" -> executeMemoryGetTool(argsJson)
             else -> ToolExecutionResult("Unknown tool: $name", false)
@@ -9928,6 +10060,165 @@ class ChatViewModel(
         } catch (e: Exception) {
             ToolExecutionResult("Error: ${e.message}", false)
         }
+    }
+
+    private suspend fun executeWebSearchTool(argsJson: String): ToolExecutionResult {
+        val args = runCatching { JSONObject(argsJson) }.getOrNull()
+            ?: return ToolExecutionResult("{\"ok\":false,\"error\":{\"code\":\"INVALID_ARGUMENTS\",\"message\":\"Invalid JSON\"}}", false, toolTitle = "Search Web")
+        val query = args.optString("query", "").trim()
+        val title = args.optString("tool_title", "Search Web")
+        if (query.isBlank()) return ToolExecutionResult("{\"ok\":false,\"error\":{\"code\":\"INVALID_ARGUMENTS\",\"message\":\"query is required\"}}", false, toolTitle = title)
+        val prefs = AgentBehaviorSettingsPrefs(context).load()
+        val options = SearchOptions(
+            maxResults = args.optInt("max_results", prefs.webSearchMaxResults).coerceAtMost(prefs.webSearchMaxResults),
+            timeoutMs = args.optLong("timeout_ms", prefs.webRequestTimeoutMs).coerceAtMost(prefs.webRequestTimeoutMs),
+        ).normalized()
+        val result = PublicSearchService(listOf(DuckDuckGoHtmlAdapter())).search(query, options)
+        val json = JSONObject().put("ok", result.failures.isEmpty() || result.items.isNotEmpty())
+            .put("query", result.query)
+            .put("results", JSONArray().apply {
+                result.items.forEach { item -> put(JSONObject()
+                    .put("title", item.title).put("url", item.url)
+                    .put("snippet", item.snippet ?: JSONObject.NULL).put("source", item.source)) }
+            })
+            .put("failures", JSONArray().apply {
+                result.failures.forEach { failure -> put(JSONObject().put("source", failure.source).put("detail", failure.detail)) }
+            })
+        return ToolExecutionResult(json.toString(), result.items.isNotEmpty(), toolTitle = title)
+    }
+
+    private suspend fun executeWebFetchTool(argsJson: String): ToolExecutionResult {
+        val args = runCatching { JSONObject(argsJson) }.getOrNull()
+            ?: return ToolExecutionResult("{\"ok\":false,\"error\":{\"code\":\"INVALID_ARGUMENTS\",\"message\":\"Invalid JSON\"}}", false, toolTitle = "Fetch Web")
+        val url = args.optString("url", "").trim()
+        val title = args.optString("tool_title", "Fetch Web")
+        if (url.isBlank()) return ToolExecutionResult("{\"ok\":false,\"error\":{\"code\":\"INVALID_ARGUMENTS\",\"message\":\"url is required\"}}", false, toolTitle = title)
+        val prefs = AgentBehaviorSettingsPrefs(context).load()
+        val timeout = args.optLong("timeout_ms", prefs.webRequestTimeoutMs).coerceAtMost(prefs.webRequestTimeoutMs)
+        val maxBytes = args.optInt("max_bytes", PublicWebFetcher.DEFAULT_MAX_BYTES).coerceAtMost(PublicWebFetcher.DEFAULT_MAX_BYTES)
+        return when (val result = PublicWebFetcher().fetch(url, WebFetchOptions(timeoutMs = timeout, maxBytes = maxBytes))) {
+            is WebFetchResult.Success -> ToolExecutionResult(JSONObject()
+                .put("ok", true).put("url", result.url).put("content", result.body).toString(), true, toolTitle = title)
+            is WebFetchResult.Failure -> ToolExecutionResult(JSONObject()
+                .put("ok", false).put("url", result.url)
+                .put("error", JSONObject().put("code", result.reason.name).put("message", result.detail)).toString(), false, toolTitle = title)
+        }
+    }
+
+    private suspend fun executeStopDescendantTool(argsJson: String): ToolExecutionResult {
+        val args = runCatching { JSONObject(argsJson) }.getOrNull()
+            ?: return ToolExecutionResult("{\"ok\":false,\"error\":\"invalid arguments\"}", false, toolTitle = "Stop Descendant")
+        val title = args.optString("tool_title", "Stop Descendant")
+        val actorSessionId = activeSessionId.trim()
+        val targetSessionId = args.optString("target_session_id", "").trim()
+        if (actorSessionId.isBlank() || targetSessionId.isBlank()) {
+            return ToolExecutionResult(
+                JSONObject().put("ok", false).put("error", "actor session or target session is missing").toString(),
+                false,
+                toolTitle = title,
+            )
+        }
+        val receipt = runCatching {
+            runtimeCoordinator.stopDescendant(
+                actorSessionId = actorSessionId,
+                targetSessionId = targetSessionId,
+                rootId = args.optString("root_id").takeIf { it.isNotBlank() },
+                reason = args.optString("reason", "Requested by parent agent"),
+                operationId = args.optString("operation_id").takeIf { it.isNotBlank() },
+                idempotencyKey = args.optString("idempotency_key").takeIf { it.isNotBlank() },
+            )
+        }.getOrElse { error ->
+            return ToolExecutionResult(
+                JSONObject().put("ok", false).put("error", error.message ?: "runtime stop failed").toString(),
+                false,
+                toolTitle = title,
+            )
+        }
+        val json = JSONObject()
+            .put("ok", receipt.accepted)
+            .put("type", receipt.type.name)
+            .put("operation_id", receipt.operationId)
+            .put("idempotency_key", receipt.idempotencyKey)
+            .put("actor_node_id", receipt.actorNodeId)
+            .put("target_node_id", receipt.targetNodeId)
+            .put("root_id", receipt.rootId ?: JSONObject.NULL)
+            .put("state_before", receipt.stateBefore?.name ?: JSONObject.NULL)
+            .put("state_after", receipt.stateAfter?.name ?: JSONObject.NULL)
+            .put("affected_node_ids", org.json.JSONArray(receipt.affectedNodeIds))
+            .put("audit_event_id", receipt.eventId ?: JSONObject.NULL)
+            .put("reason", receipt.reason ?: JSONObject.NULL)
+        return ToolExecutionResult(json.toString(), receipt.accepted, toolTitle = title)
+    }
+
+    private suspend fun executeDeleteSubtreeTool(argsJson: String): ToolExecutionResult {
+        val args = runCatching { JSONObject(argsJson) }.getOrNull()
+            ?: return ToolExecutionResult("{\"success\":false,\"result\":\"REJECTED\",\"reason\":\"invalid arguments\"}", false, toolTitle = "Delete Subtree")
+        val title = args.optString("tool_title", "Delete Subtree")
+        val initiator = activeSessionId.trim()
+        val target = args.optString("target_session_id", "").trim()
+        if (initiator.isBlank() || target.isBlank()) {
+            return ToolExecutionResult(
+                JSONObject().put("success", false).put("result", "REJECTED").put("reason", "initiator or target session is missing").toString(),
+                false,
+                toolTitle = title,
+            )
+        }
+        val receipt = runCatching {
+            runtimeCoordinator.deleteSubtree(
+                initiatorSessionId = initiator,
+                executorSessionId = initiator,
+                targetSessionId = target,
+                rootId = args.optString("root_id").takeIf { it.isNotBlank() },
+                operationId = args.optString("operation_id").takeIf { it.isNotBlank() },
+                idempotencyKey = args.optString("idempotency_key").takeIf { it.isNotBlank() },
+            )
+        }.getOrElse { error ->
+            return ToolExecutionResult(
+                JSONObject().put("success", false).put("result", "REJECTED").put("reason", error.message ?: "runtime delete failed").toString(),
+                false,
+                toolTitle = title,
+            )
+        }
+        val success = receipt.result == DeleteSubtreeResult.DELETED
+        val json = JSONObject()
+            .put("success", success)
+            .put("result", receipt.result.name)
+            .put("reason", receipt.reason ?: JSONObject.NULL)
+            .put("affected", JSONArray(receipt.affectedNodeIds))
+            .put("operation", receipt.operationId)
+            .put("idempotency", receipt.idempotencyKey)
+            .put("initiator", receipt.initiatorNodeId)
+            .put("executor", receipt.executorNodeId)
+            .put("target", receipt.targetNodeId)
+            .put("oldParent", receipt.oldParentId ?: JSONObject.NULL)
+        return ToolExecutionResult(json.toString(), success, toolTitle = title)
+    }
+    private suspend fun executeBrowserDevToolsTool(argsJson: String): ToolExecutionResult {
+        val request = BrowserDevToolsTools.Request.parse(argsJson)
+            ?: return ToolExecutionResult(
+                BrowserDevToolsTools.Result(BrowserDevToolsTools.Status.INVALID, "Invalid browser_devtools input").toJson(),
+                false,
+                toolTitle = "Browser DevTools",
+            )
+        val title = runCatching { JSONObject(argsJson).optString("tool_title", "Browser DevTools") }
+            .getOrDefault("Browser DevTools")
+        val session = activeSessionId.trim()
+        if (request.sessionId != session || request.sessionId.isBlank()) {
+            val denied = BrowserDevToolsTools.Result(BrowserDevToolsTools.Status.DENIED, "browser session is not authorized")
+            return ToolExecutionResult(denied.toJson(), false, toolTitle = title)
+        }
+        val target = browserTabPool.resolveDevToolsTarget(session, request.tabId, request.pageId)
+        if (target == null) {
+            val denied = BrowserDevToolsTools.Result(
+                BrowserDevToolsTools.Status.DENIED,
+                "browser tab/page scope is not authorized",
+                BrowserDevToolsTools.Scope(session, request.tabId, request.pageId),
+            )
+            return ToolExecutionResult(denied.toJson(), false, toolTitle = title)
+        }
+        val scope = BrowserDevToolsTools.Scope(session, request.tabId, request.pageId)
+        val result = target.executeDevTools(request, scope)
+        return ToolExecutionResult(result.toJson(), result.status == BrowserDevToolsTools.Status.OK, toolTitle = title)
     }
 
     private suspend fun executeBrowserUseTool(argsJson: String): ToolExecutionResult {
@@ -10404,7 +10695,10 @@ class ChatViewModel(
         toolBlockMeta: Map<String, AssistantBlock> = emptyMap(),
     ): String? {
         if (parts.isEmpty()) return null
-        val partsJson = buildAssistantPartsJson(parts, toolBlockMeta)
+        var partsJson = buildAssistantPartsJson(parts, toolBlockMeta)
+        actualRequestMetadata(ModelRole.PRIMARY)?.let { meta ->
+            partsJson = prependRequestMetadata(partsJson, meta)
+        }
         val tokenJson = usage?.let {
             """{"inputTokens":${it.inputTokens},"outputTokens":${it.outputTokens},"cacheCreationTokens":${it.cacheCreationInputTokens ?: 0},"cacheReadTokens":${it.cacheReadInputTokens ?: 0},"latestContextTokens":${it.latestContextTokens}}"""
         }
@@ -10469,7 +10763,7 @@ class ChatViewModel(
     private suspend fun persistToolResultMessage(parts: List<AgentContentPart>): String? {
         val results = parts.filterIsInstance<AgentContentPart.ToolResult>()
         if (results.isEmpty()) return null
-        val partsJson = buildString {
+        var partsJson = buildString {
             append("[")
             results.forEachIndexed { index, result ->
                 if (index > 0) append(",")
@@ -10477,6 +10771,9 @@ class ChatViewModel(
                 append("""{"type":"toolResult","value":{"toolUseId":${escapeJson(result.id)},"name":${escapeJson(result.name)},"output":${escapeJson(result.content)},"success":${!result.isError},"snapshot":{"type":"text","text":$snapshotText}}}""")
             }
             append("]")
+        }
+        actualRequestMetadata(ModelRole.PRIMARY)?.let { meta ->
+            partsJson = prependRequestMetadata(partsJson, meta)
         }
         val entity = chatRepository.appendMessage(
             realSessionId.ifEmpty { sessionId },
@@ -11248,9 +11545,31 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
         return parts.joinToString(prefix = "[", postfix = "]", separator = ",")
     }
 
-    /** LLM-based title + category generation, mirrors iOS generateSessionTitleIfNeeded(). */
-    private var titleGenerationAttempts = 0
+    private var titleRequestEntry: com.openminis.app.data.model.ModelEntry? = null
+    private var titleRequestProvider: LLMProvider? = null
+
+    private fun titleSnapshot(
+        entry: com.openminis.app.data.model.ModelEntry?,
+        provider: LLMProvider? = currentProvider,
+    ): ActualModelRequestSnapshot? {
+        entry?.let { actual ->
+            val instance = providerRepository.instance(actual.providerInstanceId)
+            if (instance != null) return ActualModelRequestSnapshot.capture(ModelRole.TITLE, actual, instance.providerType.name)
+        }
+        val actualProvider = provider ?: return null
+        return ActualModelRequestSnapshot.captureWithoutEntry(
+            ModelRole.TITLE,
+            actualProvider.model,
+            actualProvider.name,
+        )
+    }
+
     private var titleGenerationInFlight = false
+    private var titleGenerationAttempts = 0
+    private var compactionRequestEntry: com.openminis.app.data.model.ModelEntry? = null
+    private var compactionRequestModel: LLMModel? = null
+    private var compactionRequestProviderTypeRaw: String? = null
+    private var compactionRequestProviderInstanceId: String? = null
     private val TITLE_MAX_ATTEMPTS = 3
 
     // [T-android-auto-grouping-injection] Bounds on the group list folded into
@@ -11291,6 +11610,7 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
         // reason and fall back to the first user message as the title.
         val subProvider = resolveTitleProvider()
         if (subProvider == null) {
+            titleRequestEntry = resolveRoleEntry(providerRepository.config.value.primaryModelEntryId)
             AppLogger.info("TitleGen", "resolveTitleProvider=null — falling back to currentProvider")
         }
         val provider = subProvider ?: currentProvider
@@ -11303,6 +11623,7 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
         }
 
         titleGenerationInFlight = true
+        titleRequestProvider = provider
         titleGenerationAttempts++
 
         // [T-titlegen-context-first-last-pair] Build the summary from the first
@@ -11420,7 +11741,8 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
                 // Code prefix block at the provider layer (and strips a
                 // caller-supplied one), so no caller-side prepend is needed — the
                 // previous manual prefix branch here was redundant.
-                val effectiveSystemPrompt = TITLE_GEN_SYSTEM_PROMPT
+                val effectiveSystemPrompt = providerRepository.titlePrompt
+                    ?.takeIf { it.isNotBlank() } ?: TITLE_GEN_SYSTEM_PROMPT
 
                 AppLogger.info(
                     "TitleGen",
@@ -11457,7 +11779,15 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
                 val (title, category, folderName) = parseTitleResponse(response.text)
                 if (title.isNotEmpty()) {
                     val sid = realSessionId.ifEmpty { sessionId }
-                    chatRepository.updateSessionTitleAndCategory(sid, title, category)
+                    val snapshot = titleSnapshot(titleRequestEntry, titleRequestProvider)
+                    if (snapshot != null) {
+                        chatRepository.updateSessionTitleAndCategoryWithModelSnapshot(
+                            sid, title, category, snapshot.entryId, snapshot.modelId,
+                            snapshot.displayName, snapshot.providerTypeRaw, System.currentTimeMillis(),
+                        )
+                    } else {
+                        chatRepository.updateSessionTitleAndCategory(sid, title, category)
+                    }
                     withContext(Dispatchers.Main) {
                         _sessionTitle.value = title
                         _sessionCategory.value = category
@@ -11627,7 +11957,15 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
             return
         }
         val fallbackTitle = if (cleaned.length > 30) cleaned.take(30).trimEnd() + "…" else cleaned
-        chatRepository.updateSessionTitle(sidForCheck, fallbackTitle)
+                    val snapshot = titleSnapshot(titleRequestEntry, titleRequestProvider)
+                    if (snapshot != null) {
+                        chatRepository.updateSessionTitleAndCategoryWithModelSnapshot(
+                            sidForCheck, fallbackTitle, null, snapshot.entryId, snapshot.modelId,
+                            snapshot.displayName, snapshot.providerTypeRaw, System.currentTimeMillis(),
+                        )
+                    } else {
+                        chatRepository.updateSessionTitle(sidForCheck, fallbackTitle)
+                    }
         withContext(Dispatchers.Main) {
             _sessionTitle.value = fallbackTitle
         }
@@ -11645,6 +11983,15 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
      * OAuth-Anthropic Claude-Code-only gate. Falls back to null if no sub is
      * configured — caller uses the primary provider then.
      */
+    private fun createRoleProvider(entry: com.openminis.app.data.model.ModelEntry): LLMProvider? {
+        val instance = providerRepository.instance(entry.providerInstanceId) ?: return null
+        val apiKey = providerRepository.usableApiKey(instance) ?: return null
+        return ProviderFactory.create(instance, apiKey, entry.model, context)
+    }
+
+    private fun resolveRoleEntry(explicitId: String?): com.openminis.app.data.model.ModelEntry? =
+        explicitId?.let { id -> providerRepository.config.value.modelEntries.firstOrNull { it.id == id } }
+
     private fun resolveTitleProvider(): LLMProvider? {
         // [T-disabled-provider-via-group-android] Resolve the dedicated
         // title-generation sub-model (first enabled member of defaultSubGroupId).
@@ -11653,7 +12000,11 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
         // path so both prefer the same sub-model. Silently degrades (caller
         // falls back to the primary provider) when no sub-group is configured or
         // every member sits behind a disabled provider.
-        val entry = providerRepository.resolveTitleSubEntry() ?: return null
+        val config = providerRepository.config.value
+        val entry = ModelRoleSelectionResolver.explicitTitleEntry(config)
+            ?: providerRepository.resolveTitleSubEntry()
+            ?: return null
+        titleRequestEntry = entry
         val instance = providerRepository.instance(entry.providerInstanceId) ?: return null
         // [T-android-keyless-provider-selection] usableApiKey — a keyless
         // self-hosted sub-model is usable; loadApiKey returned null and made

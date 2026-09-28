@@ -16,6 +16,9 @@ import java.util.Locale
 internal const val TITLE_GEN_SYSTEM_PROMPT: String =
     "You generate concise titles for conversations. You MUST respond with a single valid JSON object: {\"title\": \"...\", \"category\": \"...\"}. No other text."
 
+internal const val COMPACTION_DEFAULT_SYSTEM_PROMPT: String =
+    "You are a context compaction engine. Preserve identifiers, decisions, errors, constraints, and completed work. Write a concise past-tense summary for the next turn."
+
 /**
  * Build the bilingual language directive appended to the title-generation
  * user prompt so the model produces a title in the user's UI language even
