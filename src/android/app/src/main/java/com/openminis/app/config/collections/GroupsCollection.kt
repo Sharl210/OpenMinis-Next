@@ -137,8 +137,8 @@ class GroupsCollection(
         ClosureField(
             path = "groups.$id.strategy",
             displayName = "Routing strategy",
-            description = "fallback (try in order) / loadBalance (distribute).",
-            valueSchema = ConfigSchema.StrEnum(listOf("fallback", "loadBalance")),
+            description = "none (never switch to another group member) / fallback (try in order) / loadBalance (distribute).",
+            valueSchema = ConfigSchema.StrEnum(listOf("none", "fallback", "loadBalance")),
             risk = ConfigRisk.SENSITIVE,
             revertable = true,
             reader = {
