@@ -185,19 +185,35 @@ class RuntimeSessionCoordinator private constructor(
                 ),
             )
         }
-        return receipt ?: DeleteSubtreeReceipt(
-            operationId = operation,
-            idempotencyKey = key,
-            result = DeleteSubtreeResult.REJECTED,
-            initiatorNodeId = initiator,
-            executorNodeId = executor,
-            targetNodeId = target,
-            rootId = rootId,
-            oldParentId = null,
-            affectedNodeIds = emptyList(),
-            reason = if (persisted) "runtime delete produced no receipt" else "runtime tree persistence failed",
-            createdAtMillis = System.currentTimeMillis(),
-        )
+        return if (persisted) {
+            receipt ?: DeleteSubtreeReceipt(
+                operationId = operation,
+                idempotencyKey = key,
+                result = DeleteSubtreeResult.REJECTED,
+                initiatorNodeId = initiator,
+                executorNodeId = executor,
+                targetNodeId = target,
+                rootId = rootId,
+                oldParentId = null,
+                affectedNodeIds = emptyList(),
+                reason = "runtime delete produced no receipt",
+                createdAtMillis = System.currentTimeMillis(),
+            )
+        } else {
+            DeleteSubtreeReceipt(
+                operationId = operation,
+                idempotencyKey = key,
+                result = DeleteSubtreeResult.REJECTED,
+                initiatorNodeId = initiator,
+                executorNodeId = executor,
+                targetNodeId = target,
+                rootId = rootId,
+                oldParentId = null,
+                affectedNodeIds = emptyList(),
+                reason = "runtime tree persistence failed",
+                createdAtMillis = System.currentTimeMillis(),
+            )
+        }
     }
     @Synchronized
     fun stopDescendant(
