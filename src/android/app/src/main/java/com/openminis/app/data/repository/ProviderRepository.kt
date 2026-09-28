@@ -1676,7 +1676,7 @@ class ProviderRepository(private val context: Context) {
         for (m in members) {
             if (out.none { it.second.id == m.second.id }) out.add(m)
         }
-        return out
+        return if (group.strategy == RoutingStrategy.none) out.take(1) else out
     }
 
     // --- Thinking rules (custom) [T-android-thinking-rules-phase2] ---
@@ -1972,7 +1972,8 @@ class ProviderRepository(private val context: Context) {
                 if (out.none { it.second.id == m.second.id }) out.add(m)
             }
         }
-        return out
+        val groupStrategy = group?.strategy
+        return if (groupStrategy == RoutingStrategy.none) out.take(1) else out
     }
 
     // --- Voice OUTPUT resolution [T-android-voice-output-resolver] ---
