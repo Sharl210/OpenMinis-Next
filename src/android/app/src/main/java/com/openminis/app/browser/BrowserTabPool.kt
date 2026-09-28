@@ -33,7 +33,8 @@ class BrowserTabPool(private val context: Context) {
 
     companion object {
         private const val TAG = "BrowserTabPool"
-        const val MAX_TABS = 20
+        const val MAX_TABS = 10
+        internal fun canCreateTab(currentCount: Int): Boolean = currentCount < MAX_TABS
         private const val IDLE_CHECK_INTERVAL_MS = 60_000L  // 60 seconds
         /** Default idle timeout — matches iOS BrowserTabPool.idleTimeout (15 minutes). */
         const val DEFAULT_IDLE_TIMEOUT_MINUTES = 2
@@ -964,7 +965,7 @@ class BrowserTabPool(private val context: Context) {
     }
 
     private fun createTab(tabs: MutableList<Tab>, url: String? = null): Tab? {
-        if (tabs.size >= MAX_TABS) return null
+        if (!canCreateTab(tabs.size)) return null
 
         val id = nextTabId++
         val webView = WebView(context)
@@ -1015,7 +1016,7 @@ class BrowserTabPool(private val context: Context) {
 
     private suspend fun newTab(url: String?): BrowserActionResult = withContext(Dispatchers.Main) {
         val currentTabs = _tabs.value.toMutableList()
-        if (currentTabs.size >= MAX_TABS) {
+        if (!canCreateTab(currentTabs.size)) {
             return@withContext BrowserActionResult.error("Maximum $MAX_TABS tabs reached")
         }
         val tab = createTab(currentTabs, url)
@@ -1072,7 +1073,7 @@ class BrowserTabPool(private val context: Context) {
 
     private fun handleNewWindow(resultMsg: Message) {
         val currentTabs = _tabs.value.toMutableList()
-        if (currentTabs.size >= MAX_TABS) {
+        if (!canCreateTab(currentTabs.size)) {
             Log.w(TAG, "window.open rejected: max tabs reached")
             return
         }
@@ -1132,7 +1133,7 @@ class BrowserTabPool(private val context: Context) {
     /** Create a new tab from the UI (user tapped + button). */
     suspend fun newTabFromUI(): Tab? = withContext(Dispatchers.Main) {
         val currentTabs = _tabs.value.toMutableList()
-        if (currentTabs.size >= MAX_TABS) return@withContext null
+        if (!canCreateTab(currentTabs.size)) return@withContext null
         val tab = createTab(currentTabs) ?: return@withContext null
         _selectedTabId.value = tab.id
         if (tab.needsInitialBlankPage) {
