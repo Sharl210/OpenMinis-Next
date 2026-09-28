@@ -324,9 +324,10 @@ class ReadAloudPlayer(context: Context) {
     // -- internals --
 
     private suspend fun speakOne(text: String) {
-        val entry = runCatching {
-            (appContext as? MinisApp)?.providerRepository?.resolveVoiceOutputEntry()
+        val choice = runCatching {
+            (appContext as? MinisApp)?.providerRepository?.resolveVoiceOutputChoice()
         }.getOrNull()
+        val entry = choice?.entry
 
         if (entry != null) {
             val (instance, modelEntry) = entry
@@ -347,6 +348,11 @@ class ReadAloudPlayer(context: Context) {
                     false
                 }
             if (ok) return
+        }
+        if (choice?.allowSystemFallback == false) {
+            if (ownsCapsule()) VoiceOutputState.activeModelLabel.value = null
+            notifySpeechUnavailable(providerConfigured = true)
+            return
         }
         if (ownsCapsule()) VoiceOutputState.activeModelLabel.value = null // system engine
         if (!speakViaSystem(text)) {

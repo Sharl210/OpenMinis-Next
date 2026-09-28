@@ -2011,6 +2011,8 @@ class ProviderRepository(private val context: Context) {
         /** null → provider-backed; true → System TextToSpeech. */
         val isSystemEngine: Boolean,
         val entry: Pair<ProviderInstance, ModelEntry>?,
+        /** Whether a failed provider may degrade to the device speech engine. */
+        val allowSystemFallback: Boolean = true,
     ) {
         val isSystem: Boolean get() = entry == null
     }
@@ -2040,7 +2042,7 @@ class ProviderRepository(private val context: Context) {
             if (override.startsWith(SystemVoiceIds.BUILTIN_PROVIDER_ID)) {
                 return VoiceOutputChoice(isSystemEngine = true, entry = null)
             }
-            providerEntry(override)?.let { return VoiceOutputChoice(false, it) }
+            providerEntry(override)?.let { return VoiceOutputChoice(false, it, allowSystemFallback = false) }
             // Stale override (entry removed) — fall through to the group.
         }
         val gid = config.voiceOutputGroupId
@@ -2050,7 +2052,13 @@ class ProviderRepository(private val context: Context) {
                 if (memberId.startsWith(SystemVoiceIds.BUILTIN_PROVIDER_ID)) {
                     return VoiceOutputChoice(isSystemEngine = true, entry = null)
                 }
-                providerEntry(memberId)?.let { return VoiceOutputChoice(false, it) }
+                providerEntry(memberId)?.let {
+                    return VoiceOutputChoice(
+                        isSystemEngine = false,
+                        entry = it,
+                        allowSystemFallback = group.strategy != RoutingStrategy.none,
+                    )
+                }
             }
         }
         return VoiceOutputChoice(isSystemEngine = true, entry = null)
