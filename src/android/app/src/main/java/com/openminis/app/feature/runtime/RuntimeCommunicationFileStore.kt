@@ -1,5 +1,6 @@
 package com.openminis.app.feature.runtime
 
+import com.openminis.app.logging.AppLogger
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -9,18 +10,61 @@ import java.nio.charset.StandardCharsets
  * Restart-safe storage for runtime communication metadata.
  * This file deliberately stores no payload, transcript, attachment, or media bytes.
  */
-class RuntimeCommunicationFileStore(private val file: File) {
+class RuntimeCommunicationFileStore(
+    private val file: File,
+    /**
+     * Where metadata that could not be read back is reported.
+     *
+     * This read is all-or-nothing: [decode] uses `getString`/`getLong`/`enumValueOf`,
+     * all of which throw, and the loop runs inside one `buildList`, so **a single
+     * unreadable record discards every record in the file** — the caller gets the same
+     * `emptyList()` as a mailbox that was never written. Losing this file means runtime
+     * messages stop being deliverable across a restart, so that silence is worth a
+     * report even though the contract itself is not changing here.
+     *
+     * Injectable so a unit test can observe it; the default logs.
+     */
+    private val reportCorruption: (String) -> Unit = { detail -> AppLogger.warning(TAG, detail) },
+) {
     @Synchronized
     fun read(): List<RuntimeCommunicationMetadata> {
         if (!file.isFile) return emptyList()
-        return runCatching {
-            val root = JSONObject(file.readText(StandardCharsets.UTF_8))
-            require(root.optInt("schemaVersion", -1) == SCHEMA_VERSION)
-            val rows = root.optJSONArray("records") ?: JSONArray()
-            buildList(rows.length()) {
-                for (index in 0 until rows.length()) add(decode(rows.getJSONObject(index)))
+        val raw = runCatching { file.readText(StandardCharsets.UTF_8) }.getOrNull()
+        if (raw == null) {
+            reportCorruption("the communication metadata file exists but could not be read")
+            return emptyList()
+        }
+        return runCatching { parse(raw) }.getOrElse { error ->
+            reportCorruption(
+                "the communication metadata file exists but could not be decoded, so every " +
+                    "record in it is being ignored: ${error.message}",
+            )
+            emptyList()
+        }
+    }
+
+    private fun parse(raw: String): List<RuntimeCommunicationMetadata> {
+        val root = JSONObject(raw)
+        val version = root.optInt("schemaVersion", -1)
+        require(version == SCHEMA_VERSION) {
+            "its schema version is $version, not the $SCHEMA_VERSION this build reads"
+        }
+        val rows = root.optJSONArray("records") ?: JSONArray()
+        return buildList(rows.length()) {
+            for (index in 0 until rows.length()) {
+                add(
+                    runCatching { decode(rows.getJSONObject(index)) }.getOrElse { error ->
+                        // Named so the report says which record, and out of how many --
+                        // without this the log would say "undecodable" and leave the
+                        // reader to guess whether one record or two hundred were lost.
+                        throw IllegalStateException(
+                            "record $index of ${rows.length()} could not be decoded: ${error.message}",
+                            error,
+                        )
+                    },
+                )
             }
-        }.getOrElse { emptyList() }
+        }
     }
 
     @Synchronized
@@ -159,6 +203,7 @@ class RuntimeCommunicationFileStore(private val file: File) {
     }
 
     companion object {
+        private const val TAG = "RuntimeCommunicationStore"
         private const val SCHEMA_VERSION = 1
 
         /**
