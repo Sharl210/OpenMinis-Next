@@ -1447,18 +1447,7 @@ class ProviderRepository(private val context: Context) {
         val current = config.instances.toList()
         if (current.isEmpty()) return
 
-        val byId = current.associateBy { it.id }
-        val seen = LinkedHashSet<String>()
-        val reordered = ArrayList<ProviderInstance>(current.size)
-        for (id in newOrder) {
-            val inst = byId[id] ?: continue      // drop unknown ids
-            if (!seen.add(id)) continue          // drop duplicates
-            reordered.add(inst)
-        }
-        // Anything the caller didn't mention keeps its existing relative order.
-        for (inst in current) {
-            if (seen.add(inst.id)) reordered.add(inst)
-        }
+        val reordered = reorderById(current, newOrder) { it.id }
 
         // No-op guard: skip the DB write + StateFlow churn when nothing moved.
         if (reordered.map { it.id } == current.map { it.id }) return
@@ -1508,18 +1497,7 @@ class ProviderRepository(private val context: Context) {
         val current = config.modelGroups.toList()
         if (current.isEmpty()) return
 
-        val byId = current.associateBy { it.id }
-        val seen = LinkedHashSet<String>()
-        val reordered = ArrayList<ModelGroup>(current.size)
-        for (id in newOrder) {
-            val group = byId[id] ?: continue     // drop unknown ids
-            if (!seen.add(id)) continue          // drop duplicates
-            reordered.add(group)
-        }
-        // Anything the caller didn't mention keeps its existing relative order.
-        for (group in current) {
-            if (seen.add(group.id)) reordered.add(group)
-        }
+        val reordered = reorderById(current, newOrder) { it.id }
 
         // No-op guard: skip the DB write + StateFlow churn when nothing moved.
         if (reordered.map { it.id } == current.map { it.id }) return
@@ -3259,4 +3237,44 @@ internal fun resolveVisionCandidatesIn(
         if (out.none { it.second.id == m.second.id }) out.add(m)
     }
     return if (group.strategy == RoutingStrategy.none) out.take(1) else out
+}
+
+/**
+ * [T-android-reorder-shared-rule] The permutation rule behind [ProviderRepository.reorderInstances]
+ * and [ProviderRepository.reorderModelGroups], in one place.
+ *
+ * Both reorders used to carry their own copy of these forty lines, and the JVM tests
+ * carried a **third** copy each — so the tests pinned a transcription of the rule
+ * rather than the rule, and a drift between them was invisible by construction.
+ * Extracting it here removes the production duplication and lets the tests call the
+ * real thing.
+ *
+ * Contract (what the UI relies on):
+ *  - ids are taken in [newOrder] order;
+ *  - ids in [newOrder] that are not in [current] are dropped, so a stale drag racing
+ *    a delete cannot resurrect an entry;
+ *  - duplicate ids in [newOrder] are collapsed;
+ *  - entries the caller did not mention keep their existing relative order and are
+ *    appended, which is how a drag inside one section leaves the other sections alone.
+ *
+ * [idOf] exists so the two element types (provider instances, model groups) share the
+ * rule; pass `{ it }` when the elements already *are* their ids.
+ *
+ * This is pure: it neither mutates [current] nor touches persistence. Callers own the
+ * no-op guard, the `clear()`/`addAll()` under the config lock, and the save.
+ */
+internal fun <T> reorderById(current: List<T>, newOrder: List<String>, idOf: (T) -> String): List<T> {
+    val byId = current.associateBy(idOf)
+    val seen = LinkedHashSet<String>()
+    val reordered = ArrayList<T>(current.size)
+    for (id in newOrder) {
+        val item = byId[id] ?: continue      // drop unknown ids
+        if (!seen.add(id)) continue          // drop duplicates
+        reordered.add(item)
+    }
+    // Anything the caller didn't mention keeps its existing relative order.
+    for (item in current) {
+        if (seen.add(idOf(item))) reordered.add(item)
+    }
+    return reordered
 }

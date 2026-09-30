@@ -1,5 +1,7 @@
 package com.openminis.app.data
 
+import com.openminis.app.data.repository.reorderById
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertEquals
 import org.junit.Test
 
@@ -21,21 +23,14 @@ import org.junit.Test
  */
 class ModelGroupReorderTest {
 
-    /** The exact algorithm implemented in ProviderRepository.reorderModelGroups. */
-    private fun reorder(current: List<String>, newOrder: List<String>): List<String> {
-        val known = current.toSet()
-        val seen = LinkedHashSet<String>()
-        val out = ArrayList<String>(current.size)
-        for (id in newOrder) {
-            if (id !in known) continue      // drop unknown ids
-            if (!seen.add(id)) continue     // drop duplicates
-            out.add(id)
-        }
-        for (id in current) {
-            if (seen.add(id)) out.add(id)
-        }
-        return out
-    }
+    /**
+     * The ids are their own keys, so this adapter just supplies `idOf`. The rule
+     * itself is [reorderById] — production, not a transcription of it: this used
+     * to carry a copy of the algorithm, which meant a drift between the copy and
+     * the real method was invisible by construction.
+     */
+    private fun reorder(current: List<String>, newOrder: List<String>): List<String> =
+        reorderById(current, newOrder) { it }
 
     @Test
     fun `a full permutation is applied verbatim`() {
@@ -76,5 +71,17 @@ class ModelGroupReorderTest {
         val result = reorder(current, newOrder = listOf("d", "ghost", "b"))
         assertEquals(current.sorted(), result.sorted())
         assertEquals(current.size, result.size)
+    }
+
+    private data class Group(val id: String, val name: String)
+
+    @Test
+    fun `grouping reorder keeps the group objects themselves`() {
+        val g1 = Group("g1", "Fast")
+        val g2 = Group("g2", "Slow")
+        val out = reorderById(listOf(g1, g2), listOf("g2", "g1")) { it.id }
+        assertEquals(listOf("g2", "g1"), out.map { it.id })
+        assertSame(g2, out[0])
+        assertSame(g1, out[1])
     }
 }

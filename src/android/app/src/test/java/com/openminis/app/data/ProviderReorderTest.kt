@@ -1,5 +1,7 @@
 package com.openminis.app.data
 
+import com.openminis.app.data.repository.reorderById
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertEquals
 import org.junit.Test
 
@@ -23,21 +25,14 @@ import org.junit.Test
  */
 class ProviderReorderTest {
 
-    /** The exact algorithm implemented in ProviderRepository.reorderInstances. */
-    private fun reorder(current: List<String>, newOrder: List<String>): List<String> {
-        val known = current.toSet()
-        val seen = LinkedHashSet<String>()
-        val out = ArrayList<String>(current.size)
-        for (id in newOrder) {
-            if (id !in known) continue      // drop unknown ids
-            if (!seen.add(id)) continue     // drop duplicates
-            out.add(id)
-        }
-        for (id in current) {
-            if (seen.add(id)) out.add(id)
-        }
-        return out
-    }
+    /**
+     * The ids are their own keys, so this adapter just supplies `idOf`. The rule
+     * itself is [reorderById] — production, not a transcription of it: this used
+     * to carry a copy of the algorithm, which meant a drift between the copy and
+     * the real method was invisible by construction.
+     */
+    private fun reorder(current: List<String>, newOrder: List<String>): List<String> =
+        reorderById(current, newOrder) { it }
 
     @Test
     fun `a full permutation is applied verbatim`() {
@@ -93,5 +88,25 @@ class ProviderReorderTest {
             current.sorted(), result.sorted(),
         )
         assertEquals(current.size, result.size)
+    }
+
+    /** A tiny carrier so the test can ask about *object* identity, not just ids. */
+    private data class Item(val id: String, val label: String)
+
+    @Test
+    fun `the returned entries are the same objects, not rebuilt from their ids`() {
+        val a = Item("a", "Alpha")
+        val b = Item("b", "Beta")
+        val out = reorderById(listOf(a, b), listOf("b")) { it.id }
+        assertEquals(listOf("b", "a"), out.map { it.id })
+        assertSame("a reordered entry must be the entry itself", b, out[0])
+        assertSame("an unmentioned entry must be the entry itself", a, out[1])
+    }
+
+    @Test
+    fun `the rule is a pure function - the caller's list is left alone`() {
+        val current = listOf(Item("a", "Alpha"), Item("b", "Beta"))
+        reorderById(current, listOf("b", "a")) { it.id }
+        assertEquals("the input list must not be reordered in place", listOf("a", "b"), current.map { it.id })
     }
 }
