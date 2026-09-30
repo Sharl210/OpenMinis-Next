@@ -257,36 +257,43 @@ class AgentToolExecutor(
 
         val json = runCatching {
             if (searching) {
-                val hits = source.search(conversationId, keyword, limit)
-                val kept = ConversationQueryPolicy.fitToBudget(hits, budget)
+                val slice = source.search(conversationId, keyword, offset, limit)
+                val kept = ConversationQueryPolicy.fitToBudget(slice.items, budget)
                 ConversationQueryPolicy.resultJson(
                     conversationIdRaw = conversationId,
                     messages = kept,
-                    totalMatching = hits.size,
-                    // Search paging runs through the same cursor so a caller can
-                    // walk a long result set without a second mechanism.
-                    nextCursor = (offset + kept.size)
-                        .takeIf { kept.isNotEmpty() && kept.size == limit }
-                        ?.let { ConversationQueryPolicy.encodeCursor(it) },
+                    // Hits found in the window THIS call examined. Not the
+                    // session's match total — see resultJson's contract.
+                    totalMatching = slice.items.size,
+                    // Derived from where the scan stopped, not from what was
+                    // delivered: `offset + kept.size` mixed the two index spaces
+                    // and produced a cursor that stood still or went backwards.
+                    nextCursor = ConversationQueryPolicy.nextCursor(slice, kept.size, offset),
                     budgetChars = budget,
                     mode = "search",
                 )
             } else {
                 val total = source.count(conversationId)
-                val items = source.page(
+                val slice = source.page(
                     conversationId,
                     offset,
                     limit,
                     ConversationQueryPolicy.MESSAGE_TEXT_MAX,
                 )
-                val kept = ConversationQueryPolicy.fitToBudget(items, budget)
+                val kept = ConversationQueryPolicy.fitToBudget(slice.items, budget)
                 ConversationQueryPolicy.resultJson(
                     conversationIdRaw = conversationId,
                     messages = kept,
                     totalMatching = total,
-                    nextCursor = (offset + kept.size)
-                        .takeIf { it < total }
-                        ?.let { ConversationQueryPolicy.encodeCursor(it) },
+                    // `total` is a raw row count and so is `resumeAfter`, so they
+                    // share an index space and the comparison is exact — no extra
+                    // round trip for a session whose size divides evenly.
+                    nextCursor = ConversationQueryPolicy.nextCursor(
+                        slice,
+                        kept.size,
+                        offset,
+                        totalRows = total,
+                    ),
                     budgetChars = budget,
                     mode = "page",
                 )

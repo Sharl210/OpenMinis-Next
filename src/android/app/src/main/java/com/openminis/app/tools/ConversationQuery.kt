@@ -1,6 +1,7 @@
 package com.openminis.app.tools
 
 import com.openminis.app.data.repository.ChatRepository
+import com.openminis.app.data.repository.MessageWindow
 import com.openminis.app.feature.runtime.ConversationIdProtocol
 import com.openminis.app.feature.runtime.RuntimeCommunicationCursor
 import com.openminis.app.feature.runtime.RuntimeCommunicationDirectory
@@ -77,6 +78,38 @@ data class ConversationMessage(
  * testable on the JVM without Room (see [ConversationQueryPolicy]), while
  * production binds [ChatRepositoryConversationSource].
  */
+/**
+ * One window of the transcript, plus everything needed to continue from exactly
+ * where it stopped.
+ *
+ * These travel together because the cursor must not be derivable from anything
+ * the caller already holds. The previous code made one from `offset + kept.size`,
+ * which mixed two index spaces: `kept.size` counts DELIVERED items while a cursor
+ * has to name a position in the UNDERLYING scan. The two diverge as soon as the
+ * budget trims a page or a row is dropped during the parse — and the result was a
+ * cursor that stood still (an all-blank window returned the same token forever)
+ * or went backwards (a budget-trimmed page re-delivered what it had just sent).
+ */
+data class ConversationSlice(
+    /** This window's messages, in the order the caller should render them. */
+    val items: List<ConversationMessage>,
+    /**
+     * Parallel to [items]: the offset to resume from when the caller delivers
+     * only the first `k` of them — `resumeOffsets[k]` is where the first
+     * UNDELIVERED item sits.
+     */
+    val resumeOffsets: List<Int>,
+    /** The offset to resume from once every item here has been delivered. */
+    val resumeAfter: Int,
+    /** True when the underlying scan stopped with rows still unexamined. */
+    val moreMayRemain: Boolean,
+)
+
+/**
+ * The narrow read port. An interface so the tool's paging/budget behaviour is
+ * testable on the JVM without Room (see [ConversationQueryPolicy]), while
+ * production binds [ChatRepositoryConversationSource].
+ */
 interface ConversationTranscriptSource {
     suspend fun count(sessionId: String): Int
 
@@ -85,9 +118,20 @@ interface ConversationTranscriptSource {
         offset: Int,
         limit: Int,
         maxChars: Int,
-    ): List<ConversationMessage>
+    ): ConversationSlice
 
-    suspend fun search(sessionId: String, keyword: String, limit: Int): List<ConversationMessage>
+    /**
+     * Search hits from row [offset] onward. [offset] is a raw-row position, not a
+     * hit index, because the parse-time filtering that decides which rows become
+     * hits happens after the scan. Search runs through the same cursor as [page]
+     * so a caller can walk a long result set without a second mechanism.
+     */
+    suspend fun search(
+        sessionId: String,
+        keyword: String,
+        offset: Int,
+        limit: Int,
+    ): ConversationSlice
 }
 
 /** Production binding: the live chat store, through its existing readers. */
@@ -102,30 +146,31 @@ class ChatRepositoryConversationSource(
         offset: Int,
         limit: Int,
         maxChars: Int,
-    ): List<ConversationMessage> =
-        chatRepository.loadMessagePage(sessionId, offset, limit, maxChars)
-            .map {
-                ConversationMessage(
-                    messageId = it.messageId,
-                    role = it.role,
-                    createdAtMillis = it.createdAt,
-                    text = it.text,
-                    truncated = it.truncated,
-                )
-            }
+    ): ConversationSlice =
+        chatRepository.loadMessageWindow(sessionId, offset, limit, maxChars).toSlice(offset) {
+            ConversationMessage(
+                messageId = it.messageId,
+                role = it.role,
+                createdAtMillis = it.createdAt,
+                text = it.text,
+                truncated = it.truncated,
+            )
+        }
 
     override suspend fun search(
         sessionId: String,
         keyword: String,
+        offset: Int,
         limit: Int,
-    ): List<ConversationMessage> =
-        chatRepository.searchMessages(
+    ): ConversationSlice =
+        chatRepository.searchMessageWindow(
             sessionIds = listOf(sessionId),
             keywords = listOf(keyword),
             limit = limit,
             startMs = null,
             endMs = null,
-        ).map {
+            offset = offset,
+        ).toSlice(offset) {
             ConversationMessage(
                 messageId = it.messageId,
                 role = it.role,
@@ -138,6 +183,20 @@ class ChatRepositoryConversationSource(
             )
         }
 }
+
+/**
+ * Rebases a window's row indices into absolute offsets, so that everything above
+ * this line speaks one index space: positions in the underlying scan.
+ */
+private fun <T> MessageWindow<T>.toSlice(
+    offset: Int,
+    map: (T) -> ConversationMessage,
+): ConversationSlice = ConversationSlice(
+    items = items.map(map),
+    resumeOffsets = windowIndices.map { offset + it },
+    resumeAfter = offset + rowsExamined,
+    moreMayRemain = moreMayRemain,
+)
 
 /**
  * The pure half of `conversation_query`: argument validation, page sizing,
@@ -177,6 +236,54 @@ object ConversationQueryPolicy {
 
     fun encodeCursor(offset: Int): RuntimeCommunicationCursor =
         RuntimeCommunicationCursor("m$offset")
+
+    /**
+     * The cursor to hand back, derived from where the scan actually stopped.
+     *
+     * `null` means "there is nothing after what you just got". That is the one
+     * claim [resultJson]'s contract forbids making when it is not true, and the
+     * old predicate — `kept.size == limit` for search, `offset + kept.size < total`
+     * for page — made it from the wrong quantity: both compared DELIVERED items
+     * against a scan-level bound, so a page the budget had trimmed looked like the
+     * end of the data.
+     *
+     * [deliveredCount] is how many of [slice]'s items survived the budget, so the
+     * first undelivered one sits at `resumeOffsets[deliveredCount]`. Trimming can
+     * therefore leave something behind even when the scan reached the end: the
+     * budget's leftovers and the scan's leftovers are both leftovers, and the old
+     * predicates only ever looked at the second kind.
+     *
+     * The last guard is not defensive. A cursor is a promise that asking again
+     * with it returns something NEW; a cursor equal to the offset that produced
+     * this window breaks that promise, and a caller that trusts it loops forever
+     * on one page. An all-blank page used to do exactly that — every row dropped
+     * during the parse, so `offset + 0` came back unchanged, forever. Refusing to
+     * emit it turns a silent infinite loop into a clean stop.
+     *
+     * [totalRows] is the session's raw row count, when the caller has it. A window
+     * that filled up cannot tell "there are more rows" from "that was exactly the
+     * last one", so without this bound an exactly-divisible session costs one
+     * extra round trip that returns nothing. It is deliberately NOT accepted for
+     * search: there `total_matching` counts hits in the window, and comparing a
+     * scan position against a hit count would be the same category error as the
+     * bug this function replaces.
+     */
+    fun nextCursor(
+        slice: ConversationSlice,
+        deliveredCount: Int,
+        offset: Int,
+        totalRows: Int? = null,
+    ): RuntimeCommunicationCursor? {
+        val trimmed = deliveredCount < slice.items.size
+        val hasMore = when {
+            trimmed -> true
+            totalRows != null -> slice.resumeAfter < totalRows
+            else -> slice.moreMayRemain
+        }
+        if (!hasMore) return null
+        val resume = if (trimmed) slice.resumeOffsets[deliveredCount] else slice.resumeAfter
+        return resume.takeIf { it > offset }?.let { encodeCursor(it) }
+    }
 
     /**
      * Trim [messages] so their combined text fits [budgetChars].
@@ -225,7 +332,17 @@ object ConversationQueryPolicy {
     /**
      * Assemble the tool result. [nextCursor] is non-null whenever anything was
      * left behind — either messages the budget dropped or rows the page did not
-     * reach — so the model is never told "that's all" when it is not.
+     * reach — so the model is never told "that's all" when it is not. Compute it
+     * with [nextCursor] rather than by hand: the two conditions are not
+     * expressible in terms of what was delivered.
+     *
+     * [totalMatching] deliberately means two different things, because the two
+     * modes know different things. In `page` mode it is the number of rows in the
+     * session, which is exact. In `search` mode it is the number of hits found in
+     * the window this call actually examined — NOT a count of every match in the
+     * session, which would need a second full scan. A caller that needs to know
+     * whether search's count is final should page until `next_cursor` is null
+     * rather than compare against it.
      */
     fun resultJson(
         conversationIdRaw: String,

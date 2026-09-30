@@ -510,10 +510,42 @@ class AgentToolExecutorIdentityForgeryTest {
             offset: Int,
             limit: Int,
             maxChars: Int,
-        ): List<ConversationMessage> = rows.drop(offset).take(limit)
+        ): ConversationSlice {
+            val window = rows.drop(offset).take(limit)
+            return ConversationSlice(
+                items = window,
+                resumeOffsets = window.indices.map { offset + it },
+                resumeAfter = offset + window.size,
+                moreMayRemain = window.size >= limit,
+            )
+        }
 
-        override suspend fun search(sessionId: String, keyword: String, limit: Int): List<ConversationMessage> =
-            rows.filter { it.text.contains(keyword, ignoreCase = true) }.take(limit)
+        override suspend fun search(
+            sessionId: String,
+            keyword: String,
+            offset: Int,
+            limit: Int,
+        ): ConversationSlice {
+            val scanned = rows.drop(offset)
+            val hits = mutableListOf<ConversationMessage>()
+            val indices = mutableListOf<Int>()
+            var consumed = scanned.size
+            for ((i, r) in scanned.withIndex()) {
+                if (!r.text.contains(keyword, ignoreCase = true)) continue
+                hits += r
+                indices += i
+                if (hits.size >= limit) {
+                    consumed = i + 1
+                    break
+                }
+            }
+            return ConversationSlice(
+                items = hits,
+                resumeOffsets = indices.map { offset + it },
+                resumeAfter = offset + consumed,
+                moreMayRemain = consumed < scanned.size,
+            )
+        }
     }
 
     /**

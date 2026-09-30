@@ -47,35 +47,86 @@ class AgentToolExecutorConversationQueryTest {
     private class FakeSource(
         private val rows: List<ConversationMessage>,
         private val label: String = "conv",
+        /**
+         * Row indices the store drops while parsing — a `parts_json` that extracts
+         * to blank text, or a LIKE hit on tool-call metadata that yields no
+         * snippet. They still occupy a slot in the window, which is exactly what
+         * makes "how many items came back" a different number from "how far the
+         * scan got".
+         */
+        private val hidden: Set<Int> = emptySet(),
     ) : ConversationTranscriptSource {
         var lastPageOffset = -1
         var lastPageLimit = -1
+        var lastSearchOffset = -1
         var lastSearchKeyword: String? = null
 
         override suspend fun count(sessionId: String): Int = rows.size
 
+        // This fake models the store's WINDOW semantics, not just its items: it
+        // reports which window row each item came from, how many rows were
+        // examined, and whether the scan filled the window. A fake that returned a
+        // bare list would let the tool compute a cursor from `items.size` and still
+        // pass — which is exactly the bug these tests exist to catch, so the resume
+        // bookkeeping is part of the contract being faked, not test scaffolding.
         override suspend fun page(
             sessionId: String,
             offset: Int,
             limit: Int,
             maxChars: Int,
-        ): List<ConversationMessage> {
+        ): ConversationSlice {
             lastPageOffset = offset
             lastPageLimit = limit
-            return rows.drop(offset).take(limit).map {
-                it.copy(text = it.text.take(maxChars), truncated = it.text.length > maxChars)
+            val window = rows.drop(offset).take(limit)
+            val items = mutableListOf<ConversationMessage>()
+            val indices = mutableListOf<Int>()
+            window.forEachIndexed { i, row ->
+                if (offset + i in hidden) return@forEachIndexed
+                items += row.copy(
+                    text = row.text.take(maxChars),
+                    truncated = row.text.length > maxChars,
+                )
+                indices += i
             }
+            return ConversationSlice(
+                items = items,
+                resumeOffsets = indices.map { offset + it },
+                resumeAfter = offset + window.size,
+                moreMayRemain = window.size >= limit,
+            )
         }
 
         override suspend fun search(
             sessionId: String,
             keyword: String,
+            offset: Int,
             limit: Int,
-        ): List<ConversationMessage> {
+        ): ConversationSlice {
             lastSearchKeyword = keyword
-            return rows.filter { it.text.contains(keyword, ignoreCase = true) }
-                .take(limit)
-                .map { it.copy(text = it.text.take(80), truncated = true) }
+            lastSearchOffset = offset
+            // The whole remainder is one window here (a fake has no reason to
+            // over-fetch), so "more may remain" is exactly "stopped before the end
+            // of everything it could see".
+            val scanned = rows.drop(offset)
+            val hits = mutableListOf<ConversationMessage>()
+            val indices = mutableListOf<Int>()
+            var consumed = scanned.size
+            for ((i, r) in scanned.withIndex()) {
+                if (offset + i in hidden) continue
+                if (!r.text.contains(keyword, ignoreCase = true)) continue
+                hits += r.copy(text = r.text.take(80), truncated = true)
+                indices += i
+                if (hits.size >= limit) {
+                    consumed = i + 1
+                    break
+                }
+            }
+            return ConversationSlice(
+                items = hits,
+                resumeOffsets = indices.map { offset + it },
+                resumeAfter = offset + consumed,
+                moreMayRemain = consumed < scanned.size,
+            )
         }
 
         fun unusedLabel(): String = label
@@ -162,6 +213,151 @@ class AgentToolExecutorConversationQueryTest {
         // always serialised (with a JSON null value when there is nothing left), so the
         // claim to check is the VALUE, not the presence of the key.
         assertTrue("an exhausted read must not promise another page", page2.isNull("next_cursor"))
+    }
+
+    /**
+     * The R43 defect, on the branch that had no offset to pass.
+     *
+     * Scroll back through `query` until the cursor runs out, and read every
+     * `message_id` that comes back. The old search branch called the store with no
+     * offset at all and then built the next cursor from `offset + kept.size` — a
+     * number that grew while the query it described stayed at the top of the result
+     * set. So each page repeated the previous one and the cursor never became null:
+     * a caller following it reads the same rows forever and never reaches the hits
+     * past the first page.
+     *
+     * The assertion is the whole walk, so it fails on a repeat, on a gap, and on a
+     * walk that does not end.
+     */
+    @Test
+    fun `search paging walks every hit exactly once and then stops`() = runBlocking {
+        val executor = executor(FakeSource((0 until 5).map(::message)))
+        val seen = mutableListOf<String>()
+
+        var cursor: String? = null
+        var rounds = 0
+        while (true) {
+            rounds++
+            assertTrue("paging must terminate; round $rounds already means it does not", rounds <= 6)
+            var args = "{\"tool_title\":\"Read\",\"conversation_id\":\"minis-conv-$raw\"," +
+                "\"query\":\"line\",\"limit\":2"
+            if (cursor != null) args += ",\"cursor\":\"$cursor\""
+            args += "}"
+
+            val json = run(executor, args)
+            assertTrue(json.getBoolean("ok"))
+            val messages = json.getJSONArray("messages")
+            for (i in 0 until messages.length()) {
+                seen += messages.getJSONObject(i).getString("message_id")
+            }
+            if (json.isNull("next_cursor")) break
+            cursor = json.getString("next_cursor")
+        }
+
+        assertEquals(
+            "every hit exactly once, in row order",
+            (0 until 5).map { "minis-msg-message-$it" },
+            seen,
+        )
+    }
+
+    /**
+     * A search page the budget shortened still has rows behind it.
+     *
+     * The old predicate was `kept.size == limit`, so trimming a page made the tool
+     * answer "there is nothing more" — the exact claim `resultJson`'s contract
+     * forbids while messages are being held back. Nothing about a short page implies
+     * an empty result set; only the scan position does.
+     */
+    @Test
+    fun `a search page the budget trimmed must not claim there is nothing left`() = runBlocking {
+        val long = "needle " + "x".repeat(600)
+        val source = FakeSource((0 until 3).map { message(it).copy(text = long) })
+
+        val json = run(
+            executor(source),
+            "{\"tool_title\":\"Search\",\"conversation_id\":\"minis-conv-$raw\"," +
+                "\"query\":\"needle\",\"limit\":20,\"result_budget_chars\":40}",
+        )
+
+        assertEquals(1, json.getInt("returned"))
+        assertFalse(
+            "the budget dropped two hits, so a cursor must say more remains",
+            json.isNull("next_cursor"),
+        )
+    }
+
+    /**
+     * A window whose rows are all dropped during the parse returns nothing — but the
+     * scan moved, and the next cursor has to reflect that.
+     *
+     * Deriving it from the delivered count yields `offset + 0`, i.e. the same token
+     * the caller just used: every subsequent call asks the identical question and
+     * gets the identical empty page, forever. The window examined three rows here,
+     * so the honest resume point is three rows in.
+     */
+    @Test
+    fun `an all-hidden window advances the cursor instead of looping on it`() = runBlocking {
+        val executor = executor(FakeSource((0 until 6).map(::message), hidden = setOf(0, 1, 2)))
+
+        val page1 = run(
+            executor,
+            """{"tool_title":"Read","conversation_id":"minis-conv-$raw","limit":3}""",
+        )
+        assertEquals(0, page1.getInt("returned"))
+        assertEquals(
+            "three rows were examined, so the next window starts after them — not at the same place",
+            "m3",
+            page1.getString("next_cursor"),
+        )
+
+        val page2 = run(
+            executor,
+            """{"tool_title":"Read","conversation_id":"minis-conv-$raw","limit":3,"cursor":"m3"}""",
+        )
+        assertEquals(3, page2.getInt("returned"))
+        assertTrue("the second window is the end of the conversation", page2.isNull("next_cursor"))
+    }
+
+    /**
+     * The same walk, with rows dropped in the MIDDLE of windows rather than in one
+     * leading block.
+     *
+     * Here the two index spaces diverge by one row instead of by a whole page, which
+     * is what makes the mistake survivable-looking: `offset + delivered` still lands
+     * on a real row, just the wrong one, so the walk keeps making progress while
+     * quietly re-sending rows it already sent. Budgeted to one item per page on
+     * purpose, so every page is trimmed and every resume point is exercised.
+     */
+    @Test
+    fun `paging with hidden rows repeats nothing, skips nothing and terminates`() = runBlocking {
+        val executor = executor(FakeSource((0 until 6).map(::message), hidden = setOf(1, 4)))
+        val seen = mutableListOf<String>()
+
+        var cursor: String? = null
+        var rounds = 0
+        while (true) {
+            rounds++
+            assertTrue("paging must terminate; round $rounds", rounds <= 8)
+            var args = "{\"tool_title\":\"Read\",\"conversation_id\":\"minis-conv-$raw\"," +
+                "\"limit\":3,\"result_budget_chars\":6"
+            if (cursor != null) args += ",\"cursor\":\"$cursor\""
+            args += "}"
+
+            val json = run(executor, args)
+            val messages = json.getJSONArray("messages")
+            for (i in 0 until messages.length()) {
+                seen += messages.getJSONObject(i).getString("message_id").removePrefix("minis-msg-")
+            }
+            if (json.isNull("next_cursor")) break
+            cursor = json.getString("next_cursor")
+        }
+
+        assertEquals(
+            "rows 1 and 4 are the ones the store drops; the rest must arrive once each, in order",
+            listOf("message-0", "message-2", "message-3", "message-5"),
+            seen,
+        )
     }
 
     @Test

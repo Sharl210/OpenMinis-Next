@@ -757,6 +757,10 @@ class ChatRepository(internal val dao: ChatDao) {
      * Kotlin side, drop rows whose extracted text is blank or whose
      * keyword didn't survive the parse, and trim to [limit] on the way
      * out. Mirrors iOS ChatStore.searchMessages.
+     *
+     * [offset] is a RAW ROW offset into the result set, applied by SQL before any
+     * of that parse-time filtering runs. It is therefore NOT a hit index, and it
+     * is not interchangeable with one — see [MessageWindow].
      */
     suspend fun searchMessages(
         sessionIds: List<String>?,
@@ -764,8 +768,23 @@ class ChatRepository(internal val dao: ChatDao) {
         limit: Int,
         startMs: Long?,
         endMs: Long?,
-    ): List<MessageSearchMatch> {
-        if (keywords.isEmpty()) return emptyList()
+        // Appended last and defaulted so the existing positional call in
+        // SessionsOffloadHandler keeps its meaning; inserting it before
+        // `startMs`/`endMs` would silently rebind them.
+        offset: Int = 0,
+    ): List<MessageSearchMatch> =
+        searchMessageWindow(sessionIds, keywords, limit, startMs, endMs, offset).items
+
+    /** [searchMessages] plus the bookkeeping needed to resume exactly; see [MessageWindow]. */
+    suspend fun searchMessageWindow(
+        sessionIds: List<String>?,
+        keywords: List<String>,
+        limit: Int,
+        startMs: Long?,
+        endMs: Long?,
+        offset: Int = 0,
+    ): MessageWindow<MessageSearchMatch> {
+        if (keywords.isEmpty()) return MessageWindow(emptyList(), emptyList(), 0, false)
         val conditions = mutableListOf<String>()
         val args = mutableListOf<Any>()
 
@@ -786,28 +805,46 @@ class ChatRepository(internal val dao: ChatDao) {
             args += endMs
         }
         val where = conditions.joinToString(" AND ")
+        val window = limit * 3
+        val safeOffset = offset.coerceAtLeast(0)
         val sql = """
             SELECT m.session_id, m.id, m.role, m.created_at, m.parts_json
             FROM messages m
             WHERE $where
-            ORDER BY m.created_at DESC
+            ORDER BY m.created_at DESC, m.sort_order ASC
             LIMIT ?
+            OFFSET ?
         """.trimIndent()
-        args += (limit * 3)
+        args += window
+        args += safeOffset
 
         val rows = dao.runMessageSearchQuery(
             androidx.sqlite.db.SimpleSQLiteQuery(sql, args.toTypedArray()),
         )
         val out = mutableListOf<MessageSearchMatch>()
-        for (r in rows) {
+        val indices = mutableListOf<Int>()
+        var consumed = rows.size
+        var brokeEarly = false
+        for ((i, r) in rows.withIndex()) {
             val text = extractTextForOffload(r.partsJson)
             if (text.isBlank()) continue
             val snip = keywordSnippet(text, keywords, SNIPPET_MAX)
             if (snip.isBlank()) continue
             out += MessageSearchMatch(r.sessionId, r.id, r.role, r.createdAt, snip)
-            if (out.size >= limit) break
+            indices += i
+            if (out.size >= limit) {
+                // Stopped at its own cap, so rows past `i` were never looked at.
+                consumed = i + 1
+                brokeEarly = true
+                break
+            }
         }
-        return out
+        return MessageWindow(
+            items = out,
+            windowIndices = indices,
+            rowsExamined = consumed,
+            moreMayRemain = brokeEarly || rows.size >= window,
+        )
     }
 
     /**
@@ -829,22 +866,42 @@ class ChatRepository(internal val dao: ChatDao) {
         // side, so existing callers keep the previous behaviour untouched.
         startMs: Long? = null,
         endMs: Long? = null,
-    ): List<MessagePageItem> {
+    ): List<MessagePageItem> =
+        loadMessageWindow(sessionId, offset, limit, maxChars, startMs, endMs).items
+
+    /** [loadMessagePage] plus the bookkeeping needed to resume exactly; see [MessageWindow]. */
+    suspend fun loadMessageWindow(
+        sessionId: String,
+        offset: Int,
+        limit: Int,
+        maxChars: Int = MESSAGE_TEXT_MAX,
+        startMs: Long? = null,
+        endMs: Long? = null,
+    ): MessageWindow<MessagePageItem> {
         val rows = if (startMs == null && endMs == null) {
             dao.loadMessagesPage(sessionId, offset, limit)
         } else {
             dao.loadMessagesPageInRange(sessionId, offset, limit, startMs, endMs)
         }
-        return rows.mapNotNull { e ->
+        val items = mutableListOf<MessagePageItem>()
+        val indices = mutableListOf<Int>()
+        rows.forEachIndexed { i, e ->
             val text = extractTextForOffload(e.partsJson)
-            if (text.isBlank()) return@mapNotNull null
-            MessagePageItem(
+            if (text.isBlank()) return@forEachIndexed
+            items += MessagePageItem(
                 e.id, e.role, e.createdAt, text.take(maxChars),
                 // Mark messages that exceeded the cap so the caller can emit
                 // "truncated": true (mirrors iOS SessionsOffloadBridge).
                 truncated = text.length > maxChars,
             )
+            indices += i
         }
+        return MessageWindow(
+            items = items,
+            windowIndices = indices,
+            rowsExamined = rows.size,
+            moreMayRemain = rows.size >= limit,
+        )
     }
 
     suspend fun messageCount(sessionId: String): Int = dao.messageCountForSession(sessionId)
@@ -1169,4 +1226,31 @@ data class MessagePageItem(
     // [T-android-sessions-cli-full] True when the stored text exceeded the
     // requested cap and [text] is a prefix. Surfaced as "truncated": true.
     val truncated: Boolean = false,
+)
+
+/**
+ * One window of rows, plus the bookkeeping a caller needs to continue from
+ * exactly where this window stopped.
+ *
+ * Rows are dropped during the parse — a blank `parts_json` extracts to no text,
+ * and a LIKE hit on tool-call metadata produces no snippet — so the items that
+ * survive are NOT a contiguous run of the underlying scan, and "the count of
+ * items I got" cannot be turned back into "where the scan should resume".
+ * [windowIndices] keeps that mapping, and [rowsExamined] keeps the other half.
+ *
+ * Both halves are needed because the two ways a page can be short mean opposite
+ * things: the budget dropped items (there is more to send, right here), or the
+ * scan ran out (there is not). Reporting only `items.size` conflates them.
+ */
+data class MessageWindow<T>(
+    val items: List<T>,
+    /** Parallel to [items]: each item's 0-based row index within this window. */
+    val windowIndices: List<Int>,
+    /** Rows consumed from the window, i.e. the index just past the last one read. */
+    val rowsExamined: Int,
+    /**
+     * True when the scan stopped with rows still unexamined — either because it
+     * filled the window, or because it hit its own cap before the window ended.
+     */
+    val moreMayRemain: Boolean,
 )

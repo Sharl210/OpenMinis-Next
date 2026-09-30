@@ -4,6 +4,7 @@ import com.openminis.app.feature.runtime.RuntimeCommunicationCursor
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -68,6 +69,114 @@ class ConversationQueryPolicyTest {
         assertEquals(0, ConversationQueryPolicy.decodeCursor(null).getOrThrow())
         assertTrue(ConversationQueryPolicy.decodeCursor(RuntimeCommunicationCursor("garbage")).isFailure)
         assertTrue(ConversationQueryPolicy.decodeCursor(RuntimeCommunicationCursor("m-1")).isFailure)
+    }
+
+    // ─── Where the cursor is allowed to point ────────────────────────────
+    //
+    // The cursor names a position in the UNDERLYING scan. Twice now it has been
+    // computed instead from what was DELIVERED — `offset + kept.size` — and the two
+    // are not the same number whenever a window is shorter than the rows it read
+    // (the parse drops blank rows; the budget drops the tail). The first version of
+    // that mistake made search return the same page forever; the second made a
+    // paging walk step backwards over rows it had already sent.
+
+    private fun slice(
+        items: List<ConversationMessage>,
+        resumeOffsets: List<Int>,
+        resumeAfter: Int,
+        moreMayRemain: Boolean,
+    ) = ConversationSlice(items, resumeOffsets, resumeAfter, moreMayRemain)
+
+    @Test
+    fun `a scan that reached the end with nothing trimmed reports no more`() {
+        assertNull(
+            ConversationQueryPolicy.nextCursor(
+                slice(listOf(message("a", "x")), listOf(7), resumeAfter = 8, moreMayRemain = false),
+                deliveredCount = 1,
+                offset = 7,
+            ),
+        )
+    }
+
+    @Test
+    fun `a window the budget trimmed reports more even at the end of the scan`() {
+        val cursor = ConversationQueryPolicy.nextCursor(
+            slice(
+                listOf(message("a", "x"), message("b", "y")),
+                listOf(5, 9),
+                resumeAfter = 12,
+                moreMayRemain = false,
+            ),
+            deliveredCount = 1,
+            offset = 5,
+        )
+
+        assertEquals(
+            "the first UNDELIVERED item sits at 9; offset + delivered would say 6 and re-send",
+            "m9",
+            cursor?.token,
+        )
+    }
+
+    @Test
+    fun `a window that yielded nothing but did examine rows still advances`() {
+        assertEquals(
+            "m3",
+            ConversationQueryPolicy.nextCursor(
+                slice(emptyList(), emptyList(), resumeAfter = 3, moreMayRemain = true),
+                deliveredCount = 0,
+                offset = 0,
+            )?.token,
+        )
+    }
+
+    @Test
+    fun `a cursor is never emitted that cannot move the scan forward`() {
+        val a = message("a", "x")
+        val movable = listOf(
+            slice(listOf(a), listOf(4), resumeAfter = 12, moreMayRemain = true),
+            slice(listOf(a, a), listOf(4, 6), resumeAfter = 12, moreMayRemain = true),
+        )
+        for (case in movable) {
+            val cursor = ConversationQueryPolicy.nextCursor(case, case.items.size, offset = 4)
+            assertTrue("a window with rows left must hand back a cursor", cursor != null)
+            assertTrue(
+                "${cursor?.token} must land past offset 4 or the caller loops on this page",
+                ConversationQueryPolicy.decodeCursor(cursor!!).getOrThrow() > 4,
+            )
+        }
+
+        // The pathological shape: the source says it is still standing exactly
+        // where it began. Following that cursor asks the same question forever, so
+        // the only safe answer is to stop and let the caller conclude it is done.
+        assertNull(
+            ConversationQueryPolicy.nextCursor(
+                slice(listOf(a), listOf(4), resumeAfter = 4, moreMayRemain = true),
+                deliveredCount = 1,
+                offset = 4,
+            ),
+        )
+    }
+
+    /**
+     * Page mode can be exact, because `totalRows` and `resumeAfter` are both raw
+     * row counts there. Without the bound, a filled window cannot tell "more rows
+     * follow" from "that was the last one", and a session whose size divides evenly
+     * by the page size costs one extra round trip that returns nothing.
+     */
+    @Test
+    fun `a window that filled but sat exactly on the last row is the end`() {
+        val a = message("a", "x")
+        val filled = slice(listOf(a), listOf(9), resumeAfter = 10, moreMayRemain = true)
+
+        assertNull(
+            ConversationQueryPolicy.nextCursor(filled, deliveredCount = 1, offset = 9, totalRows = 10),
+        )
+        assertEquals(
+            "with a row still beyond the window, the same slice does continue",
+            "m10",
+            ConversationQueryPolicy.nextCursor(filled, 1, 9, totalRows = 11)?.token,
+        )
     }
 
     /**
