@@ -97,20 +97,38 @@ class BackgroundSettingsRepository(context: Context) {
      * That is the second half of the same defect: binding the right key makes
      * the STORED value correct, and this listener makes it take effect live.
      *
-     * Scoped to the task-notification key this fix targets.
-     * `backgroundOverlayEnabled` / `dynamicIslandEnabled` have the identical
-     * out-of-band gap; they are a separate decision and are deliberately left
-     * alone here. The listener is held in a field on purpose — the platform
-     * stores listeners weakly.
+     * All three keys of this store are covered, and the other two are not
+     * decoration. `ConfigBuiltins` binds `background.dynamicIsland` to this same
+     * file and key and writes it through `PrefsBoolField` — i.e. directly, never
+     * through the setter below — while `setDynamicIslandEnabled`'s own KDoc and
+     * `AgentForegroundService`'s combined flow both promise the toggle takes
+     * effect without an app restart. Leaving the key out kept that promise broken
+     * for every write made through `minis-config`: stored correctly, `ok: true`,
+     * live behaviour unchanged. The same holds for the overlay key, which no
+     * config path writes yet — and the two are MUTUALLY EXCLUSIVE in
+     * `applyOverlayState`, so a stale one decides the exclusion wrongly instead of
+     * merely repainting late.
+     *
+     * The listener is held in a field on purpose — the platform stores listeners
+     * weakly.
      */
     private val prefsListener = object : SharedPreferences.OnSharedPreferenceChangeListener {
         override fun onSharedPreferenceChanged(
             sharedPreferences: SharedPreferences?,
             key: String?,
         ) {
-            if (key == KEY_TASK_NOTIFICATIONS) {
-                _taskNotificationsEnabled.value =
+            when (key) {
+                KEY_TASK_NOTIFICATIONS -> _taskNotificationsEnabled.value =
                     prefs.getBoolean(KEY_TASK_NOTIFICATIONS, DEFAULT_TASK_NOTIFICATIONS)
+
+                // Same literal as the field initialiser above, on purpose: this
+                // listener and that initialiser are the only two places the
+                // default exists, and they must agree.
+                KEY_BG_OVERLAY_ENABLED -> _backgroundOverlayEnabled.value =
+                    prefs.getBoolean(KEY_BG_OVERLAY_ENABLED, false)
+
+                KEY_DYNAMIC_ISLAND_ENABLED -> _dynamicIslandEnabled.value =
+                    prefs.getBoolean(KEY_DYNAMIC_ISLAND_ENABLED, false)
             }
         }
     }

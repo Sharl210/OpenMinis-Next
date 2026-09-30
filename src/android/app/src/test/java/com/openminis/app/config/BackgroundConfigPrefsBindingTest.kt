@@ -5,6 +5,7 @@ import android.content.ContextWrapper
 import android.content.SharedPreferences
 import com.openminis.app.data.repository.BackgroundSettingsRepository
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -124,6 +125,67 @@ class BackgroundConfigPrefsBindingTest {
         val r = registry(FakeContext())
         assertEquals("background", r.resolveField("background.dynamicIsland")?.scope)
         assertEquals("background", r.resolveField("background.notifications")?.scope)
+    }
+
+    // ─── The identical gap on this store's other two keys ────────────────
+
+    @Test
+    fun `a direct write to the dynamic-island key reaches the state the service combines on`() {
+        // `ConfigBuiltins` binds `background.dynamicIsland` to
+        // background_settings/dynamicIslandEnabled and writes the preference file
+        // directly — it never calls `setDynamicIslandEnabled`. That setter's own
+        // KDoc promises "flipping it re-drives the FG service's combined flow so
+        // the overlay appears/disappears without an app restart", and the combined
+        // flow carries the same promise, so a write that lands only on disk leaves
+        // both broken: `ok: true`, no visible change until the process restarts.
+        //
+        // The literal below is deliberately NOT shared with the repository's
+        // private constant. `ConfigBuiltins` has its own literal for this key, and
+        // the two have to agree for the write to be seen at all; spelling it out
+        // here means a rename on either side turns this red.
+        //
+        // The capability probe gates the config PATH under JVM (SDK_INT is 0, so
+        // `background.dynamicIsland` resolves to UnavailableField and refuses a
+        // write), so this drives the mechanism that path depends on rather than
+        // the path itself.
+        val ctx = FakeContext()
+        val repo = BackgroundSettingsRepository(ctx)
+        assertFalse("precondition: Live Updates ships OFF", repo.dynamicIslandEnabled.value)
+
+        ctx.store(BackgroundSettingsRepository.PREFS_NAME)
+            .edit()
+            .putBoolean("dynamicIslandEnabled", true)
+            .apply()
+
+        assertTrue(
+            "background_settings/dynamicIslandEnabled written out of band must reach " +
+                "AgentForegroundService's combined flow without a process restart:",
+            repo.dynamicIslandEnabled.value,
+        )
+    }
+
+    @Test
+    fun `a direct write to the overlay key reaches the state the service combines on`() {
+        // Same store, same shape. Worth pinning separately because the two flags
+        // are MUTUALLY EXCLUSIVE in AgentForegroundService.applyOverlayState: a
+        // stale overlay flag decided against a live island flag is a wrong
+        // mutual-exclusion decision (both, or neither, drawn), not merely a late
+        // repaint. No config path writes this key today; that is why it is the
+        // quieter half of the pair.
+        val ctx = FakeContext()
+        val repo = BackgroundSettingsRepository(ctx)
+        assertFalse(repo.backgroundOverlayEnabled.value)
+
+        ctx.store(BackgroundSettingsRepository.PREFS_NAME)
+            .edit()
+            .putBoolean("backgroundOverlayEnabled", true)
+            .apply()
+
+        assertTrue(
+            "background_settings/backgroundOverlayEnabled written out of band must reach " +
+                "AgentForegroundService's combined flow without a process restart:",
+            repo.backgroundOverlayEnabled.value,
+        )
     }
 
     // ─── Helpers ─────────────────────────────────────────────────────────
