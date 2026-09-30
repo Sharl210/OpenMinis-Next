@@ -7,9 +7,6 @@ import org.acra.ReportField
 import org.acra.sender.ReportSender
 import org.acra.sender.ReportSenderFactory
 import java.io.File
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 
 /**
  * T283: Java/Kotlin crash → file. Writes a single text report into
@@ -17,6 +14,11 @@ import java.util.Locale
  * [com.openminis.app.logging.AppLogger.listLogFiles] already filters
  * for, so reports surface in LogManagementScreen without needing a
  * separate crash-files screen.
+ *
+ * Naming and retention are [CrashReportStore]'s job (millisecond stamps so two
+ * crashes in the same second cannot share a file, plus a visible count cap), so
+ * that both are reachable from a JVM test; this class only gathers the report
+ * body out of ACRA.
  *
  * Service-loader registered via
  * `META-INF/services/org.acra.sender.ReportSenderFactory`.
@@ -27,9 +29,12 @@ import java.util.Locale
 class CrashFileSender : ReportSender {
 
     override fun send(context: Context, errorContent: CrashReportData) {
-        val dir = File(context.filesDir, "logs").also { it.mkdirs() }
-        val stamp = STAMP_FMT.format(Date())
-        val out = File(dir, "crash-$stamp.log")
+        val dir = File(context.filesDir, "logs")
+        // One clock read for both the report's Time: line and its filename, so
+        // the two can never disagree. Millisecond stamp: a second-resolution one
+        // made two crashes inside the same second overwrite each other.
+        val now = System.currentTimeMillis()
+        val stamp = CrashReportStore.stamp(now)
 
         val body = buildString {
             appendLine("=== Minis Java/Kotlin Crash ===")
@@ -50,14 +55,19 @@ class CrashFileSender : ReportSender {
                 appendLine(logcat)
             }
         }
-        out.writeText(body)
-    }
-
-    companion object {
-        // Match LogManagementScreen's expected naming so the row sorts
-        // alongside the daily minis-YYYY-MM-DD.log files (which AppLogger
-        // sorts by `name` descending — newest first).
-        private val STAMP_FMT = SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", Locale.US)
+        // The store owns naming + retention, and has already appended its own
+        // "N oldest reports were deleted" notice to the body when it had to drop
+        // something — so the count is readable in the Logs screen. Mirror it to
+        // logcat too, since a crash-file write is otherwise silent.
+        val outcome = CrashReportStore.writeReport(dir, body, now)
+        if (outcome.dropped > 0) {
+            android.util.Log.w(
+                "CrashFileSender",
+                "[crash-retention] deleted ${outcome.dropped} oldest crash report(s) to stay within " +
+                    "CrashReportStore.MAX_REPORTS=${CrashReportStore.MAX_REPORTS}; " +
+                    "the count is recorded inside ${outcome.file.name}",
+            )
+        }
     }
 }
 

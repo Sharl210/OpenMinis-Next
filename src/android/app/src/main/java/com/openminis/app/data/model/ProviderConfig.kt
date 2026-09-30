@@ -521,6 +521,39 @@ data class ProviderConfig(
     }
 
     /**
+     * [unbounded-audit-C7] Drop the sub-agent note keyed by [id].
+     *
+     * `subAgentModelNotes` is id-keyed exactly like `modelGroups[].memberEntryIds`,
+     * `agentLoopModelEntryIds` and `agentLoopGroupIds` — and those three ARE
+     * cascade-cleaned wherever their referent is removed (`removeEntry`,
+     * `removeGroup`, `removeInstance`, `replaceEntries`' prune branch). This map
+     * was not, so every deletion of a model entry / model group / provider
+     * instance — and every refresh that prunes a model the upstream API stopped
+     * returning — left a key behind that nothing can ever read again:
+     *
+     *   - `ModelEntry.id` / `ModelGroup.id` are `UUID.randomUUID()`
+     *     (ProviderConfig.kt above), so a re-created entry or group gets a fresh
+     *     id and a stale key can never be re-matched. "Keep the note so a rebuild
+     *     restores it" is therefore not a behaviour this map can express.
+     *   - The only reader is `ProviderRepository.subAgentModelNote(id)` called
+     *     from `ModelUseOffloadHandler.entryDict`, always for a LIVE entry.
+     *   - The UI renders a note only for rows that still exist.
+     *
+     * So the residue is invisible but permanent: it is re-serialized into the
+     * whole-config `provider_config / config` prefs mirror (and the DB meta row
+     * `sub_agent_model_notes`) on every single save.
+     *
+     * Deliberately a pure, Context-free function on the model instead of three
+     * inline `remove` calls inside `ProviderRepository`: that class' only
+     * constructor reads EncryptedSharedPreferences and opens Room, so a cascade
+     * living only inside its deletion methods cannot be exercised by any unit
+     * test. Same reason `ProviderRepository.resolveVisionCandidatesIn` exists.
+     */
+    internal fun dropSubAgentModelNote(id: String) {
+        subAgentModelNotes.remove(id)
+    }
+
+    /**
      * [T-android-providerconfig-cme] Hand-written equals that tests [revision]
      * FIRST and never walks the mutable lists.
      *

@@ -143,8 +143,19 @@ private fun purgeRuntimeSubtrees(
  *
  * Existence is re-checked immediately before, because
  * [ChatRepository.deleteSessionSubtree] refuses the entire batch when one id has
- * already been removed elsewhere; that race then degrades to "the rows that are
- * still there get deleted" instead of failing every id in the subtree.
+ * already been removed elsewhere. This keeps the ids handed over to the
+ * transaction *all* real, which matters because the ids arriving here are not
+ * all freshly resolved: `SessionSubtreeDeletionPipeline` also feeds in ids
+ * carried over from the retry ledger, whose chat rows a previous attempt may
+ * already have deleted. Without the filter those stale ids would reach the
+ * transaction — and `ChatDao.deleteSessionSubtree` aborts the **whole** batch on
+ * an id it cannot see (`check(countSessions(chunk) == chunk.size)`), so a single
+ * already-deleted id would roll back the rows that are still there and leave the
+ * `chat` debt on every id in the subtree.
+ *
+ * That is a race, not a degradation: the step fails, says so, and the debt stays
+ * until a later attempt succeeds. Nothing here deletes "the rows that are still
+ * there" while claiming the batch succeeded.
  */
 private suspend fun deleteChatRows(chatRepository: ChatRepository, sessionIds: List<String>) {
     if (sessionIds.isEmpty()) return

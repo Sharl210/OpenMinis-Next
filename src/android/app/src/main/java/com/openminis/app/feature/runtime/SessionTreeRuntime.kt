@@ -2161,6 +2161,46 @@ class RuntimeSessionTree(
     )
 
     /**
+     * The control ledger's half of the same contract, plus the one fact the other
+     * two ledgers do not have: [RuntimeControlReceiptRetention
+     * .droppedIdempotencyKeys] says how many index entries left with the receipts
+     * they pointed at.
+     *
+     * Consumer status, stated plainly so nobody assumes otherwise: as of this
+     * change **no production code calls this accessor**; only tests do. The same
+     * counts are carried by [toJson]'s `ledgerRetention` block (which production
+     * does write) and by the `text` export's `ledgerEvicted=` line.
+     */
+    @Synchronized
+    fun controlReceiptRetention(): RuntimeControlReceiptRetention = RuntimeControlReceiptRetention(
+        retainedReceipts = controlReceipts.size,
+        retainedChars = controlReceiptChars,
+        droppedReceipts = controlReceiptEvictions.dropped,
+        droppedChars = controlReceiptEvictions.droppedChars,
+        droppedIdempotencyKeys = controlReceiptEvictions.droppedIdempotencyKeys,
+    )
+
+    /**
+     * How many idempotency keys name an operation this ledger no longer holds.
+     *
+     * This is the invariant the control ledger's budget is built on, stated as a
+     * number: `controlOperationIdByIdempotencyKey` is a *derived view* of
+     * `controlReceipts`, so every value in it must be a live key of that map. A
+     * non-zero answer means the index has outlived the ledger it indexes — the
+     * failure mode in which a retried stop looks recognised and then is not, and
+     * in which the index keeps growing without bound while the receipts it points
+     * into are capped.
+     *
+     * Read as a whole-map scan on purpose: it is a diagnostic seam (no production
+     * caller; tests and a debugging session only), and an incrementally
+     * maintained counter is exactly the kind of thing that can drift away from
+     * the fact it describes — which is the class of bug it exists to detect.
+     */
+    @Synchronized
+    fun danglingIdempotencyKeyCount(): Int =
+        controlOperationIdByIdempotencyKey.values.count { it !in controlReceipts }
+
+    /**
      * What the tree's event ledger holds, and what its budget has already taken
      * from it. See [receiptRetention]; the same distinction applies, including
      * the consumer status note — no production code calls this yet.
@@ -2179,8 +2219,16 @@ class RuntimeSessionTree(
     )
 
     /**
-     * Apply the *current* [RuntimeTreeConfig] ledger budgets to events and
-     * receipts already in memory, and report how many entries that freed.
+     * Apply the *current* [RuntimeTreeConfig] ledger budgets to everything
+     * already in memory — events, delivery receipts and the control (stop)
+     * ledger with the idempotency index that belongs to it — and report how many
+     * entries that freed.
+     *
+     * All three ledgers are reclaimed through this one call rather than through
+     * three call sites: a ceiling that applies to memory already spent has to be
+     * applied in one place, or the ledgers start diverging in *when* their
+     * ceilings take effect — the same defect as a budget one write path can walk
+     * around, one level up.
      *
      * The append paths enforce their budgets on their own; this exists for the
      * other orders, because a ceiling that only applies to future writes cannot
@@ -2206,10 +2254,11 @@ class RuntimeSessionTree(
      */
     @Synchronized
     fun reclaimLedgers(): Int {
-        val before = eventEvictions.dropped + receiptEvictions.dropped
+        val before = eventEvictions.dropped + receiptEvictions.dropped + controlReceiptEvictions.dropped
         evictEventOverflow()
         evictReceiptOverflow()
-        return (eventEvictions.dropped + receiptEvictions.dropped) - before
+        evictControlReceiptOverflow()
+        return (eventEvictions.dropped + receiptEvictions.dropped + controlReceiptEvictions.dropped) - before
     }
 
     /**
@@ -2291,6 +2340,12 @@ class RuntimeSessionTree(
             if (config.maxDeliveryReceiptChars != RuntimeTreeConfig.DEFAULT_DELIVERY_RECEIPT_CHARS_LIMIT) {
                 put("maxDeliveryReceiptChars", config.maxDeliveryReceiptChars)
             }
+            if (config.maxControlReceipts != RuntimeTreeConfig.DEFAULT_CONTROL_RECEIPTS_LIMIT) {
+                put("maxControlReceipts", config.maxControlReceipts)
+            }
+            if (config.maxControlReceiptChars != RuntimeTreeConfig.DEFAULT_CONTROL_RECEIPT_CHARS_LIMIT) {
+                put("maxControlReceiptChars", config.maxControlReceiptChars)
+            }
         })
         out.put("nodes", JSONArray().apply { nodes.values.forEach { put(nodeJson(it)) } })
         out.put("events", JSONArray().apply { events.forEach { put(eventJson(it)) } })
@@ -2323,7 +2378,7 @@ class RuntimeSessionTree(
         // to. When a ledger *is* present, a reader of the restored tree can
         // still tell "complete" from "trimmed" — without this, a restart would
         // launder a trimmed history into one that looks whole.
-        if (eventEvictions.dropped > 0 || receiptEvictions.dropped > 0) {
+        if (eventEvictions.dropped > 0 || receiptEvictions.dropped > 0 || controlReceiptEvictions.dropped > 0) {
             out.put("ledgerRetention", JSONObject().apply {
                 if (eventEvictions.dropped > 0) {
                     put("events", JSONObject().apply {
@@ -2345,6 +2400,17 @@ class RuntimeSessionTree(
                         put("droppedChars", receiptEvictions.droppedChars)
                     })
                 }
+                // The control ledger is the one whose budget also removed index
+                // entries, so it reports three numbers rather than two: a reader
+                // has to be able to see that the idempotency keys went with the
+                // receipts, not that the receipts went and the keys stayed.
+                if (controlReceiptEvictions.dropped > 0) {
+                    put("stopReceipts", JSONObject().apply {
+                        put("droppedReceipts", controlReceiptEvictions.dropped)
+                        put("droppedChars", controlReceiptEvictions.droppedChars)
+                        put("droppedIdempotencyKeys", controlReceiptEvictions.droppedIdempotencyKeys)
+                    })
+                }
             })
         }
         return out.toString()
@@ -2362,6 +2428,9 @@ class RuntimeSessionTree(
             eventDropsByNode.clear()
             receiptChars = 0
             receiptEvictions.dropped = 0; receiptEvictions.droppedChars = 0
+            controlReceiptChars = 0
+            controlReceiptEvictions.dropped = 0; controlReceiptEvictions.droppedChars = 0
+            controlReceiptEvictions.droppedIdempotencyKeys = 0
             controlReceipts.clear(); controlOperationIdByIdempotencyKey.clear()
             pendingStopOperationByNodeId.clear()
             rootIds.clear()
@@ -2401,6 +2470,12 @@ class RuntimeSessionTree(
                 config.maxDeliveryReceiptChars = configJson
                     .optInt("maxDeliveryReceiptChars", config.maxDeliveryReceiptChars)
                     .coerceIn(1, RuntimeTreeConfig.MAX_DELIVERY_RECEIPT_CHARS_LIMIT)
+                config.maxControlReceipts = configJson
+                    .optInt("maxControlReceipts", config.maxControlReceipts)
+                    .coerceIn(1, RuntimeTreeConfig.MAX_CONTROL_RECEIPTS_LIMIT)
+                config.maxControlReceiptChars = configJson
+                    .optInt("maxControlReceiptChars", config.maxControlReceiptChars)
+                    .coerceIn(1, RuntimeTreeConfig.MAX_CONTROL_RECEIPT_CHARS_LIMIT)
             }
             val legacyRoot = json.optString("rootId").takeIf { it.isNotBlank() && it != "null" }
             val serializedRoots = json.optJSONArray("rootIds")
@@ -2446,8 +2521,17 @@ class RuntimeSessionTree(
             val stopReceiptArray = json.optJSONArray("stopReceipts") ?: JSONArray()
             for (i in 0 until stopReceiptArray.length()) {
                 val receipt = parseStopReceipt(stopReceiptArray.getJSONObject(i))
+                // Written into the two maps directly rather than through
+                // [storeControlReceipt], because restore applies the budgets once,
+                // at the end: the file's own recorded eviction counts are read
+                // back *after* every array has been parsed and *before* the current
+                // ceilings add to them. Evicting per receipt here would spend the
+                // budget before that read-back, and the read-back assigns rather
+                // than accumulates — so this load's overflow would be laundered
+                // into the number the file remembered.
                 controlReceipts[receipt.operationId] = receipt
                 controlOperationIdByIdempotencyKey[receipt.idempotencyKey] = receipt.operationId
+                controlReceiptChars += receipt.retainedChars()
                 if (receipt.accepted) {
                     receipt.affectedNodeIds
                         .filter { nodes[it]?.status == RuntimeNodeStatus.STOP_REQUESTED }
@@ -2504,6 +2588,21 @@ class RuntimeSessionTree(
                     if (dropped > 0) {
                         receiptEvictions.dropped = dropped
                         receiptEvictions.droppedChars = entry.optInt("droppedChars", 0)
+                    }
+                }
+                // The third ledger, and the only one that also has index entries
+                // to remember losing. Read back under the same rule as the two
+                // above: a file written before this budget existed carries no such
+                // key, and "this tree never lost an index entry" is the truth for
+                // it — which is why the default is an explicit `0` rather than a
+                // guess derived from the receipts that are still there.
+                ledgerJson.optJSONObject("stopReceipts")?.let { entry ->
+                    val dropped = entry.optInt("droppedReceipts", 0)
+                    if (dropped > 0) {
+                        controlReceiptEvictions.dropped = dropped
+                        controlReceiptEvictions.droppedChars = entry.optInt("droppedChars", 0)
+                        controlReceiptEvictions.droppedIdempotencyKeys =
+                            entry.optInt("droppedIdempotencyKeys", 0)
                     }
                 }
             }
@@ -2780,6 +2879,109 @@ class RuntimeSessionTree(
         deliveryReceipts.subList(0, firstSurvivor).clear()
         receiptEvictions.dropped += doomedReceipts
         receiptEvictions.droppedChars += doomedChars
+    }
+
+    /**
+     * Single writer for the control ledger **as a unit**.
+     *
+     * That ledger is not one data structure but two — `controlReceipts` holds the
+     * stop receipts and `controlOperationIdByIdempotencyKey` is the index
+     * [stopDescendant] answers a retried stop from — and the second is only ever
+     * meaningful as a view of the first. Every write therefore goes through here,
+     * for the same reason [appendReceipt] exists one ledger over: a budget that
+     * one path can walk around is not a budget, and an index one path can leave
+     * behind is not an index. Both maps are written, then the budget is applied to
+     * both at once.
+     *
+     * Upsert rather than append: the operation id is this ledger's key, and the
+     * abort path rewrites an existing receipt's `stateAfter` through this method
+     * too — an in-place edit that skipped the accounting is exactly the defect
+     * `replaceReceiptAt` was centralised to prevent for the delivery ledger.
+     */
+    private fun storeControlReceipt(receipt: RuntimeStopReceipt) {
+        controlReceipts[receipt.operationId]?.let { previous ->
+            controlReceiptChars -= previous.retainedChars()
+        }
+        controlReceipts[receipt.operationId] = receipt
+        // Registering a *new* key for an operation already stored is the
+        // documented way a caller retries one stop under a fresh idempotency key,
+        // and has to keep resolving; that is also why one operation id can be
+        // named by several keys, and why the eviction below deletes by value.
+        controlOperationIdByIdempotencyKey[receipt.idempotencyKey] = receipt.operationId
+        controlReceiptChars += receipt.retainedChars()
+        evictControlReceiptOverflow()
+    }
+
+    /**
+     * What one stop receipt costs against [RuntimeTreeConfig.maxControlReceiptChars].
+     *
+     * Same shape as the delivery ledger's: the two node ids that answer *who asked*
+     * and *who was stopped*, plus `reason`, the only free-text field a stop receipt
+     * carries. The capability snapshots are deliberately not counted — they are
+     * fixed-field structures whose size does not follow anything a caller writes,
+     * so charging them here would turn this into a second copy of the receipt
+     * budget instead of an independent rail.
+     */
+    private fun RuntimeStopReceipt.retainedChars(): Int =
+        actorNodeId.length + targetNodeId.length + (reason?.length ?: 0)
+
+    /**
+     * Counterpart of [evictReceiptOverflow] for the control ledger: oldest first,
+     * newest never evicted — and, uniquely among the three ledgers, the index is
+     * reclaimed together with the receipts it points at.
+     *
+     * The index deletion is **by value**: one receipt may be reachable under
+     * several idempotency keys (that is exactly what [stopDescendant]'s "same
+     * operation, new key" branch produces), so there is no positional pairing
+     * between the two maps to walk. Every key whose *value* is one of the doomed
+     * operation ids leaves, in one pass. That is what keeps "every value in the
+     * index is a live key of `controlReceipts`" true after every eviction — the
+     * property [RuntimeSessionTree.danglingIdempotencyKeyCount] measures.
+     *
+     * Walking the map and collecting first, instead of fetching keys by position,
+     * is what keeps this O(1) in the common case: a `LinkedHashMap` has no index
+     * access, so copying its keys on every append would make the append path
+     * quadratic in the ceiling — the same trap the running character totals exist
+     * to avoid. The loop stops at the first entry the budget can keep, and the
+     * last entry is never even considered.
+     *
+     * Oldest-first is the friendly order for an idempotency window: the newest
+     * operation — the one whose retry is most likely still in flight — is always
+     * still answerable. A retried stop that arrives after its receipt has left the
+     * window *is* carried out again; that is the unavoidable cost of a bounded
+     * window, and it is why the counts below are persisted rather than the window
+     * being pretended unlimited. What this design refuses to do is leave the index
+     * claiming that a recognition will happen when the ledger can no longer
+     * answer.
+     */
+    private fun evictControlReceiptOverflow() {
+        val maxReceipts = config.maxControlReceipts
+        val maxChars = config.maxControlReceiptChars
+        if (controlReceipts.size <= maxReceipts && controlReceiptChars <= maxChars) return
+        var retained = controlReceipts.size
+        var chars = controlReceiptChars
+        var doomedChars = 0
+        val doomedOperationIds = LinkedHashSet<String>()
+        for (entry in controlReceipts.entries) {
+            // The newest receipt is never a casualty of its own arrival: it is the
+            // one entry the caller that just wrote it must be able to read back.
+            if (retained <= 1) break
+            if (retained <= maxReceipts && chars <= maxChars) break
+            val cost = entry.value.retainedChars()
+            doomedOperationIds.add(entry.key)
+            doomedChars += cost
+            chars -= cost
+            retained--
+        }
+        if (doomedOperationIds.isEmpty()) return
+        doomedOperationIds.forEach { controlReceipts.remove(it) }
+        val indexBefore = controlOperationIdByIdempotencyKey.size
+        controlOperationIdByIdempotencyKey.entries.removeIf { it.value in doomedOperationIds }
+        controlReceiptEvictions.dropped += doomedOperationIds.size
+        controlReceiptEvictions.droppedChars += doomedChars
+        controlReceiptEvictions.droppedIdempotencyKeys +=
+            indexBefore - controlOperationIdByIdempotencyKey.size
+        controlReceiptChars -= doomedChars
     }
 
     private fun isAncestor(ancestorNodeId: String, nodeId: String): Boolean {
@@ -3160,6 +3362,16 @@ class RuntimeSessionTree(
             "transcripts=${transcripts.values.sumOf { it.size }} messages retained; " +
                 "transcriptBudget=${config.maxTranscriptMessagesPerNode} msgs / ${config.maxTranscriptCharsPerNode} chars per node; " +
                 "transcriptEvicted=${transcriptEvictions.values.sumOf { it.messages }} messages across ${transcriptEvictions.size} node(s)"
+        )
+        // The third ledger, on the same terms — and this one has to report the
+        // idempotency keys as well: a reader told only "3 receipts were evicted"
+        // would come away thinking the tree still recognises the stop requests
+        // those receipts answered. It does not, and the number of keys that left
+        // with them is the honest way to say so.
+        appendLine(
+            "controlBudget=${config.maxControlReceipts} receipts / ${config.maxControlReceiptChars} chars; " +
+                "controlEvicted=${controlReceiptEvictions.dropped} receipts / " +
+                "${controlReceiptEvictions.droppedIdempotencyKeys} idempotency keys"
         )
     }
 

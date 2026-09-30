@@ -149,6 +149,17 @@ object BrowserUseTool {
             put("description", "For set_cookies, a JSON array of cookie objects (or a JSON-encoded array string); each object requires name and value, with optional domain, path, secure, http_only, and expires.")
         })
 
+        properties.put("page_id", JSONObject().apply {
+            put("type", "string")
+            put(
+                "description",
+                "Stable page id for restore_tab — the id shown by list_tabs as " +
+                    "`Sleeping page <id>`. Either the full id or the 8-character " +
+                    "prefix list_tabs prints is accepted. Required by restore_tab: " +
+                    "without it that action fails with \"restore_tab requires page_id\".",
+            )
+        })
+
         properties.put("item_id", JSONObject().apply {
             put("type", "string")
             put("description", "History or bookmark id for delete/open/remove actions; bookmark URLs are also accepted.")
@@ -176,7 +187,7 @@ object BrowserUseTool {
                     "coordinate_x", "coordinate_y", "direction", "amount", "scroll_count",
                     "item_selector", "script", "user_agent", "max_depth", "keywords", "fuzzy",
                     "cookies", "timeout", "viewport_width", "viewport_height", "reset",
-                    "full_page", "item_id", "query", "title",
+                    "full_page", "page_id", "item_id", "query", "title",
                 ),
             ),
         )

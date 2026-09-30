@@ -337,15 +337,14 @@ class SelectionController {
         }
         // A table cell selects as a whole cell — see TextShard.isAtomicUnit.
         if (shard.isAtomicUnit) {
-            val start = text.indexOfFirst { !it.isWhitespace() }
-            if (start < 0) {
+            val bounds = atomicUnitBounds(text)
+            if (bounds == null) {
                 beginSelection(pos)
                 return
             }
-            val end = text.indexOfLast { !it.isWhitespace() } + 1
             selection.value = TextSelection(
-                start = TextPosition(pos.shard, start),
-                end = TextPosition(pos.shard, end),
+                start = TextPosition(pos.shard, bounds.first),
+                end = TextPosition(pos.shard, bounds.second),
             )
             return
         }
@@ -369,7 +368,29 @@ class SelectionController {
      * to "select this single character" when no word can be found nearby,
      * which still gives the user a visible selection to drag.
      */
-    private fun wordBoundsAt(text: String, offset: Int): Pair<Int, Int> {
+    /**
+     * The bounds of an atomic unit (a table cell): the cell's text with leading
+     * and trailing whitespace trimmed, or `null` when the cell holds no
+     * non-whitespace character at all (the caller then falls back to a caret).
+     *
+     * Extracted from [beginSelectionWord] so the rule can be executed by a JVM
+     * test: the branch it lived in needs a registered [TextShard], which carries
+     * a Compose `TextLayoutResult` and therefore cannot be built off-device. While
+     * it was inline, the only test of this rule was a *copy* of it inside the
+     * test file, which asserted the copy rather than this code — and had already
+     * drifted from it.
+     */
+    internal fun atomicUnitBounds(text: String): Pair<Int, Int>? {
+        val start = text.indexOfFirst { !it.isWhitespace() }
+        if (start < 0) return null
+        return start to (text.indexOfLast { !it.isWhitespace() } + 1)
+    }
+
+    // [testability] Widened from `private` so a JVM unit test can call the real
+    // sentence-expansion rule. It takes only String/Int, so unlike `beginSelectionWord`
+    // (which needs a registered TextShard carrying a Compose TextLayoutResult) it can be
+    // driven directly — and a test that copies the rule instead never executes this code.
+    internal fun wordBoundsAt(text: String, offset: Int): Pair<Int, Int> {
         if (text.isEmpty()) return 0 to 0
         val len = text.length
         val clamped = offset.coerceIn(0, len)

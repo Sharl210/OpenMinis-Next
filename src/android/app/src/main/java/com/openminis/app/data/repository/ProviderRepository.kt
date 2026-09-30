@@ -821,10 +821,17 @@ class ProviderRepository(private val context: Context) {
                 group.memberEntryIds.removeAll { it in removedEntryIds }
             }
             config.agentLoopModelEntryIds.removeAll { it in removedEntryIds }
+            // [unbounded-audit-C7] Every entry of the removed instance just
+            // disappeared, so their notes are orphans from here on.
+            removedEntryIds.forEach { config.dropSubAgentModelNote(it) }
         }
         val emptyGroupIds = config.modelGroups.filter { it.memberEntryIds.isEmpty() }.map { it.id }.toSet()
         if (emptyGroupIds.isNotEmpty()) {
             config.modelGroups.removeAll { it.id in emptyGroupIds }
+            // [unbounded-audit-C7] Those groups are deleted by THIS call, so
+            // their group-keyed notes have to go with them (the audit listed
+            // only the entry notes here; a group note orphans the same way).
+            emptyGroupIds.forEach { config.dropSubAgentModelNote(it) }
             if (config.defaultPrimaryGroupId in emptyGroupIds) config.defaultPrimaryGroupId = null
             if (config.defaultSubGroupId in emptyGroupIds) config.defaultSubGroupId = null
         }
@@ -1199,6 +1206,17 @@ class ProviderRepository(private val context: Context) {
                 if (agentRemoved > 0) {
                     android.util.Log.i("ProviderRepo", "[ModelList] replaceEntries pruned $agentRemoved stale agent-loop entry pins")
                 }
+                // [unbounded-audit-C7] Fourth orphan source the audit did not
+                // list: an upstream model-list shrink prunes entries here too.
+                // Cleaned in the same branch as the two cascades above and NOT
+                // under suspicious-shrink, so a transient API hiccup keeps the
+                // user's curated notes exactly like it keeps the pins.
+                val notesBefore = config.subAgentModelNotes.size
+                prunedEntryIds.forEach { config.dropSubAgentModelNote(it) }
+                val notesRemoved = notesBefore - config.subAgentModelNotes.size
+                if (notesRemoved > 0) {
+                    android.util.Log.i("ProviderRepo", "[ModelList] replaceEntries dropped $notesRemoved orphaned sub-agent notes")
+                }
             }
         }
 
@@ -1260,6 +1278,14 @@ class ProviderRepository(private val context: Context) {
         // no longer exists. Mirrors iOS ProviderConfigStore.removeEntry
         // (Providers/ProviderConfigStore.swift L268).
         config.agentLoopModelEntryIds.removeAll { it == entryId }
+        // [unbounded-audit-C7] Same cascade for the note keyed by this entry id.
+        // The note map is id-keyed like the two collections cleaned above and
+        // was the one pointer left behind; the id is a fresh UUID afterwards, so
+        // the stale key can never be read again — it just rides along in every
+        // future full-config serialization. See ProviderConfig.dropSubAgentModelNote.
+        // (Intent evidence: no KDoc / comment / test / iOS counterpart argues for
+        // keeping it, and iOS has no such field at all — see the fix report.)
+        config.dropSubAgentModelNote(entryId)
         saveConfig(config)
     }
 
@@ -1308,6 +1334,9 @@ class ProviderRepository(private val context: Context) {
             config.visionGroupId = null
         }
         config.agentLoopGroupIds.removeAll { it == groupId }
+        // [unbounded-audit-C7] Drop the note keyed by this group id — the group
+        // is gone from modelGroups, so nothing can read that key again.
+        config.dropSubAgentModelNote(groupId)
         saveConfig(config)
     }
 

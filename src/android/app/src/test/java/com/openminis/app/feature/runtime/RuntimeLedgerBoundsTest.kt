@@ -4,6 +4,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -32,9 +33,13 @@ class RuntimeLedgerBoundsTest {
      * and such a file carries no `maxEvents` key for restore to read — the
      * store's own default is what applies.
      */
-    private fun legacyJson(events: Int = 0, receipts: Int = 0): String {
+    private fun legacyJson(events: Int = 0, receipts: Int = 0, stopReceipts: Int = 0): String {
         val json = JSONObject(treeWith().also { it.createRoot("root", model) }.toJson())
         assertFalse("a default-config tree must not write budget keys", json.getJSONObject("config").has("maxEvents"))
+        assertFalse(
+            "the control ledger's budget is not written on a default-config tree either",
+            json.getJSONObject("config").has("maxControlReceipts"),
+        )
         if (events > 0) {
             json.put("events", JSONArray().apply {
                 for (i in 0 until events) put(
@@ -61,6 +66,26 @@ class RuntimeLedgerBoundsTest {
                         put("createdAtMillis", i.toLong())
                         put("reason", JSONObject.NULL)
                         put("status", "ENQUEUED")
+                    }
+                )
+            })
+        }
+        if (stopReceipts > 0) {
+            json.put("stopReceipts", JSONArray().apply {
+                for (i in 0 until stopReceipts) put(
+                    JSONObject().apply {
+                        put("operationId", "legacy-stop-$i")
+                        put("idempotencyKey", "legacy-stop-key-$i")
+                        put("type", "STOP_DESCENDANT")
+                        put("actorNodeId", "root")
+                        put("targetNodeId", "root")
+                        put("accepted", true)
+                        put("stateBefore", "RUNNING")
+                        put("stateAfter", "STOP_REQUESTED")
+                        put("affectedNodeIds", JSONArray(listOf("root")))
+                        put("createdAtMillis", i.toLong())
+                        put("reason", JSONObject.NULL)
+                        put("eventId", JSONObject.NULL)
                     }
                 )
             })
@@ -125,11 +150,16 @@ class RuntimeLedgerBoundsTest {
         assertFalse(config.has("maxEventChars"))
         assertFalse(config.has("maxDeliveryReceipts"))
         assertFalse(config.has("maxDeliveryReceiptChars"))
+        assertFalse(config.has("maxControlReceipts"))
+        assertFalse(config.has("maxControlReceiptChars"))
 
         assertFalse(tree.eventRetention().truncated)
         assertEquals(0, tree.eventRetention().droppedEvents)
         assertFalse(tree.receiptRetention().truncated)
         assertEquals(0, tree.receiptRetention().droppedReceipts)
+        assertFalse(tree.controlReceiptRetention().truncated)
+        assertEquals(0, tree.controlReceiptRetention().droppedReceipts)
+        assertEquals(0, tree.controlReceiptRetention().droppedIdempotencyKeys)
     }
 
     /**
@@ -508,13 +538,15 @@ class RuntimeLedgerBoundsTest {
     @Test
     fun outOfRangeBudgetsInStoredJsonAreCoercedNotRefused() {
         val tree = treeWith()
-        val legacy = """{"config":{"maxEvents":0,"maxEventChars":-5,"maxDeliveryReceipts":3000000,"maxDeliveryReceiptChars":1}}"""
+        val legacy = """{"config":{"maxEvents":0,"maxEventChars":-5,"maxDeliveryReceipts":3000000,"maxDeliveryReceiptChars":1,"maxControlReceipts":-1,"maxControlReceiptChars":999999999}}"""
         assertTrue("an old or corrupt config must not make the tree unloadable", tree.restoreJson(legacy))
 
         assertEquals(1, tree.config.maxEvents)
         assertEquals(1, tree.config.maxEventChars)
         assertEquals(RuntimeTreeConfig.MAX_DELIVERY_RECEIPTS_LIMIT, tree.config.maxDeliveryReceipts)
         assertEquals(1, tree.config.maxDeliveryReceiptChars)
+        assertEquals(1, tree.config.maxControlReceipts)
+        assertEquals(RuntimeTreeConfig.MAX_CONTROL_RECEIPT_CHARS_LIMIT, tree.config.maxControlReceiptChars)
     }
 
     /**
@@ -524,7 +556,7 @@ class RuntimeLedgerBoundsTest {
      */
     @Test
     fun customBudgetsSurviveASaveAndRestore() {
-        val source = treeWith(RuntimeTreeConfig().apply { maxEvents = 4_321; maxDeliveryReceipts = 1_234 })
+        val source = treeWith(RuntimeTreeConfig().apply { maxEvents = 4_321; maxDeliveryReceipts = 1_234; maxControlReceipts = 321 })
         source.createRoot("root", model)
         repeat(10) { source.appendTranscript("root", "user", "m$it") }
 
@@ -532,5 +564,329 @@ class RuntimeLedgerBoundsTest {
         assertTrue(restored.restoreJson(source.toJson()))
         assertEquals(4_321, restored.config.maxEvents)
         assertEquals(1_234, restored.config.maxDeliveryReceipts)
+        assertEquals(321, restored.config.maxControlReceipts)
+    }
+
+    /**
+     * Issues [count] distinct stop operations against one child and returns what
+     * the tree answered to each.
+     *
+     * The first is accepted; the rest are refused with "target is not active"
+     * because the child is already stopping — and are filed anyway, which is the
+     * point of using this shape: a refusal is an audit fact and counts against the
+     * ledger exactly like an acceptance, so a budget that only bounded the
+     * accepted ones would not be a budget.
+     */
+    private fun stopRepeatedly(
+        tree: RuntimeSessionTree,
+        rootId: String,
+        childId: String,
+        count: Int,
+        reason: String = "stop $count",
+    ): List<RuntimeStopReceipt> = (0 until count).map { i ->
+        tree.stopDescendant(
+            RuntimeStopRequest(
+                actorNodeId = rootId,
+                targetNodeId = childId,
+                rootId = rootId,
+                reason = reason,
+                operationId = "op-$i",
+                idempotencyKey = "key-$i",
+            ),
+        )
+    }
+
+    /**
+     * Distinguishes "the control (stop) ledger is bounded" from "every stop files
+     * a receipt that nothing ever removes" — the state this ledger was in, where a
+     * session that is stopped repeatedly grows by ~1 982 bytes of tree JSON per
+     * stop, linearly and with no knee.
+     *
+     * Refusals are counted too (see [stopRepeatedly]), and the arithmetic is
+     * pinned: retained + dropped has to be the whole history, or the number cannot
+     * be audited against the operations that were actually issued.
+     */
+    @Test
+    fun controlReceiptLedgerIsBoundedAndCountsWhatItDropped() {
+        val tree = treeWith(RuntimeTreeConfig().apply { maxControlReceipts = 5 })
+        val root = tree.createRoot("root", model)
+        val child = tree.createChild("root", "child", model).getOrThrow()
+        tree.start(child.id)
+
+        stopRepeatedly(tree, root.id, child.id, count = 20)
+
+        val retention = tree.controlReceiptRetention()
+        assertEquals(5, retention.retainedReceipts)
+        assertTrue("a control ledger that dropped receipts must say so", retention.truncated)
+        assertEquals("every dropped receipt is counted exactly once", 15, retention.droppedReceipts)
+        assertEquals(
+            "retained + dropped must be the whole history, so the count is auditable",
+            20,
+            retention.retainedReceipts + retention.droppedReceipts,
+        )
+        assertEquals("the newest operation is never a casualty of its own arrival", "op-19", tree.stopReceipt("op-19")?.operationId)
+    }
+
+    /**
+     * **The test this change exists for.**
+     *
+     * The control ledger doubles as the tree's stop idempotency table, and the
+     * index that makes the lookup work (`controlOperationIdByIdempotencyKey`) is a
+     * *derived view* of it — not a second ledger that can be capped on its own.
+     * Bound the receipts without taking the index with them and two things break
+     * at once: the index keeps every key it has ever recorded, so the memory
+     * problem is only half solved; and it keeps naming operations the ledger no
+     * longer holds, so "this key is known" stops being a true statement and the
+     * lookup's inner `?.let` falls through as a matter of routine instead of as an
+     * impossible case.
+     *
+     * What it distinguishes: "the index is a view of the ledger and is reclaimed
+     * with it" from "the index outlives the ledger it indexes". The second is the
+     * defect a receipts-only ceiling would introduce, and it turns **both**
+     * assertions below red while leaving the rest of this file green — which is
+     * the whole reason they are written as a pair.
+     */
+    @Test
+    fun controlLedgerEvictionTakesTheIdempotencyIndexWithIt() {
+        val tree = treeWith(RuntimeTreeConfig().apply { maxControlReceipts = 5 })
+        val root = tree.createRoot("root", model)
+        val child = tree.createChild("root", "child", model).getOrThrow()
+        tree.start(child.id)
+
+        stopRepeatedly(tree, root.id, child.id, count = 20)
+
+        val retention = tree.controlReceiptRetention()
+        assertEquals(
+            "five receipts were kept, so the fifteen keys that named the rest must have gone too",
+            15,
+            retention.droppedIdempotencyKeys,
+        )
+        assertTrue(
+            "and that loss has to be visible rather than silent",
+            retention.droppedIdempotencyKeys > 0,
+        )
+        assertEquals(
+            "no idempotency key may name an operation this ledger no longer holds",
+            0,
+            tree.danglingIdempotencyKeyCount(),
+        )
+        // The third surface the loss has to be visible on. `receiptRetention()`
+        // and the JSON block are read by code; this one is read by a human looking
+        // at an export, and it would otherwise report the other two ledgers as
+        // untouched while this one had taken fifteen operations.
+        val text = String(tree.export("text").bytes, Charsets.UTF_8)
+        assertTrue(
+            "the text export must report this ledger's loss too, keys included",
+            text.contains("controlEvicted=15 receipts / 15 idempotency keys"),
+        )
+    }
+
+    /**
+     * The counterweight to the eviction: capping the ledger must not break the
+     * deduplication that made keeping it worthwhile.
+     *
+     * This is the in-repo guard for the behaviour `RuntimeDelegationTest` already
+     * pins — "same idempotency key, new operation id, one receipt" — re-run on a
+     * tree whose ceiling is small enough that eviction has to be in play. If
+     * eviction ever started taking receipts a retry still needs, this goes red.
+     */
+    @Test
+    fun idempotentRetryInsideTheWindowIsStillAnsweredByTheOriginalReceipt() {
+        val tree = treeWith(RuntimeTreeConfig().apply { maxControlReceipts = 3 })
+        val root = tree.createRoot("root", model)
+        val child = tree.createChild("root", "child", model).getOrThrow()
+        tree.start(child.id)
+
+        val operations = stopRepeatedly(tree, root.id, child.id, count = 3)
+        assertEquals(
+            "the window is exactly full, so nothing has been evicted yet",
+            0,
+            tree.controlReceiptRetention().droppedReceipts,
+        )
+
+        val replay = tree.stopDescendant(
+            RuntimeStopRequest(
+                actorNodeId = root.id,
+                targetNodeId = child.id,
+                rootId = root.id,
+                operationId = "op-0-retry",
+                idempotencyKey = "key-0",
+            ),
+        )
+        assertEquals("a retry inside the window is still recognised as a retry", "op-0", replay.operationId)
+        assertEquals("and answered with the receipt that already exists", operations[0], replay)
+        assertEquals(
+            "answering a retry must not file a second record",
+            3,
+            tree.controlReceiptRetention().retainedReceipts,
+        )
+    }
+
+    /**
+     * What a *bounded* idempotency window means, stated so it cannot be quietly
+     * assumed away: a retry that arrives after its receipt has been evicted is a
+     * new request, and is carried out again.
+     *
+     * That is the honest cost of having a ceiling at all, not a defect this change
+     * introduces — an unbounded window is the thing being removed, and no amount
+     * of keeping the *key* around could have avoided it, because the lookup needs
+     * the receipt itself to answer. What the change does owe the caller is that
+     * the ledger stops claiming otherwise: the index must not keep a key it can no
+     * longer resolve, and the loss must be counted where a reader can see it.
+     */
+    @Test
+    fun retryOutsideTheEvictedWindowIsExecutedAgainAndTheIndexSaysNothing() {
+        val tree = treeWith(RuntimeTreeConfig().apply { maxControlReceipts = 2 })
+        val root = tree.createRoot("root", model)
+        val child = tree.createChild("root", "child", model).getOrThrow()
+        tree.start(child.id)
+
+        stopRepeatedly(tree, root.id, child.id, count = 5)
+        assertTrue(
+            "the oldest operations are the ones that left",
+            tree.controlReceiptRetention().droppedReceipts > 0,
+        )
+
+        val replay = tree.stopDescendant(
+            RuntimeStopRequest(
+                actorNodeId = root.id,
+                targetNodeId = child.id,
+                rootId = root.id,
+                operationId = "op-0-retry",
+                idempotencyKey = "key-0",
+            ),
+        )
+        assertNotEquals("the evicted key is genuinely unknown again", "op-0", replay.operationId)
+        assertEquals("so this really was carried out as a fresh request", "op-0-retry", replay.operationId)
+        assertEquals(
+            "and nothing in the index pretends key-0 is still recognised",
+            0,
+            tree.danglingIdempotencyKeyCount(),
+        )
+    }
+
+    /**
+     * The control half of the restore guarantee: a legacy file's stop ledger is
+     * trimmed on load, so all three ledgers start applying their ceilings at the
+     * same moment rather than two of them now and one at its next append.
+     *
+     * This is the reachable case — the ceiling is new, so every tree already on
+     * disk was written without it — and the index has to come out of it consistent
+     * as well, since the file brought one in.
+     */
+    @Test
+    fun restoringALegacyOverBudgetControlLedgerTrimsItOnTheSpot() {
+        val opened = treeWith()
+        assertTrue(opened.restoreJson(legacyJson(stopReceipts = 2_500)))
+
+        val retention = opened.controlReceiptRetention()
+        assertEquals(
+            "the budget holds the moment the tree is loaded",
+            RuntimeTreeConfig.DEFAULT_CONTROL_RECEIPTS_LIMIT,
+            retention.retainedReceipts,
+        )
+        assertTrue("and it says so rather than looking complete", retention.truncated)
+        assertEquals(
+            "the dropped count matches the excess exactly",
+            2_500 - RuntimeTreeConfig.DEFAULT_CONTROL_RECEIPTS_LIMIT,
+            retention.droppedReceipts,
+        )
+        assertEquals(
+            "and no key from the file survived the receipt it pointed at",
+            0,
+            opened.danglingIdempotencyKeyCount(),
+        )
+    }
+
+    /**
+     * Distinguishes "the control ledger's eviction is durable and reported" from
+     * "a restart launders a trimmed ledger into one that looks whole" — the
+     * failure the persisted counters exist to prevent, one ledger over.
+     *
+     * The index count is part of that record: a restart that forgot how many keys
+     * left with the receipts would leave the next reader unable to tell a tree
+     * whose index was trimmed from one whose index was never touched.
+     */
+    @Test
+    fun trimmedControlLedgerSurvivesARestartStillSayingSo() {
+        val source = treeWith(RuntimeTreeConfig().apply { maxControlReceipts = 4 })
+        val root = source.createRoot("root", model)
+        val child = source.createChild("root", "child", model).getOrThrow()
+        source.start(child.id)
+        stopRepeatedly(source, root.id, child.id, count = 12)
+        val before = source.controlReceiptRetention()
+        assertEquals(8, before.droppedReceipts)
+        assertEquals(8, before.droppedIdempotencyKeys)
+
+        val restored = treeWith(RuntimeTreeConfig().apply { maxControlReceipts = 4 })
+        assertTrue(restored.restoreJson(source.toJson()))
+
+        val after = restored.controlReceiptRetention()
+        assertEquals("the trimmed ledger is exactly as long after a restart", 4, after.retainedReceipts)
+        assertTrue("a restart must not turn a trimmed ledger into a complete one", after.truncated)
+        assertEquals(before.droppedReceipts, after.droppedReceipts)
+        assertEquals(before.droppedChars, after.droppedChars)
+        assertEquals(
+            "the index loss is remembered too, or the restart launders it",
+            before.droppedIdempotencyKeys,
+            after.droppedIdempotencyKeys,
+        )
+        assertEquals(
+            "and what came back is a consistent pair of tables",
+            0,
+            restored.danglingIdempotencyKeyCount(),
+        )
+
+        val block = JSONObject(restored.toJson())
+            .getJSONObject("ledgerRetention")
+            .getJSONObject("stopReceipts")
+        assertEquals(8, block.getInt("droppedReceipts"))
+        assertEquals(8, block.getInt("droppedIdempotencyKeys"))
+    }
+
+    /**
+     * The one thing bounding this ledger *does* cost, pinned so it can never be
+     * discovered as a surprise: an operation has to be aborted after its receipt
+     * has left the window, [RuntimeSessionTree.abort] updates the receipt's
+     * `stateAfter` in place — and there is no longer a receipt to update.
+     * `RuntimeDelegationTest` asserts that update inside the window; this asserts
+     * what remains outside it.
+     *
+     * Not a silent failure, and deliberately not "fixed" by pinning the receipt:
+     * the terminal state is recorded in the `events` ledger, which is
+     * unconditional and independent of this budget, so the audit chain is unbroken
+     * and `stopReceipt(...)` returning `null` is the same honest "not in the
+     * window" answer it gives for an operation that never existed. Pinning would
+     * mean an unbounded set again, one `pendingStopOperationByNodeId` entry at a
+     * time — which is the defect this change removes, merely better disguised.
+     */
+    @Test
+    fun abortingAfterTheReceiptLeftTheWindowIsRecordedButNotAttachedToIt() {
+        val tree = treeWith(RuntimeTreeConfig().apply { maxControlReceipts = 2 })
+        val root = tree.createRoot("root", model)
+        val child = tree.createChild("root", "child", model).getOrThrow()
+        tree.start(child.id)
+
+        val first = tree.stopDescendant(
+            RuntimeStopRequest(
+                actorNodeId = root.id,
+                targetNodeId = child.id,
+                rootId = root.id,
+                operationId = "op-first",
+                idempotencyKey = "key-first",
+            ),
+        )
+        assertTrue(first.accepted)
+        // Two later operations push the first one out of a two-receipt window.
+        stopRepeatedly(tree, root.id, child.id, count = 2)
+        assertNull("the first receipt really is out of the window", tree.stopReceipt("op-first"))
+
+        assertTrue("aborting must still work, and must not throw", tree.abort(child.id, abnormal = false, reason = "stop acknowledged"))
+        assertNull("with no receipt left there is nothing to attach the state to", tree.stopReceipt("op-first"))
+        assertTrue(
+            "but the terminal state must still be auditable, or this would be a silent loss",
+            tree.events().any { it.kind == "aborted" && it.nodeId == child.id },
+        )
+        assertEquals("and the ledger stays consistent through it", 0, tree.danglingIdempotencyKeyCount())
     }
 }

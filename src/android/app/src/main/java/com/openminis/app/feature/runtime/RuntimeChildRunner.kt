@@ -336,12 +336,42 @@ class RuntimeChildRunner(
                 } else {
                     RuntimeDelivery.QUEUE
                 }
-                runtimeCoordinator.send(
+                val replyReceipt = runtimeCoordinator.send(
                     fromSessionId = childSessionId,
                     toSessionId = envelope.fromNodeId,
                     payload = outcome.text,
                     delivery = replyDelivery,
                 )
+                // [T-android-agent-messaging] A refused reply must not be
+                // silent. `send` records the refusal — `rejectDelivery`
+                // appends an `accepted = false` / `status = REJECTED` receipt
+                // carrying this `reason` — but nothing in production ever reads
+                // `receipts()` (see its KDoc in SessionTreeRuntime), and until
+                // this line the caller threw the return value away. So a reply
+                // this run could not deliver left no trace anywhere a developer
+                // or a later run could see it.
+                //
+                // This is a log rather than a second event or a user-facing
+                // card, and deliberately so. The payload is NOT logged: the
+                // outcome text is the child's whole result, and for an ordinary
+                // delegation it already reaches the parent through
+                // `publishDelegatedChildOutcome` — so which sentence failed to
+                // travel adds nothing that the ids and the reason do not.
+                // Nothing is retried or re-routed, and no delivery rule is
+                // relaxed here: an unauthorized direction stays unauthorized.
+                // In the default (non-Team) mode the only inbound sender is the
+                // parent, which is exactly the direction `send` refuses, so a
+                // reply is expected to be refused *once per consumed message* —
+                // that is a known shape worth one warning, not a failure that
+                // should be dressed up as a new user-visible notice.
+                if (!replyReceipt.accepted) {
+                    AppLogger.warning(
+                        TAG,
+                        "child $childSessionId could not answer ${envelope.fromNodeId} " +
+                            "(envelope ${envelope.id}, ${envelope.delivery} -> $replyDelivery): " +
+                            "${replyReceipt.reason ?: "no reason reported"}",
+                    )
+                }
             }
             withContext(Dispatchers.IO) {
                 val usageJson = outcome.usage?.let {
