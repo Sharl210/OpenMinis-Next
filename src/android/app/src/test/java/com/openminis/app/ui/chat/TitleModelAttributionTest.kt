@@ -210,7 +210,17 @@ class TitleModelAttributionTest {
             "titleSnapshot must keep refusing an entry that disagrees with the serving model",
             snapshot!!.contains("titleAttributionMatches("),
         )
-        val afterParse = chat.substringAfter("val (title, category, folderName) = parseTitleResponse(response.text)")
+        // The `""` is the point, not noise: without it `substringAfter` returns the
+        // WHOLE file when the delimiter is missing, so `.take(900)` would read the
+        // import block and the assertion could pass against a file that no longer
+        // contains this line at all. That is not hypothetical — the comment below
+        // records the identical mistake already having produced a never-true
+        // assertion elsewhere in this file. With the sentinel the slice is empty,
+        // `contains` is false, and a renamed marker REDs instead of whispering.
+        val afterParse = chat.substringAfter(
+            "val (title, category, folderName) = parseTitleResponse(response.text)",
+            "",
+        )
         assertTrue(
             "the success path must still record the model snapshot",
             afterParse.take(900).contains("updateSessionTitleAndCategoryWithModelSnapshot"),

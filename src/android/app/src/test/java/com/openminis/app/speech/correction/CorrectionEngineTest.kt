@@ -233,7 +233,24 @@ class CorrectionStrategyTest {
     fun `vocabulary block respects its character budget`() {
         val many = (1..500).map { candidate("typed_vocabulary", "词汇$it", "e") }
         val p = LlmCorrectionStrategy.buildPrompt("测试", many, ConversationContext.EMPTY)
-        val block = p.substringAfter("仅供参考）：\n").substringBefore("\n\n")
+        // The header is asserted, not assumed. `substringAfter` returns the whole
+        // string when its delimiter is missing, so a reworded header would quietly
+        // turn `block` into the prompt's first paragraph — and the naive repair is
+        // worse than the bug: passing `""` as the missing-delimiter value makes
+        // `block` empty, and an empty block satisfies `block.length <= budget`. The
+        // failure value would be exactly the value this assertion reads as success.
+        // Checking the marker first keeps a reworded header red from either side.
+        val header = "仅供参考）：\n"
+        assertTrue(
+            "the prompt must still contain the vocabulary-block header; without it this " +
+                "test measures the wrong slice and cannot fail",
+            p.contains(header),
+        )
+        val block = p.substringAfter(header).substringBefore("\n\n")
+        assertTrue(
+            "the slice must not be empty — an empty block satisfies the budget below",
+            block.isNotEmpty(),
+        )
         assertTrue(
             "vocab block was ${block.length} chars, budget is ${CorrectionContextBudget.VOCAB_BLOCK}",
             block.length <= CorrectionContextBudget.VOCAB_BLOCK,

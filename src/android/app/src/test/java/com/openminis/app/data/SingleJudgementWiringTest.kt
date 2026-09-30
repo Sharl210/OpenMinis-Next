@@ -90,7 +90,12 @@ class SingleJudgementWiringTest {
         // The expression body only: the next function in the companion legitimately
         // mentions "s3" (secretNeedsObscuring), and reading past this one would make
         // the assertions below about the wrong code.
-        val body = store.substringAfter("fun secretKeyFor(backend: String): String")
+        // `""` on purpose: `substringAfter` with no sentinel returns the ENTIRE
+        // file when the delimiter is absent, so the slice would quietly become
+        // "the first three lines of the file" — package plus imports — and the
+        // assertions below would be measuring nothing. With the sentinel a missing
+        // marker yields an empty `body` and a red test.
+        val body = store.substringAfter("fun secretKeyFor(backend: String): String", "")
             .lines().take(3).joinToString("\n")
         assertTrue(
             "secretKeyFor must read the catalog's declared secret field, got: ${body.trim().take(200)}",

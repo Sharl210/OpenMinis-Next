@@ -126,14 +126,31 @@ class ChildCapabilityInjectionTest {
         // The names that would count as a spawn affordance must be the composer
         // commands, otherwise the block could call a tool "available" that the
         // delegation parser would never accept.
-        val parserSource = sequenceOf(
-            File("src/main/java/com/openminis/app/feature/runtime/RuntimeDelegation.kt"),
-            File("app/src/main/java/com/openminis/app/feature/runtime/RuntimeDelegation.kt"),
-        ).first { it.isFile }.readText()
-
+        //
+        // Behaviour, not file text. This used to read `RuntimeDelegation.kt` and
+        // assert its source contained `"/subagent"`, `"/team"` and `"/delegate"` —
+        // which the `private const val` declarations satisfy even after nothing
+        // calls them, so dropping a command from the parser while leaving its
+        // constant behind kept the assertion green. Asking the parser is the claim
+        // actually being made, and only a parser that still accepts the command can
+        // satisfy it.
         listOf("/subagent", "/team", "/delegate").forEach { command ->
-            assertTrue("the parser must still know $command", parserSource.contains("\"$command\""))
+            assertTrue(
+                "the parser must still accept $command, or the capability block advertises " +
+                    "a spawn affordance the composer command cannot reach",
+                RuntimeDelegationParser.isCommand("$command do the thing"),
+            )
+            assertTrue(
+                "a bare $command is a command too",
+                RuntimeDelegationParser.isCommand(command),
+            )
         }
+        // The other direction, so the assertions above cannot be satisfied by a
+        // parser that accepts everything.
+        assertFalse(
+            "an ordinary message must not be read as a delegation",
+            RuntimeDelegationParser.isCommand("just a normal message"),
+        )
     }
 
     // ─── 角色结论 ────────────────────────────────────────────────────────
