@@ -1,7 +1,9 @@
 package com.openminis.app.i18n
 
+import com.openminis.app.shared.KotlinSourceText
 import java.io.File
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -160,6 +162,24 @@ class StringsLocaleParityTest {
     }
 
     @Test
+    fun `a key mentioned only inside a comment is not a reference`() {
+        val keys = referencedKeysIn(
+            listOf(
+                """
+                // migrated away from R.string.line_comment_only
+                /* block comment still says R.string.block_comment_only */
+                /** KDoc says stringResource(R.string.kdoc_only) is gone */
+                val label = stringResource(R.string.really_used)
+                """.trimIndent(),
+            ),
+        )
+        assertTrue("a real reference must still be found: $keys", keys.contains("really_used"))
+        assertFalse("a // comment must not count as a reference: $keys", keys.contains("line_comment_only"))
+        assertFalse("a /* */ comment must not count as a reference: $keys", keys.contains("block_comment_only"))
+        assertFalse("a KDoc must not count as a reference: $keys", keys.contains("kdoc_only"))
+    }
+
+    @Test
     fun `no locale simply repeats the English text for a translatable string`() {
         val default = declaredStrings(File(resourcesRoot(), "values/strings.xml"))
 
@@ -236,11 +256,24 @@ class StringsLocaleParityTest {
      * menu uses them). Counting them as app keys produced two phantom "missing from
      * values/" hits on the first run.
      */
-    private fun referencedKeys(): Set<String> {
+    private fun referencedKeys(): Set<String> = referencedKeysIn(kotlinSources().map { it.readText() })
+
+    /**
+     * The scanner itself, over already-read texts.
+     *
+     * Comments are masked **first**: a KDoc that mentions
+     * `stringResource(R.string.some_key)` is documentation, not a reference. Without
+     * the mask two things went wrong — a note mentioning a key that does not exist
+     * failed the build, and (worse) deleting the real `R.string.x` while a comment
+     * still mentioned it kept the check green, so a genuinely missing string went
+     * unnoticed. `KotlinSourceText.noComments` is the mask for exactly this question:
+     * it drops comments and **keeps string literals**, which is what a resource key is.
+     */
+    private fun referencedKeysIn(texts: List<String>): Set<String> {
         val pattern = Regex("(?<!android\\.)\\bR\\.string\\.([A-Za-z0-9_]+)")
         val out = mutableSetOf<String>()
-        for (file in kotlinSources()) {
-            for (match in pattern.findAll(file.readText())) out.add(match.groupValues[1])
+        for (text in texts) {
+            for (match in pattern.findAll(KotlinSourceText.noComments(text))) out.add(match.groupValues[1])
         }
         return out
     }
