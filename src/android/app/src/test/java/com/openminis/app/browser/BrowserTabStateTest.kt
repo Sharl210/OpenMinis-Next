@@ -3,6 +3,7 @@ package com.openminis.app.browser
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -14,12 +15,27 @@ class BrowserTabStateTest {
     }
 
     @Test fun `stable page identities are independent from runtime tab handles`() {
-        val first = BrowserTabRecord(pageId = "page-a", title = "Account", url = "https://example.com")
-        val reopened = first.copy()
-        val newPage = first.copy(pageId = "page-b")
-        assertEquals(first.pageId, reopened.pageId)
-        assertNotEquals(first.pageId, newPage.pageId)
-        assertEquals("Account", reopened.title)
+        // A runtime tab id is never reused once a WebView is evicted, so the PAGE
+        // identity has to travel inside the record and the handle is only a
+        // lookup key. This drives the real persistence ledger; the previous
+        // version asserted `copy()` round-trips and direct field reads, which the
+        // compiler already guarantees and which therefore could not fail for any
+        // production reason.
+        val records = mutableMapOf<Int, BrowserTabRecord>()
+        BrowserTabPersistence.rememberEvicted(records, 4, BrowserTabRecord("page-a", "Account", "https://example.com"))
+        BrowserTabPersistence.rememberEvicted(records, 7, BrowserTabRecord("page-b", "", "https://b.example.com"))
+
+        val reopenedA = BrowserTabPersistence.mergeLive(records, 4, BrowserTabRecord("", "", ""))
+        val reopenedB = BrowserTabPersistence.mergeLive(records, 7, BrowserTabRecord("", "", ""))
+
+        assertEquals("page-a", reopenedA.pageId)
+        assertEquals("page-b", reopenedB.pageId)
+        assertNotEquals(
+            "two handles must not collapse onto one page identity",
+            reopenedA.pageId,
+            reopenedB.pageId,
+        )
+        assertEquals("the stored title survives a blank live snapshot", "Account", reopenedA.title)
     }
 
     @Test fun `evicted page identity and title survive live merge with blank webview fields`() {
@@ -107,25 +123,57 @@ class BrowserTabStateTest {
     // --- [T-browser-sleeping-tabs-visible] slept pages stay addressable ---
 
     @Test fun `a slept page keeps its page identity and url`() {
-        // Sleep must not be a silent close. The record has to keep the PAGE id
-        // so the page can be listed and restored; the runtime tab id it used to
-        // be filed under is never reused inside a process, which is exactly why
-        // slept pages became unreachable forever.
-        val slept = BrowserTabRecord("page-abc-123", "Docs", "https://docs.example.com")
-        assertEquals("page-abc-123", slept.pageId)
-        assertEquals("Docs", slept.title)
-        assertEquals("https://docs.example.com", slept.url)
+        // Sleep must not be a silent close. The record has to stay addressable by
+        // its PAGE id — the runtime tab id it used to be filed under is never
+        // reused inside a process, which is exactly why slept pages became
+        // unreachable forever. Drives the real insert the evictor performs.
+        val sleeping = upsertSleepingTab(
+            existing = emptyList(),
+            record = BrowserTabRecord("page-abc-123", "Docs", "https://docs.example.com"),
+        )
+        val found = sleeping.firstOrNull { it.pageId == "page-abc-123" }
+        assertNotNull("a slept page must stay addressable by its page id", found)
+        assertEquals("Docs", found!!.title)
+        assertEquals("https://docs.example.com", found.url)
+        // The key is the PAGE id and nothing else: two pages that merely happen
+        // to share a title are two pages and must both stay listed.
+        val sameTitle = upsertSleepingTab(
+            existing = sleeping,
+            record = BrowserTabRecord("page-other", "Docs", "https://other.example.com"),
+        )
+        assertEquals("same-title pages must not collapse", 2, sameTitle.size)
     }
 
     @Test fun `sleeping list keys off page id so a restore is unambiguous`() {
         // restoreSleepingTab/forgetSleepingTab look records up by pageId, so a
         // page that sleeps twice must collapse to one entry, newest winning.
-        val kept = mutableListOf<BrowserTabRecord>()
-        repeat(3) { kept.add(BrowserTabRecord("page-$it", "t$it", "https://e/$it")) }
-        kept.add(BrowserTabRecord("page-1", "newer", "https://e/new"))
-        val deduped = kept.filterNot { it.pageId == "page-1" } + kept.last()
-        assertEquals("a re-slept page must not appear twice", 3, deduped.size)
-        assertEquals("newer", deduped.first { it.pageId == "page-1" }.title)
+        // Drives the PRODUCTION rule the evictor calls; the copy that used to
+        // live here could not fail when the real rule changed.
+        val alreadySlept = listOf(
+            BrowserTabRecord("page-0", "t0", "https://e/0"),
+            BrowserTabRecord("page-1", "old", "https://e/old"),
+            BrowserTabRecord("page-2", "t2", "https://e/2"),
+        )
+        val sleptAgain = upsertSleepingTab(
+            alreadySlept,
+            BrowserTabRecord("page-1", "newer", "https://e/new"),
+        )
+        assertEquals("a re-slept page must not appear twice", 3, sleptAgain.size)
+        val reopened = sleptAgain.first { it.pageId == "page-1" }
+        assertEquals("the newest record must win", "newer", reopened.title)
+        assertEquals("and carry the newest url", "https://e/new", reopened.url)
+    }
+
+    @Test fun `the sleeping list is capped and drops the oldest first`() {
+        // A bounded list: the cap defaults to production's MAX_SLEEPING_TABS and
+        // is passed explicitly here so the drop-oldest edge can be exercised.
+        val full = (0 until 3).map { BrowserTabRecord("page-$it", "t$it", "https://e/$it") }
+        val capped = upsertSleepingTab(
+            existing = full,
+            record = BrowserTabRecord("page-new", "n", "https://e/new"),
+            maxTabs = 3,
+        )
+        assertEquals(listOf("page-1", "page-2", "page-new"), capped.map { it.pageId })
     }
 
     @Test fun `agent-facing line reports a slept page and how to restore it`() {

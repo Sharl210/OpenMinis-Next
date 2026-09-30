@@ -1541,16 +1541,10 @@ fun ChatScreen(
         val info = listState.layoutInfo
         val visible = info.visibleItemsInfo
         if (visible.isEmpty()) return@scrollToPreviousUserTurn
-        // Ordered oldest → newest list of user-message ids, matching the order
-        // the user reads the conversation in.
-        val userIds = messages.filter { it.isManualHumanUser() }.map { it.id }
-        if (userIds.isEmpty()) {
-            // No user turns (rare) — fall back to the oldest item (the HIGHEST
-            // index; see the orientation note below) so the button is never a
-            // dead no-op.
-            tracedScrollToItem("FAB-UP/no-user-turns", (info.totalItemsCount - 1).coerceAtLeast(0), 0)
-            return@scrollToPreviousUserTurn
-        }
+        // The user-turn list, the walk anchor and the target decision all live in
+        // the pure top-level `resolvePreviousUserTurnTarget` below: this handler
+        // needs a LazyListState + live layout, so the rule has to be callable from
+        // a JVM test — otherwise the test could only ever mirror a copy of it.
         // Row-index orientation — measured on device, not inferred. Earlier
         // rounds of this feature flip-flopped because "reverseLayout=true" was
         // reasoned about instead of observed; the authoritative signal is each
@@ -1574,77 +1568,19 @@ fun ChatScreen(
         // "back" direction — is what produced the wrong anchor in the previous
         // implementation.
         val topKey = visible.minByOrNull { it.index }?.key as? String
-        // Map the top row back to its position in `messages`. Row keys are
-        // "<kind>:<messageId>[:extra]", and some kinds append their own suffix
-        // after the id (e.g. "mdblock:<id>:text_<id>_0:1"), so the id is the
-        // segment between the FIRST and SECOND colon — not everything after the
-        // first one.
-        val topMessageId = topKey
-            ?.split(':')
-            ?.getOrNull(1)
-            ?.substringBefore('#')
-            ?.takeIf { it.isNotEmpty() }
+        // The row-key → message-id parse is the pure `chatRowKeyMessageId` below
+        // (row keys are "<kind>:<messageId>[:extra]" and some kinds append their own
+        // suffix after the id, e.g. "mdblock:<id>:text_<id>_0:1").
+        val topMessageId = chatRowKeyMessageId(topKey)
         // `messages` is a TAIL WINDOW (ChatViewModel.uiMessages + loadOlderMessages),
         // so the visible top row can belong to a message that is not loaded yet.
-        // The top of the viewport is the OLDEST content on screen, so when it
-        // resolves to nothing the user is at/above the start of the window —
-        // anchor on the oldest loaded message (index 0) and let the walk proceed
-        // from there.
-        val topMsgIdx = topMessageId
-            ?.let { id -> messages.indexOfFirst { it.id == id } }
-            ?.takeIf { it >= 0 }
-            ?: 0
-        // The current turn's anchor = nearest user message AT OR ABOVE the top
-        // row (searching backwards through the conversation).
-        val currentAnchor = messages.take(topMsgIdx + 1).lastOrNull { it.isManualHumanUser() }?.id
-            ?: userIds.first()
-        // Decide the target — the rule from iOS `scrollToPreviousUserTurn`: if
-        // the viewport is already at the anchor we last jumped to (the user has
-        // seen this turn's start), step to the previous turn; otherwise land on
-        // the current turn's anchor first.
+        // Mapping the top row back to a message, anchoring the current turn, the
+        // repeated-tap walk and the "never scroll to a turn already fully on screen"
+        // rule all live in `resolvePreviousUserTurnTarget` below.
         //
-        // Android cannot re-derive the walk position from the viewport the way
-        // iOS does, for two independent reasons — so once a walk has started we
-        // always continue from `lastJumpedUserId`:
-        //
-        //  1. A LazyColumn CLAMPS at the end of its content. Near the oldest rows
-        //     the target can't reach the top, `currentAnchor` recomputes to the
-        //     same turn every tap, and the walk oscillates (device: taps 6/7
-        //     flipping bfa090b0 <-> 345b4a6c).
-        //  2. Top-aligning the landing (below) deliberately anchors the viewport
-        //     on a NEWER row than the target, so the recomputed `currentAnchor`
-        //     reads a turn NEWER than the one we just jumped to — the walk then
-        //     bounced 9 -> 22 -> 9 -> 22 forever.
-        //
-        // `lastJumpedUserId` is cleared on drag / jump-to-bottom / new messages /
-        // session switch, so this only ever chains genuine repeated taps; the
-        // first tap after any of those still anchors off the viewport.
-        val walkFrom = lastJumpedUserId?.takeIf { it in userIds } ?: currentAnchor
-        val pos = userIds.indexOf(walkFrom)
-        val steppedTarget = if (lastJumpedUserId == walkFrom && pos > 0) {
-            userIds[pos - 1]
-        } else {
-            walkFrom
-        }
-        // [T-android-fab-up-skip-visible] Never "scroll" to a turn the user is
-        // already looking at.
-        //
-        // `currentAnchor` is the nearest user message AT OR ABOVE the viewport
-        // top, so when a user bubble is already on screen it IS the anchor —
-        // and on the first tap (lastJumpedUserId == null) the target is the
-        // anchor itself. The button then scrolls to a bubble that is already
-        // visible, which reads as a dead tap: the transcript barely moves and
-        // the user has to tap twice to go back one turn.
-        //
-        // Fix: treat every user turn currently rendered in the viewport as
-        // "already seen" and walk further back until we find one that is not.
-        // Only fully-visible bubbles count — a turn scrolled half off the top
-        // edge is one the user has NOT finished reading, and jumping to it to
-        // align its top edge is a genuine, useful move.
-        //
-        // Visibility is read from the pre-seek layout on purpose: the seek
-        // below mutates the viewport, so anything derived afterwards would
-        // describe where the search happened to stop, not where the user was.
+        // Visibility is read from the pre-seek layout on purpose: the seek below
+        // mutates the viewport, so anything derived afterwards would describe where
+        // the search happened to stop, not where the user was.
         val viewportTop = info.viewportStartOffset
         val viewportBottom = info.viewportEndOffset
         val fullyVisibleUserIds: Set<String> = visible
@@ -1658,17 +1594,20 @@ fun ChatScreen(
             .mapNotNull { (it.key as? String)?.removePrefix("user:")?.substringBefore('#')?.takeIf { id -> id.isNotEmpty() } }
             .toSet()
 
-        val target = if (steppedTarget in fullyVisibleUserIds) {
-            // Walk back (toward older turns = LOWER index in `userIds`, which is
-            // ordered oldest → newest) past every turn already on screen. If all
-            // of them are visible we stop at the oldest — `scrollToItem` clamps,
-            // so this stays a harmless no-op at the start of the conversation
-            // rather than an overscroll.
-            var i = userIds.indexOf(steppedTarget)
-            while (i > 0 && userIds[i] in fullyVisibleUserIds) i--
-            userIds[i]
-        } else {
-            steppedTarget
+        val target = resolvePreviousUserTurnTarget(
+            messages = messages,
+            idOf = { it.id },
+            isUserTurn = { it.isManualHumanUser() },
+            topMessageId = topMessageId,
+            lastJumpedUserId = lastJumpedUserId,
+            fullyVisibleUserIds = fullyVisibleUserIds,
+        )
+        if (target == null) {
+            // No user turns (rare) — fall back to the oldest item (the HIGHEST
+            // index; see the orientation note above) so the button is never a
+            // dead no-op.
+            tracedScrollToItem("FAB-UP/no-user-turns", (info.totalItemsCount - 1).coerceAtLeast(0), 0)
+            return@scrollToPreviousUserTurn
         }
         // Resolve the target user bubble's row index by its stable key.
         //
@@ -1720,7 +1659,7 @@ fun ChatScreen(
                 // Advance past whatever is now on screen rather than one row at
                 // a time, but never skip ahead of the rows we have inspected.
                 val hi = listState.layoutInfo.visibleItemsInfo.maxByOrNull { it.index }?.index
-                probe = (hi ?: probe) + 1
+                probe = nextSeekProbeIndex(probe = probe, highestVisibleIndex = hi)
             }
         }
         if (targetIndex == null) {
@@ -7558,5 +7497,106 @@ private fun ThinkingLevelSheet(
     }
 }
 
+/**
+ * [T-android-scrollbtn-turn-walk] The message id carried by a LazyColumn row key.
+ *
+ * Row keys are "<kind>:<messageId>[:extra]", and some kinds append their own
+ * suffix after the id (e.g. "mdblock:<id>:text_<id>_0:1"), so the id is the
+ * segment between the FIRST and SECOND colon — taking everything after the first
+ * colon yields "<id>:text_..." which never matches a message id; every tap then
+ * fell back to the oldest loaded turn and the walk never advanced (device bug).
+ *
+ * A rendered row can also carry a `#n` dedupe suffix (`ChatFlatItems.dedupe`
+ * falls back to `"<id>#$n"` when a message would otherwise produce a duplicate
+ * LazyColumn key), so that suffix is dropped too.
+ *
+ * Top-level and pure on purpose: the up-button handler needs a LazyListState and
+ * a live layout, so a parse buried inside it cannot be exercised by a JVM test
+ * — the test would have to mirror the parse and would keep passing after the
+ * real parse broke.
+ */
+internal fun chatRowKeyMessageId(key: String?): String? =
+    key?.split(':')?.getOrNull(1)?.substringBefore('#')?.takeIf { it.isNotEmpty() }
 
+/**
+ * [T-android-scrollbtn-turn-walk] Which USER turn the up-button targets, given
+ * the viewport's top row, the walk so far and the turns already fully on screen.
+ *
+ * Returns null when the conversation has no user turn at all (the caller then
+ * falls back to the oldest row so the button is never a dead no-op).
+ *
+ * The user-visible rule (ported from iOS `scrollToPreviousUserTurn`, dcdec3c5):
+ *  - first tap lands on the turn the viewport is currently in — the nearest user
+ *    message AT OR ABOVE the visual top, because the top of the viewport is the
+ *    OLDEST content on screen;
+ *  - repeated taps (no intervening drag / new message) each go one turn further
+ *    back;
+ *  - the first turn is a floor: no overscroll past it;
+ *  - a turn already FULLY rendered in the viewport is not a target — scrolling to
+ *    something the user is looking at reads as a dead tap — so the walk keeps
+ *    going back until it finds one that is not fully visible.
+ *
+ * Two device-discovered corrections are part of the rule, not decoration:
+ *  - [T-android-scrollbtn-turn-walk] `messages` is a TAIL WINDOW, so the top row
+ *    can belong to an unloaded message; that case anchors on the oldest loaded
+ *    turn (index 0), NOT on the newest one.
+ *  - Once a walk has started it always continues from [lastJumpedUserId]: a
+ *    LazyColumn CLAMPS near the oldest rows, so the target never reaches the top
+ *    and the recomputed anchor keeps reading the same (or a NEWER) turn — the
+ *    walk oscillated between two turns forever (device: taps 6/7 of a 7-turn
+ *    session). [lastJumpedUserId] is cleared on drag / jump-to-bottom / new
+ *    messages / session switch, so this only ever chains genuine repeated taps.
+ *
+ * Pure and top-level on purpose: every branch above is a user-visible behaviour
+ * that has to be pinned by a JVM test, and a test can only pin it if the rule is
+ * reachable without a LazyListState.
+ */
+internal fun <T> resolvePreviousUserTurnTarget(
+    messages: List<T>,
+    idOf: (T) -> String,
+    isUserTurn: (T) -> Boolean,
+    topMessageId: String?,
+    lastJumpedUserId: String?,
+    fullyVisibleUserIds: Set<String>,
+): String? {
+    // Ordered oldest → newest, matching the order the user reads in.
+    val userIds = messages.filter(isUserTurn).map(idOf)
+    if (userIds.isEmpty()) return null
+    val topMsgIdx = topMessageId
+        ?.let { id -> messages.indexOfFirst { idOf(it) == id } }
+        ?.takeIf { it >= 0 }
+        ?: 0
+    // The current turn's anchor = nearest user message AT OR ABOVE the top row.
+    val currentAnchor = messages.take(topMsgIdx + 1).lastOrNull(isUserTurn)?.let(idOf)
+        ?: userIds.first()
+    val walkFrom = lastJumpedUserId?.takeIf { it in userIds } ?: currentAnchor
+    val pos = userIds.indexOf(walkFrom)
+    val steppedTarget = if (lastJumpedUserId == walkFrom && pos > 0) userIds[pos - 1] else walkFrom
+    if (steppedTarget !in fullyVisibleUserIds) return steppedTarget
+    // Walk back (toward older turns = LOWER index) past every turn already on
+    // screen; `scrollToItem` clamps, so stopping at the oldest is a harmless
+    // no-op rather than an overscroll.
+    var i = userIds.indexOf(steppedTarget)
+    while (i > 0 && userIds[i] in fullyVisibleUserIds) i--
+    return userIds[i]
+}
 
+/**
+ * [T-android-scrollbtn-turn-walk] The next row the up-button's seek should
+ * scroll to and inspect.
+ *
+ * Starts at row 0 and sweeps forward, always continuing from just past the
+ * highest row currently on screen — so it can never step over a row it has not
+ * looked at, and it cannot loop on a probe that made no progress. The row list
+ * itself lives inside the LazyColumn's own scope and is not reachable from the
+ * handler, which is why the seek has to walk the viewport at all; and the
+ * direction cannot be assumed (the target's row can sit above or below the
+ * window depending on how tall the intervening tool / thinking blocks are),
+ * which is what the earlier stride-upward version got wrong — it jumped straight
+ * over a target sitting one row below the window and surfaced as a dead button.
+ *
+ * Pure and top-level so the sweep can be driven from a JVM test; a copy of the
+ * arithmetic in the test would keep passing after the real one broke.
+ */
+internal fun nextSeekProbeIndex(probe: Int, highestVisibleIndex: Int?): Int =
+    (highestVisibleIndex ?: probe) + 1

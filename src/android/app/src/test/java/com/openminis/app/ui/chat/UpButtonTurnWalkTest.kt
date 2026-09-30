@@ -14,8 +14,12 @@ import org.junit.Test
  * That rule is the whole user-visible behaviour — "first tap goes to this turn,
  * repeated taps walk further back, and the first turn is a floor".
  *
+ * The rule itself is the PRODUCTION top-level `resolvePreviousUserTurnTarget`
+ * (and `chatRowKeyMessageId`), called from `ChatScreen`. This file deliberately
+ * holds no copy of it: a copy keeps passing after the real rule breaks.
+ *
  * Two device-discovered bugs are pinned here as regression cases:
- *  - `keyMessageId` parsing: row keys look like "mdblock:<id>:text_<id>_0:1",
+ *  - `chatRowKeyMessageId` parsing: row keys look like "mdblock:<id>:text_<id>_0:1",
  *    so taking everything after the FIRST colon yields "<id>:text_..." which
  *    never matches a message id. Every tap then fell back to the oldest loaded
  *    turn and the walk never advanced.
@@ -27,33 +31,30 @@ class UpButtonTurnWalkTest {
 
     private data class Msg(val id: String, val role: String)
 
-    /** Mirrors the id extraction in ChatScreen's scrollToPreviousUserTurn. */
-    private fun keyMessageId(key: String?): String? =
-        key?.split(':')?.getOrNull(1)?.substringBefore('#')?.takeIf { it.isNotEmpty() }
-
-    /** Mirrors the target-selection rule in ChatScreen's scrollToPreviousUserTurn. */
+    /**
+     * Feeds the PRODUCTION rule instead of a copy of it:
+     * [resolvePreviousUserTurnTarget] is the same top-level function that
+     * `ChatScreen`'s `scrollToPreviousUserTurn` calls, and
+     * [chatRowKeyMessageId] is the same row-key parse it uses. This helper only
+     * adapts the fixture onto those parameters.
+     *
+     * The fixture models "the human's own turn" as `role == "user"`; the
+     * production predicate (`ChatMessage.isManualHumanUser`) additionally checks
+     * `provenance`, which this fixture has no field for.
+     */
     private fun pickTarget(
         messages: List<Msg>,
         topRowKey: String?,
         lastJumpedUserId: String?,
-    ): String? {
-        val userIds = messages.filter { it.role == "user" }.map { it.id }
-        if (userIds.isEmpty()) return null
-        val topMessageId = keyMessageId(topRowKey)
-        val topMsgIdx = topMessageId
-            ?.let { id -> messages.indexOfFirst { it.id == id } }
-            ?.takeIf { it >= 0 }
-            ?: 0
-        val currentAnchor = messages.take(topMsgIdx + 1).lastOrNull { it.role == "user" }?.id
-            ?: userIds.first()
-        // Once a walk has started, always continue from lastJumpedUserId — the
-        // viewport can no longer be trusted to identify the current turn (the
-        // list clamps at its end, and top-aligning anchors the viewport on a
-        // NEWER row than the target).
-        val walkFrom = lastJumpedUserId?.takeIf { it in userIds } ?: currentAnchor
-        val pos = userIds.indexOf(walkFrom)
-        return if (lastJumpedUserId == walkFrom && pos > 0) userIds[pos - 1] else walkFrom
-    }
+        fullyVisibleUserIds: Set<String> = emptySet(),
+    ): String? = resolvePreviousUserTurnTarget(
+        messages = messages,
+        idOf = { it.id },
+        isUserTurn = { it.role == "user" },
+        topMessageId = chatRowKeyMessageId(topRowKey),
+        lastJumpedUserId = lastJumpedUserId,
+        fullyVisibleUserIds = fullyVisibleUserIds,
+    )
 
     /** u1 a1 u2 a2 u3 a3 — three turns, assistant reply after each. */
     private val convo = listOf(
@@ -133,13 +134,42 @@ class UpButtonTurnWalkTest {
     }
 
     @Test
+    fun `a turn already fully on screen is not a scroll target`() {
+        // [T-android-fab-up-skip-visible] The anchor IS the turn already rendered
+        // in the viewport, so targeting it reads as a dead tap: the transcript
+        // barely moves and the user has to tap twice to go back one turn. The
+        // walk must therefore continue to the first turn that is NOT fully
+        // visible.
+        val target = pickTarget(
+            convo,
+            topRowKey = "user:u3",
+            lastJumpedUserId = null,
+            fullyVisibleUserIds = setOf("u3"),
+        )
+        assertEquals("u2", target)
+    }
+
+    @Test
+    fun `when every turn is already on screen the walk stops at the oldest`() {
+        // scrollToItem clamps, so stopping at the first turn stays a harmless
+        // no-op instead of an overscroll.
+        val target = pickTarget(
+            convo,
+            topRowKey = "user:u3",
+            lastJumpedUserId = null,
+            fullyVisibleUserIds = setOf("u1", "u2", "u3"),
+        )
+        assertEquals("u1", target)
+    }
+
+    @Test
     fun `row keys with an id suffix still resolve to the message id`() {
         // Device-observed key shape. substringAfter(':') would return
         // "a3:text_a3_0:1" and match nothing.
-        assertEquals("a3", keyMessageId("mdblock:a3:text_a3_0:1"))
-        assertEquals("u3", keyMessageId("user:u3"))
-        assertEquals("a3", keyMessageId("thinking:a3"))
-        assertNull(keyMessageId("__resume_banner__"))
+        assertEquals("a3", chatRowKeyMessageId("mdblock:a3:text_a3_0:1"))
+        assertEquals("u3", chatRowKeyMessageId("user:u3"))
+        assertEquals("a3", chatRowKeyMessageId("thinking:a3"))
+        assertNull(chatRowKeyMessageId("__resume_banner__"))
     }
 
     @Test
@@ -152,37 +182,55 @@ class UpButtonTurnWalkTest {
     }
 
     /**
-     * Mirrors the row-index search in ChatScreen. `rows` is the flat row list
-     * (index -> key); `viewport` is the inclusive range of rows on screen when
-     * the tap happens. Returns the found row index, or null for a dead tap.
+     * The seek algorithm that was REMOVED from `ChatScreen` (stride upward from
+     * the highest visible row), kept only as a record of its failure mode. It is
+     * a historical algorithm and NOT production code, so no assertion on it can
+     * ever guard a change in the app — it exists to document why the stride was
+     * dropped, nothing more.
      */
-    private fun seekRowIndex(
+    private fun legacyStrideSeek(
         rows: List<String>,
         viewport: IntRange,
         targetKey: String,
-        strideFromHighestOnly: Boolean,
     ): Int? {
-        rows.indexOf(targetKey).let { if (it in viewport) return it }
-        if (strideFromHighestOnly) {
-            // The OLD algorithm: stride upward from the highest visible row by a
-            // viewport's worth of rows at a time.
-            var hi = viewport.last
-            val stride = viewport.count().coerceAtLeast(1)
-            var guard = 0
-            while (guard++ < 60) {
-                val next = (hi + stride).coerceAtMost(rows.lastIndex)
-                if (next <= hi) return null
-                // After scrolling to `next`, roughly that row and the following
-                // viewport-worth are on screen.
-                val window = next..(next + stride - 1).coerceAtMost(rows.lastIndex)
-                val found = rows.indexOf(targetKey)
-                if (found in window) return found
-                hi = window.last
-            }
-            return null
+        var hi = viewport.last
+        val stride = viewport.count().coerceAtLeast(1)
+        var guard = 0
+        while (guard++ < 60) {
+            val next = (hi + stride).coerceAtMost(rows.lastIndex)
+            if (next <= hi) return null
+            val window = next..(next + stride - 1).coerceAtMost(rows.lastIndex)
+            val found = rows.indexOf(targetKey)
+            if (found in window) return found
+            hi = window.last
         }
-        // The NEW algorithm: sweep from row 0 forward.
-        return rows.indexOf(targetKey).takeIf { it >= 0 }
+        return null
+    }
+
+    /**
+     * Drives the PRODUCTION seek rule [nextSeekProbeIndex] — the same top-level
+     * function `ChatScreen`'s seek loop calls — over a stub row list. Each probe
+     * makes rows `probe until probe + span` visible, exactly like
+     * `tracedScrollToItem("FAB-UP/seek", probe, 0)` followed by reading the
+     * viewport and continuing past the highest row now on screen.
+     *
+     * The sweep starts at row 0 on purpose: the target can sit ABOVE or BELOW
+     * the current window (how far the anchor's row is from the viewport depends
+     * on how tall the intervening tool / thinking / shell-output blocks are), so
+     * the direction cannot be assumed, and a stride steps straight over a target
+     * that sits just outside the window — the reported dead-tap bug.
+     */
+    private fun fullSweepSeek(rows: List<String>, span: Int, targetKey: String): Int? {
+        var probe = 0
+        var guard = 0
+        while (probe <= rows.lastIndex && guard++ < 200) {
+            val hi = (probe + span - 1).coerceAtMost(rows.lastIndex)
+            (probe..hi).firstOrNull { rows[it] == targetKey }?.let { return it }
+            val next = nextSeekProbeIndex(probe = probe, highestVisibleIndex = hi)
+            if (next <= probe) return null
+            probe = next
+        }
+        return null
     }
 
     @Test
@@ -195,12 +243,12 @@ class UpButtonTurnWalkTest {
         val viewport = 0..8
 
         assertNull(
-            "old stride seek must miss it (this is the reported bug)",
-            seekRowIndex(rows, viewport, "user:u2", strideFromHighestOnly = true),
+            "legacy stride seek must miss it (recorded bug, not production code)",
+            legacyStrideSeek(rows, viewport, "user:u2"),
         )
         assertEquals(
             9,
-            seekRowIndex(rows, viewport, "user:u2", strideFromHighestOnly = false),
+            fullSweepSeek(rows, span = viewport.count(), targetKey = "user:u2"),
         )
     }
 
@@ -211,7 +259,7 @@ class UpButtonTurnWalkTest {
         val rows = List(47) { "row$it" }.toMutableList().also { it[46] = "user:u1" }
         assertEquals(
             46,
-            seekRowIndex(rows, 0..8, "user:u1", strideFromHighestOnly = false),
+            fullSweepSeek(rows, span = 9, targetKey = "user:u1"),
         )
     }
 
@@ -235,9 +283,9 @@ class UpButtonTurnWalkTest {
      */
     @Test
     fun `deduped row keys resolve to the underlying message id`() {
-        assertEquals("u2", keyMessageId("user:u2#2"))
-        assertEquals("u2", keyMessageId("mdblock:u2#2:text_u2_0:1"))
-        assertEquals("u2", keyMessageId("user:u2"))
+        assertEquals("u2", chatRowKeyMessageId("user:u2#2"))
+        assertEquals("u2", chatRowKeyMessageId("mdblock:u2#2:text_u2_0:1"))
+        assertEquals("u2", chatRowKeyMessageId("user:u2"))
         // End to end through the selection rule: the first tap must still land
         // on the turn the viewport is showing, not on the oldest turn.
         assertEquals("u3", pickTarget(convo, topRowKey = "user:u3#2", lastJumpedUserId = null))

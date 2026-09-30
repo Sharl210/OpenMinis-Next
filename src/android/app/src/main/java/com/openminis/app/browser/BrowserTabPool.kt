@@ -1760,8 +1760,9 @@ class BrowserTabPool(private val context: Context) {
             persistedTabRecords[tab.id] = record
             // [T-browser-sleeping-tabs-visible] File it under the PAGE identity,
             // not the runtime handle, so it stays addressable and recoverable.
-            val kept = (_sleepingTabs.value.filterNot { it.pageId == record.pageId } + record)
-            _sleepingTabs.value = kept.takeLast(MAX_SLEEPING_TABS)
+            // One record per PAGE identity, newest wins — the rule lives in the
+            // pure top-level `upsertSleepingTab` below so a JVM test can pin it.
+            _sleepingTabs.value = upsertSleepingTab(_sleepingTabs.value, record)
             destroyTab(tab)
             currentTabs.remove(tab)
             Log.i(TAG, "Evicted idle tab ${tab.id} (page ${tab.pageId.take(8)})")
@@ -2016,3 +2017,25 @@ internal fun formatSleepingTabLine(record: BrowserTabRecord): String {
     val url = record.url.ifEmpty { "about:blank" }
     return "  Sleeping page ${record.pageId.take(8)}: $title — $url (restore with restore_tab)"
 }
+
+/**
+ * [T-browser-sleeping-tabs-visible] File a newly slept page into the sleeping
+ * list, keyed by PAGE identity and not by the runtime tab handle.
+ *
+ * Sleep must not be a silent close: `restoreSleepingTab` / `forgetSleepingTab`
+ * look records up by `pageId`, so a page that sleeps twice must collapse to ONE
+ * entry with the newest record winning — otherwise the second sleep would leave
+ * a stale duplicate that shadows the real one, and the runtime tab id it used to
+ * be filed under is never reused inside a process. Oldest entries are dropped
+ * first past [maxTabs] so a long session cannot accumulate records forever.
+ *
+ * Top-level and pure on purpose: the evictor decides inline against a live
+ * WebView, so a rule buried inside it can only be mirrored (copied) by a test —
+ * and a copy keeps passing after the real rule breaks.
+ */
+internal fun upsertSleepingTab(
+    existing: List<BrowserTabRecord>,
+    record: BrowserTabRecord,
+    maxTabs: Int = BrowserTabPool.MAX_SLEEPING_TABS,
+): List<BrowserTabRecord> =
+    (existing.filterNot { it.pageId == record.pageId } + record).takeLast(maxTabs)
