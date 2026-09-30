@@ -111,6 +111,41 @@ data class AgentBehaviorSettings(
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
+// The user's compact-reserve setting, in ONE place.
+//
+// [R5] `compactThresholdTokens` is persisted in THOUSANDS of tokens and `0` is
+// the UI's "off". Both facts were previously expressed only as an inline
+// expression at the two call sites that build a `ContextPolicy`
+// (`ChatViewModel.checkContextBeforeSend` and
+// `ChatViewModel.inLoopContextCheck`):
+//
+//     .compactThresholdTokens.takeIf { it > 0 }?.times(1_000)
+//
+// Measured before this extraction: the string `compactThresholdTokens` appeared
+// ZERO times under `src/test` and `src/androidTest`. Deleting `.times(1_000)`,
+// or reversing `takeIf { it > 0 }`, left the whole suite green — the setting was
+// wired to the compaction trigger by two lines nobody was watching. The scaling
+// is therefore expressed once, here, where a JVM test can execute it.
+//
+// This is an extraction, not a new behaviour or a new call path: both sites now
+// call this function instead of repeating the expression.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * The persisted compact threshold, converted into the token units
+ * [com.openminis.app.data.ContextPolicy.forContextWindow] consumes.
+ *
+ *  * the stored value is in **thousands** of tokens
+ *    ([AgentBehaviorSettingsPrefs.DEFAULT_COMPACT_THRESHOLD_TOKENS] is 150, i.e.
+ *    150 000 tokens = the default reserve, and
+ *    [AgentBehaviorSettingsPrefs.MAX_COMPACT_THRESHOLD_TOKENS] is likewise 150);
+ *  * `0` is "off" in the settings UI, which means *no user reserve* — `null` —
+ *    and must never be read as a reserve of zero tokens.
+ */
+internal fun compactHeadroomTokensFromSetting(compactThresholdTokens: Int): Int? =
+    compactThresholdTokens.takeIf { it > 0 }?.times(1_000)
+
+// ─────────────────────────────────────────────────────────────────────────────
 // The user's automatic-retry setting, in ONE place.
 //
 // [T-android-retry-governs-title-and-compaction] Every call site that is

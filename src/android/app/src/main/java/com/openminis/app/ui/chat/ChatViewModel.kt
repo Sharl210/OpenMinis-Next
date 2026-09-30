@@ -118,6 +118,7 @@ import com.openminis.app.service.SessionConcurrencyManager
 import com.openminis.app.feature.runtime.AgentRetryRunner
 import com.openminis.app.feature.runtime.RuntimeInboxSurfacing
 import com.openminis.app.ui.settings.AgentBehaviorSettingsPrefs
+import com.openminis.app.ui.settings.compactHeadroomTokensFromSetting
 import com.openminis.app.ui.settings.agentRetryPolicyFromSettings
 import com.openminis.app.ui.settings.agentRetryRunnerFromSettings
 import com.openminis.app.ui.settings.effectiveMaxRetryAttempts
@@ -4764,8 +4765,9 @@ class ChatViewModel(
         val window = effectiveContextWindowTokens() ?: return PreSendContextAction.PROCEED
         val policy = ContextPolicy.forContextWindow(
             window,
-            compactHeadroomTokens = AgentBehaviorSettingsPrefs(context).load()
-                .compactThresholdTokens.takeIf { it > 0 }?.times(1_000),
+            compactHeadroomTokens = compactHeadroomTokensFromSetting(
+                AgentBehaviorSettingsPrefs(context).load().compactThresholdTokens,
+            ),
         )
         return when (policy.check(tokens, window)) {
             ContextPolicy.CheckResult.OK -> PreSendContextAction.PROCEED
@@ -4899,8 +4901,9 @@ class ChatViewModel(
         val window = effectiveContextWindowTokens() ?: return InLoopContextAction.PROCEED
         val policy = ContextPolicy.forContextWindow(
             window,
-            compactHeadroomTokens = AgentBehaviorSettingsPrefs(context).load()
-                .compactThresholdTokens.takeIf { it > 0 }?.times(1_000),
+            compactHeadroomTokens = compactHeadroomTokensFromSetting(
+                AgentBehaviorSettingsPrefs(context).load().compactThresholdTokens,
+            ),
         )
         return when (policy.check(tokens, window)) {
             ContextPolicy.CheckResult.OK -> InLoopContextAction.PROCEED

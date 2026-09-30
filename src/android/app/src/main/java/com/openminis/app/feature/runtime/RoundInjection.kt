@@ -62,6 +62,47 @@ object RoundInjectionPolicy {
     }
 }
 
+/**
+ * The history shaping an injected prompt performs, as a pure top-level function.
+ *
+ * ## Why this is top-level and `internal`
+ *
+ * Two production call sites hand the result of this straight to a provider as the
+ * turn's messages: `ChatViewModel`'s per-round injection and `RuntimeChildRunner`'s
+ * child-agent injection. Until this extraction, the only way to execute the shape
+ * was `RoundInjectionCoordinator.appendToHistory`, whose constructor reads
+ * SharedPreferences — unreachable from a JVM unit test, which is why the string
+ * `appendToHistory` appeared **zero** times under `src/test` and `src/androidTest`.
+ *
+ * The extraction changes no behaviour and adds no call path: `appendToHistory`
+ * delegates here, and both production sites still reach it through that single
+ * method. It exists so the shape below can be executed by a test rather than
+ * described by one.
+ *
+ * ## The shape, and which half is load-bearing
+ *
+ * The appended turn is a `USER` turn — it is an instruction for this turn, not a
+ * system rule. The bridge is the part that is easy to delete and expensive to
+ * lose: several providers reject (and others silently mis-attribute) a second
+ * `USER` message immediately following a `USER` message, so an `ASSISTANT`
+ * acknowledgement is inserted between them. The bridge is in-memory only; it is
+ * never persisted into the transcript.
+ */
+internal fun appendInjectedPromptToHistory(history: MutableList<LLMMessage>, prompt: String) {
+    if (history.lastOrNull()?.role == LLMMessage.Role.USER) {
+        history += LLMMessage(
+            role = LLMMessage.Role.ASSISTANT,
+            content = RoundInjectionCoordinator.ROLE_BRIDGE,
+            contentParts = listOf(AgentContentPart.Text(RoundInjectionCoordinator.ROLE_BRIDGE)),
+        )
+    }
+    history += LLMMessage(
+        role = LLMMessage.Role.USER,
+        content = prompt,
+        contentParts = listOf(AgentContentPart.Text(prompt)),
+    )
+}
+
 /** Durable per-session counter. Settings are intentionally separate from counters. */
 class RoundInjectionCoordinator(context: Context) {
     private val statePrefs = context.applicationContext.getSharedPreferences(
@@ -80,20 +121,8 @@ class RoundInjectionCoordinator(context: Context) {
     }
 
     /** Adds a model-visible user turn, inserting an in-memory role bridge when needed. */
-    fun appendToHistory(history: MutableList<LLMMessage>, prompt: String) {
-        if (history.lastOrNull()?.role == LLMMessage.Role.USER) {
-            history += LLMMessage(
-                role = LLMMessage.Role.ASSISTANT,
-                content = ROLE_BRIDGE,
-                contentParts = listOf(AgentContentPart.Text(ROLE_BRIDGE)),
-            )
-        }
-        history += LLMMessage(
-            role = LLMMessage.Role.USER,
-            content = prompt,
-            contentParts = listOf(AgentContentPart.Text(prompt)),
-        )
-    }
+    fun appendToHistory(history: MutableList<LLMMessage>, prompt: String) =
+        appendInjectedPromptToHistory(history, prompt)
 
     fun reset(sessionId: String) {
         if (sessionId.isNotBlank()) statePrefs.edit().remove(key(sessionId)).apply()
