@@ -210,7 +210,20 @@ Release builds are intentionally **not** signed with the debug key. To create a 
 ```sh
 ./gradlew :app:testDebugUnitTest        # JVM unit tests
 ./gradlew :app:connectedAndroidTest     # instrumented; needs a device/emulator
+./scripts/run-instrumented-tests.sh     # same suite, but it counts the skips
 ```
+
+`connectedAndroidTest` reports failures only. A case that leaves early through
+`Assume.assumeTrue(...)` is neither a pass nor a failure as far as that summary is
+concerned, so it goes unmentioned. On an x86_64 emulator — where the arm64 sandbox assets
+cannot be used — the suite prints `OK (179 tests)`, which reads as a clean run, while 49 of
+those cases asserted nothing at all.
+
+`run-instrumented-tests.sh` counts the per-case status codes out of the raw stream instead
+(`1` started, `0` passed, `-2` failed, `-4` assumption violated), lists every skipped case
+by name together with its reason, and exits non-zero when the stream carries no verdicts at
+all — so a run that verified nothing cannot be mistaken for one that verified everything.
+**Quote the skipped count whenever you quote a test run.**
 
 ---
 
@@ -236,6 +249,14 @@ installation, e.g.
 **Android: app starts but the shell does not** — the sandbox assets are
 missing. Rerun `./deps/build_proot.sh` and
 `./scripts/prepare_android_sandbox.sh`, then rebuild.
+
+**Android: instrumented tests pass — but ask what they actually verified** — the sandbox
+assets are arm64-only and are absent unless both scripts above have been run, so 49 of the
+instrumented cases skip themselves through `Assume` and never assert anything.
+`./gradlew connectedAndroidTest` does not mention them. Run
+`./scripts/run-instrumented-tests.sh` instead; it reports
+`passed N / skipped 49 / failed N`. Those cases need an arm64 device or emulator image
+regardless — see the `abiFilters` note above.
 
 **Android: every command returns `[Shell not running] (exit code: -1)`** —
 the proot ELF loaders are missing from the APK. Check that
