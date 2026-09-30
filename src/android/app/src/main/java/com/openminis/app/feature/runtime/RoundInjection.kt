@@ -3,6 +3,7 @@ package com.openminis.app.feature.runtime
 import android.content.Context
 import com.openminis.app.data.model.AgentContentPart
 import com.openminis.app.data.model.LLMMessage
+import com.openminis.app.logging.AppLogger
 import org.json.JSONObject
 
 /** User-facing configuration for DSH-compatible periodic prompt injection. */
@@ -88,6 +89,33 @@ object RoundInjectionPolicy {
  * acknowledgement is inserted between them. The bridge is in-memory only; it is
  * never persisted into the transcript.
  */
+/**
+ * The counters a stored entry describes, or null when it cannot be read back.
+ *
+ * Split out of [RoundInjectionCoordinator.readState] so the rule is executable without
+ * Android: the coordinator needs a `Context`, which is exactly why the discard this
+ * function reports was never observable to a test. `readState` owns the reporting; this
+ * owns "is this readable, and what does it say".
+ *
+ * Returning null rather than a default is the whole point. A default here is
+ * indistinguishable from "this session has not been counted yet", and those two need
+ * opposite handling: the first is silence, the second is a lost counter that makes the
+ * start prompt fire a second time.
+ */
+internal fun parseRoundInjectionState(raw: String): RoundInjectionState? {
+    return runCatching {
+        val json = JSONObject(raw)
+        RoundInjectionState(
+            totalModelCalls = json.optInt("totalModelCalls", 0).coerceAtLeast(0),
+            lastInjectionCall = if (json.has("lastInjectionCall") && !json.isNull("lastInjectionCall")) {
+                json.optInt("lastInjectionCall").takeIf { it > 0 }
+            } else {
+                null
+            },
+        )
+    }.getOrNull()
+}
+
 internal fun appendInjectedPromptToHistory(history: MutableList<LLMMessage>, prompt: String) {
     if (history.lastOrNull()?.role == LLMMessage.Role.USER) {
         history += LLMMessage(
@@ -104,7 +132,21 @@ internal fun appendInjectedPromptToHistory(history: MutableList<LLMMessage>, pro
 }
 
 /** Durable per-session counter. Settings are intentionally separate from counters. */
-class RoundInjectionCoordinator(context: Context) {
+/**
+ * Per-session round-injection counters.
+ *
+ * [reportCorruption] is where a counter that could not be read back is reported. A missing
+ * entry is a session that has not been counted yet and stays silent; an entry that exists
+ * but cannot be parsed is not.
+ */
+class RoundInjectionCoordinator(
+    context: Context,
+    /**
+     * See the class note. Injectable for the same reason [RuntimeTreeStore.openForTest] is:
+     * a JVM test cannot read the log, and this is the only signal that a counter was lost.
+     */
+    private val reportCorruption: (String) -> Unit = { detail -> AppLogger.warning(TAG, detail) },
+) {
     private val statePrefs = context.applicationContext.getSharedPreferences(
         STATE_PREFS,
         Context.MODE_PRIVATE,
@@ -129,18 +171,20 @@ class RoundInjectionCoordinator(context: Context) {
     }
 
     private fun readState(sessionId: String): RoundInjectionState {
+        // A session that has never been counted has no entry: that is the normal first
+        // call and stays silent.
         val raw = statePrefs.getString(key(sessionId), null) ?: return RoundInjectionState()
-        return runCatching {
-            val json = JSONObject(raw)
-            RoundInjectionState(
-                totalModelCalls = json.optInt("totalModelCalls", 0).coerceAtLeast(0),
-                lastInjectionCall = if (json.has("lastInjectionCall") && !json.isNull("lastInjectionCall")) {
-                    json.optInt("lastInjectionCall").takeIf { it > 0 }
-                } else {
-                    null
-                },
-            )
-        }.getOrDefault(RoundInjectionState())
+        val parsed = parseRoundInjectionState(raw)
+        if (parsed != null) return parsed
+        // The entry exists but cannot be read back, so the counters in it are being
+        // discarded and the session restarts its count at zero. That is not a neutral
+        // reset: `RoundInjectionPolicy` treats call number 1 as the session's first, so
+        // the start prompt fires again mid-session and the periodic schedule restarts.
+        reportCorruption(
+            "the round-injection counter for this session exists but could not be read, " +
+                "so it is being discarded and the session will recount from zero",
+        )
+        return RoundInjectionState()
     }
 
     private fun writeState(sessionId: String, state: RoundInjectionState) {
@@ -155,6 +199,7 @@ class RoundInjectionCoordinator(context: Context) {
     private fun key(sessionId: String): String = "session_$sessionId"
 
     companion object {
+        private const val TAG = "RoundInjectionCoordinator"
         private const val STATE_PREFS = "round_injection_runtime"
         const val ROLE_BRIDGE = "(Periodic prompt injection follows; treat it as a user instruction for this turn.)"
 
