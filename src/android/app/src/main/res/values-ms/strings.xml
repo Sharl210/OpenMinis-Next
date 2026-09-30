@@ -1888,6 +1888,8 @@
     <string name="browser_element_confirm_title">Hantar elemen ini kepada AI?</string>
     <string name="browser_element_send">Hantar ke sembang</string>
     <string name="browser_element_cancel">Batal</string>
+    <string name="browser_element_pick_timeout">Pemilihan elemen tamat masa — tiada apa yang dipilih</string>
+    <string name="browser_element_pick_unavailable">Pemilihan elemen tidak dapat dimulakan pada halaman ini</string>
     <string name="chat_auto_retry_progress">Sambungan gagal — cuba semula secara automatik dalam %1$d s (cubaan %2$d daripada %3$d)</string>
     <string name="chat_auto_retry_progress_unlimited">Sambungan gagal — cuba semula secara automatik dalam %1$d s (cubaan %2$d)</string>
     <string name="browser_bookmarks_title">Penanda buku</string>

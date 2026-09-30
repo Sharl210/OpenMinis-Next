@@ -2,6 +2,7 @@ package com.openminis.app.ui.browser
 
 import android.widget.Toast
 import com.openminis.app.R
+import org.json.JSONObject
 import com.openminis.app.browser.BrowserAction
 import com.openminis.app.browser.BrowserActionInput
 import kotlinx.coroutines.delay
@@ -576,38 +577,61 @@ fun BrowserSheet(
                         val manager = tab.manager
                         scope.launch {
                             val armed = manager.execute(BrowserActionInput(action = BrowserAction.EXECUTE_JS, script = START_ELEMENT_PICKER_JS))
-                            if (!armed.success) return@launch
+                            if (!armed.success) {
+                                // The picker never armed, so nothing on the page is listening. This used to
+                                // return silently and the tap looked like it did nothing at all.
+                                Toast.makeText(
+                                    context,
+                                    context.getString(R.string.browser_element_pick_unavailable),
+                                    Toast.LENGTH_SHORT,
+                                ).show()
+                                return@launch
+                            }
                             elementPickerActive = true
-                            repeat(240) {
-                                delay(250)
+                            repeat(ELEMENT_PICK_POLLS) { attempt ->
+                                delay(ELEMENT_PICK_POLL_MILLIS)
                                 if (tabPool.selectedTabId.value != tab.id) {
+                                    // The user moved to another tab, so the pick is void by their own action.
+                                    // This is the one exit that stays silent on purpose.
                                     manager.execute(BrowserActionInput(action = BrowserAction.EXECUTE_JS, script = CANCEL_ELEMENT_PICKER_JS))
                                     elementPickerActive = false
                                     return@launch
                                 }
                                 val result = manager.execute(BrowserActionInput(action = BrowserAction.EXECUTE_JS, script = READ_PICKED_ELEMENT_JS))
-                                val picked = if (result.success && result.text.trim() != "null") {
-                                    runCatching { org.json.JSONObject(result.text.trim()) }.getOrNull()
-                                } else null
-                                if (picked != null) {
-                                    pickedElement = BrowserElementSelectionPayload(
-                                        pageId = tab.pageId,
-                                        runtimeTabId = tab.id,
-                                        url = picked.optString("url", currentURL),
-                                        title = picked.optString("title", pageTitle),
-                                        domPath = picked.optString("domPath"),
-                                        stableSelector = picked.optString("stableSelector"),
-                                        attributes = picked.optJSONObject("attributes")?.let { attrs ->
-                                            attrs.keys().asSequence().associateWith { key -> attrs.optString(key) }
-                                        }.orEmpty(),
-                                        visibleText = picked.optString("visibleText"),
-                                    )
-                                    elementPickerActive = false
-                                    return@launch
+                                when (val poll = elementPickPoll(result.success, result.text, ELEMENT_PICK_POLLS - 1 - attempt)) {
+                                    is ElementPickPoll.Picked -> {
+                                        val picked = poll.json
+                                        pickedElement = BrowserElementSelectionPayload(
+                                            pageId = tab.pageId,
+                                            runtimeTabId = tab.id,
+                                            url = picked.optString("url", currentURL),
+                                            title = picked.optString("title", pageTitle),
+                                            domPath = picked.optString("domPath"),
+                                            stableSelector = picked.optString("stableSelector"),
+                                            attributes = picked.optJSONObject("attributes")?.let { attrs ->
+                                                attrs.keys().asSequence().associateWith { key -> attrs.optString(key) }
+                                            }.orEmpty(),
+                                            visibleText = picked.optString("visibleText"),
+                                        )
+                                        elementPickerActive = false
+                                        return@launch
+                                    }
+                                    ElementPickPoll.Waiting -> Unit
+                                    ElementPickPoll.TimedOut -> {
+                                        // The poll window closed with nothing picked. The page used to be
+                                        // disarmed here and the user was told nothing, so the only way to find
+                                        // out it had given up was to guess.
+                                        manager.execute(BrowserActionInput(action = BrowserAction.EXECUTE_JS, script = CANCEL_ELEMENT_PICKER_JS))
+                                        elementPickerActive = false
+                                        Toast.makeText(
+                                            context,
+                                            context.getString(R.string.browser_element_pick_timeout),
+                                            Toast.LENGTH_SHORT,
+                                        ).show()
+                                        return@launch
+                                    }
                                 }
                             }
-                            manager.execute(BrowserActionInput(action = BrowserAction.EXECUTE_JS, script = CANCEL_ELEMENT_PICKER_JS))
-                            elementPickerActive = false
                         }
                     },
                 )
@@ -830,4 +854,64 @@ private fun normalizeURLInput(input: String): String {
         return "https://www.google.com/search?q=${java.net.URLEncoder.encode(trimmed, "UTF-8")}"
     }
     return "https://$trimmed"
+}
+
+
+/**
+ * How many polls an armed element picker takes before it gives up.
+ *
+ * 240 x 250 ms is the 60 s window this picker has always used; naming the two numbers
+ * is what lets a test pin the window instead of re-deriving it from the loop.
+ */
+internal const val ELEMENT_PICK_POLLS = 240
+internal const val ELEMENT_PICK_POLL_MILLIS = 250L
+
+/** What one poll of an armed element picker concluded. */
+internal sealed interface ElementPickPoll {
+    /** The page answered with an element to send. */
+    data class Picked(val json: JSONObject) : ElementPickPoll
+
+    /** Still armed and nothing picked yet. */
+    data object Waiting : ElementPickPoll
+
+    /** The poll window closed with nothing picked, so the user has to be told. */
+    data object TimedOut : ElementPickPoll
+}
+
+/**
+ * The rule an armed element picker polls on.
+ *
+ * Extracted out of the composable so a JVM test can drive it: this decides what counts
+ * as a pick, and when the picker gives up. Before the extraction the give-up lived in
+ * "the loop ended", which a test cannot reach and which is why the user was never told.
+ *
+ * @param readSucceeded the read script's own result; a failed read is not a pick.
+ * @param readText its answer — the literal `null` while the page is armed and unclicked.
+ * @param pollsLeftAfterThis how many polls remain after this one. This is what makes the
+ *   last poll terminate: without it the loop cannot tell "the window closed" from "keep
+ *   waiting", which is exactly how the silent timeout came about.
+ */
+internal fun elementPickPoll(
+    readSucceeded: Boolean,
+    readText: String,
+    pollsLeftAfterThis: Int,
+): ElementPickPoll {
+    val picked = if (readSucceeded) parsePickedElement(readText) else null
+    return when {
+        picked != null -> ElementPickPoll.Picked(picked)
+        pollsLeftAfterThis > 0 -> ElementPickPoll.Waiting
+        else -> ElementPickPoll.TimedOut
+    }
+}
+
+/**
+ * The page's answer as an element to send, or null when there is nothing to send.
+ *
+ * A failed read, the literal `null` a still-armed page returns, and text that is not a
+ * JSON object all mean the same thing here: nothing picked yet.
+ */
+internal fun parsePickedElement(readText: String): JSONObject? {
+    val text = readText.trim()
+    if (text.isEmpty() || text == "null") return null
+    return runCatching { JSONObject(text) }.getOrNull()
 }

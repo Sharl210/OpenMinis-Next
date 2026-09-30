@@ -1888,6 +1888,8 @@
     <string name="browser_element_confirm_title">Enviar este elemento para a IA?</string>
     <string name="browser_element_send">Enviar para o chat</string>
     <string name="browser_element_cancel">Cancelar</string>
+    <string name="browser_element_pick_timeout">Tempo esgotado para escolher o elemento — nada foi selecionado</string>
+    <string name="browser_element_pick_unavailable">Não foi possível iniciar a seleção de elementos nesta página</string>
     <string name="chat_auto_retry_progress">Falha na conexão — nova tentativa automática em %1$d s (tentativa %2$d de %3$d)</string>
     <string name="chat_auto_retry_progress_unlimited">Falha na conexão — nova tentativa automática em %1$d s (tentativa %2$d)</string>
     <string name="browser_bookmarks_title">Favoritos</string>

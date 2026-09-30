@@ -1896,6 +1896,8 @@
     <string name="browser_element_confirm_title">Wysłać ten element do AI?</string>
     <string name="browser_element_send">Wyślij do czatu</string>
     <string name="browser_element_cancel">Anuluj</string>
+    <string name="browser_element_pick_timeout">Przekroczono czas wyboru elementu — nic nie wybrano</string>
+    <string name="browser_element_pick_unavailable">Nie udało się rozpocząć wyboru elementu na tej stronie</string>
     <string name="chat_auto_retry_progress">Połączenie nie udało się — ponowna próba za %1$d s (próba %2$d z %3$d)</string>
     <string name="chat_auto_retry_progress_unlimited">Połączenie nie udało się — ponowna próba za %1$d s (próba %2$d)</string>
     <string name="browser_bookmarks_title">Zakładki</string>

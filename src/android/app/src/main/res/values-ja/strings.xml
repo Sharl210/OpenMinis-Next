@@ -1887,6 +1887,8 @@
     <string name="browser_element_confirm_title">この要素を AI に送信しますか？</string>
     <string name="browser_element_send">チャットに送信</string>
     <string name="browser_element_cancel">キャンセル</string>
+    <string name="browser_element_pick_timeout">要素の選択がタイムアウトしました — 何も選択されていません</string>
+    <string name="browser_element_pick_unavailable">このページでは要素の選択を開始できませんでした</string>
     <string name="chat_auto_retry_progress">接続に失敗しました。%1$d 秒後に自動再試行します（%2$d/%3$d 回目）</string>
     <string name="chat_auto_retry_progress_unlimited">接続に失敗しました。%1$d 秒後に自動再試行します（%2$d 回目）</string>
     <string name="browser_bookmarks_title">ブックマーク</string>

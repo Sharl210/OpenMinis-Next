@@ -1888,6 +1888,8 @@
     <string name="browser_element_confirm_title">ส่งองค์ประกอบนี้ให้ AI ไหม</string>
     <string name="browser_element_send">ส่งไปที่แชต</string>
     <string name="browser_element_cancel">ยกเลิก</string>
+    <string name="browser_element_pick_timeout">หมดเวลาเลือกองค์ประกอบ — ยังไม่ได้เลือกอะไร</string>
+    <string name="browser_element_pick_unavailable">ไม่สามารถเริ่มการเลือกองค์ประกอบในหน้านี้ได้</string>
     <string name="chat_auto_retry_progress">เชื่อมต่อไม่สำเร็จ — ลองใหม่อัตโนมัติใน %1$d วินาที (ครั้งที่ %2$d จาก %3$d)</string>
     <string name="chat_auto_retry_progress_unlimited">เชื่อมต่อไม่สำเร็จ — ลองใหม่อัตโนมัติใน %1$d วินาที (ครั้งที่ %2$d)</string>
     <string name="browser_bookmarks_title">รายการโปรด</string>

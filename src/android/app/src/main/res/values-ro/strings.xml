@@ -1892,6 +1892,8 @@
     <string name="browser_element_confirm_title">Trimiți acest element către AI?</string>
     <string name="browser_element_send">Trimite în chat</string>
     <string name="browser_element_cancel">Anulează</string>
+    <string name="browser_element_pick_timeout">Timpul de selecție a elementului a expirat — nu s-a selectat nimic</string>
+    <string name="browser_element_pick_unavailable">Selecția elementului nu a putut începe pe această pagină</string>
     <string name="chat_auto_retry_progress">Conexiunea a eșuat — reîncercare automată în %1$d s (încercarea %2$d din %3$d)</string>
     <string name="chat_auto_retry_progress_unlimited">Conexiunea a eșuat — reîncercare automată în %1$d s (încercarea %2$d)</string>
     <string name="browser_bookmarks_title">Favorite</string>

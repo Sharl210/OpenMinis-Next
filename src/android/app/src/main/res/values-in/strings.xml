@@ -1893,6 +1893,8 @@
     <string name="browser_element_confirm_title">Kirim elemen ini ke AI?</string>
     <string name="browser_element_send">Kirim ke chat</string>
     <string name="browser_element_cancel">Batal</string>
+    <string name="browser_element_pick_timeout">Waktu pemilihan elemen habis — tidak ada yang dipilih</string>
+    <string name="browser_element_pick_unavailable">Tidak dapat memulai pemilihan elemen di halaman ini</string>
     <string name="chat_auto_retry_progress">Koneksi gagal — mencoba ulang otomatis dalam %1$d dtk (percobaan %2$d dari %3$d)</string>
     <string name="chat_auto_retry_progress_unlimited">Koneksi gagal — mencoba ulang otomatis dalam %1$d dtk (percobaan %2$d)</string>
     <string name="browser_bookmarks_title">Bookmark</string>

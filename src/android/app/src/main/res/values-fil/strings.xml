@@ -1888,6 +1888,8 @@
     <string name="browser_element_confirm_title">Ipadala ang element na ito sa AI?</string>
     <string name="browser_element_send">Ipadala sa chat</string>
     <string name="browser_element_cancel">Kanselahin</string>
+    <string name="browser_element_pick_timeout">Nag-time out ang pagpili ng elemento — walang napili</string>
+    <string name="browser_element_pick_unavailable">Hindi masimulan ang pagpili ng elemento sa pahinang ito</string>
     <string name="chat_auto_retry_progress">Nabigo ang koneksyon — awtomatikong susubukan muli sa %1$d s (pagsubok %2$d ng %3$d)</string>
     <string name="chat_auto_retry_progress_unlimited">Nabigo ang koneksyon — awtomatikong susubukan muli sa %1$d s (pagsubok %2$d)</string>
     <string name="browser_bookmarks_title">Mga bookmark</string>

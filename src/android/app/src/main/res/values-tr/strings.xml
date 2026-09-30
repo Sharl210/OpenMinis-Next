@@ -1888,6 +1888,8 @@
     <string name="browser_element_confirm_title">Bu öğe AI\'ya gönderilsin mi?</string>
     <string name="browser_element_send">Sohbete gönder</string>
     <string name="browser_element_cancel">İptal</string>
+    <string name="browser_element_pick_timeout">Öğe seçimi zaman aşımına uğradı — hiçbir şey seçilmedi</string>
+    <string name="browser_element_pick_unavailable">Bu sayfada öğe seçimi başlatılamadı</string>
     <string name="chat_auto_retry_progress">Bağlantı başarısız — %1$d sn sonra otomatik yeniden denenecek (%2$d/%3$d deneme)</string>
     <string name="chat_auto_retry_progress_unlimited">Bağlantı başarısız — %1$d sn sonra otomatik yeniden denenecek (%2$d. deneme)</string>
     <string name="browser_bookmarks_title">Yer imleri</string>

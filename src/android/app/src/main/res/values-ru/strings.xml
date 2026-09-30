@@ -1898,6 +1898,8 @@
     <string name="browser_element_confirm_title">Отправить этот элемент в AI?</string>
     <string name="browser_element_send">Отправить в чат</string>
     <string name="browser_element_cancel">Отмена</string>
+    <string name="browser_element_pick_timeout">Время выбора элемента истекло — ничего не выбрано</string>
+    <string name="browser_element_pick_unavailable">Не удалось запустить выбор элемента на этой странице</string>
     <string name="chat_auto_retry_progress">Сбой соединения — автоповтор через %1$d с (попытка %2$d из %3$d)</string>
     <string name="chat_auto_retry_progress_unlimited">Сбой соединения — автоповтор через %1$d с (попытка %2$d)</string>
     <string name="browser_bookmarks_title">Закладки</string>

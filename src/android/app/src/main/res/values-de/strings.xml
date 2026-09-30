@@ -1890,6 +1890,8 @@
     <string name="browser_element_confirm_title">Dieses Element an die KI senden?</string>
     <string name="browser_element_send">In den Chat senden</string>
     <string name="browser_element_cancel">Abbrechen</string>
+    <string name="browser_element_pick_timeout">Zeitüberschreitung bei der Elementauswahl — es wurde nichts ausgewählt</string>
+    <string name="browser_element_pick_unavailable">Die Elementauswahl konnte auf dieser Seite nicht gestartet werden</string>
     <string name="chat_auto_retry_progress">Verbindung fehlgeschlagen — automatische Wiederholung in %1$d s (Versuch %2$d von %3$d)</string>
     <string name="chat_auto_retry_progress_unlimited">Verbindung fehlgeschlagen — automatische Wiederholung in %1$d s (Versuch %2$d)</string>
     <string name="browser_bookmarks_title">Lesezeichen</string>

@@ -1887,6 +1887,8 @@
     <string name="browser_element_confirm_title">이 요소를 AI에 보낼까요?</string>
     <string name="browser_element_send">채팅으로 보내기</string>
     <string name="browser_element_cancel">취소</string>
+    <string name="browser_element_pick_timeout">요소 선택 시간이 초과되었습니다 — 선택된 항목이 없습니다</string>
+    <string name="browser_element_pick_unavailable">이 페이지에서는 요소 선택을 시작할 수 없습니다</string>
     <string name="chat_auto_retry_progress">연결 실패 — %1$d초 후 자동으로 재시도합니다 (시도 %2$d/%3$d)</string>
     <string name="chat_auto_retry_progress_unlimited">연결 실패 — %1$d초 후 자동으로 재시도합니다 (시도 %2$d)</string>
     <string name="browser_bookmarks_title">북마크</string>

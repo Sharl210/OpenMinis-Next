@@ -640,6 +640,8 @@
     <string name="browser_element_confirm_title">Send this element to AI?</string>
     <string name="browser_element_send">Send to chat</string>
     <string name="browser_element_cancel">Cancel</string>
+    <string name="browser_element_pick_timeout">Element picking timed out — nothing was selected</string>
+    <string name="browser_element_pick_unavailable">Element picking could not start on this page</string>
     <string name="browser_minis_browsing">Minis is browsing</string>
     <!-- Streaming indicator shown while the assistant is composing a reply. %1$s is the Soul-customized assistant name (default "Minis"). -->
     <string name="chat_typing_indicator">%1$s is thinking</string>

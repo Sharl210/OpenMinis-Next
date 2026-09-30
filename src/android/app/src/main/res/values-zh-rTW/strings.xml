@@ -1886,6 +1886,8 @@
     <string name="browser_element_confirm_title">要將這個元素傳送給 AI 嗎？</string>
     <string name="browser_element_send">傳送到聊天</string>
     <string name="browser_element_cancel">取消</string>
+    <string name="browser_element_pick_timeout">元素選取逾時 — 未選取任何元素</string>
+    <string name="browser_element_pick_unavailable">無法在此頁面啟動元素選取</string>
     <string name="chat_auto_retry_progress">連線失敗，%1$d 秒後自動重試（第 %2$d/%3$d 次）</string>
     <string name="chat_auto_retry_progress_unlimited">連線失敗，%1$d 秒後自動重試（第 %2$d 次）</string>
     <string name="browser_bookmarks_title">書籤</string>
