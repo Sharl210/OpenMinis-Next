@@ -12,6 +12,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -55,6 +56,19 @@ class SessionActivityTrackerChildCancellerTest {
 
     private fun clearHandles() {
         privateMap("childCancellers").clear()
+    }
+
+    /**
+     * Backstop for the app-wide singleton the cases above mutate.
+     *
+     * Every case already clears the map in its own `finally`, which is what makes
+     * the assertions inside it meaningful; this only covers the window BEFORE that
+     * `finally` can run (a failure while setting the case up) so one case cannot
+     * hand a stale handle to the next one in a different order.
+     */
+    @After
+    fun clearTrackerStateAfterEachCase() {
+        clearHandles()
     }
 
     @Test
@@ -218,18 +232,83 @@ class SessionActivityTrackerChildCancellerTest {
         clearHandles()
         val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
         try {
+            val started = CompletableDeferred<Unit>()
             val job = scope.launch {
                 SessionActivityTracker.registerChildCanceller("child-e", kotlinx.coroutines.currentCoroutineContext()[Job])
+                started.complete(Unit)
                 delay(10_000)
             }
-            delay(50)
+            // Handshake, not a bare sleep: a fixed delay races the registration, and
+            // a cancel that lands before `registerChildCanceller` runs would leave
+            // no handle at all — the assertions below would then pass for the wrong
+            // reason, on a run that never existed.
+            started.await()
+            assertEquals("the run must be registered before the cancellation", 1, handleCount())
             job.cancel(CancellationException("already cancelled"))
             withTimeout(5_000) { job.join() }
+            withTimeout(5_000) {
+                while (handleCount() != 0) delay(5)
+            }
             val dispatched = SessionActivityTracker.cancelChildSessions(listOf("child-e"))
-            assertTrue(
-                "cancelling an already-finished run must not throw: dispatched=$dispatched",
-                dispatched.size <= 1,
+            assertEquals(
+                "a run that already ended by cancellation has retired its handle: it must not be " +
+                    "handed a second cancellation, and must not be reported as newly interrupted: dispatched=$dispatched",
+                emptyList<String>(),
+                dispatched,
             )
+        } finally {
+            scope.cancel()
+            clearHandles()
+        }
+    }
+
+    /**
+     * The explicit counterpart of the assertion above.
+     *
+     * `emptyList()` alone is only half a statement: an implementation that never
+     * dispatched anything would satisfy it for the wrong reason. Running the same
+     * entry point against a LIVE run and requiring the non-empty answer rules that
+     * family out, so both directions are pinned together in one file.
+     *
+     * What the pair does NOT establish (measured against a candidate mutant): an
+     * implementation that retires a handle only when the job was cancelled would
+     * satisfy BOTH of these — the cancelled run is retired and the live one is
+     * still registered. That defect is caught by `a finished run is not handed a
+     * cancellation after it retired its handle` instead. So this is a discriminator
+     * against the never-dispatch and report-the-request families, not a proof that
+     * "live vs finished" is the only thing being distinguished.
+     *
+     * The observation shape matches `a registered child run is cancelled under its
+     * own session id`; this one is kept as the explicit near-miss for the assertion
+     * above, not as new coverage.
+     */
+    @Test
+    fun `a live run is handed the cancellation, so the empty answer above discriminates`() = runBlocking {
+        clearHandles()
+        val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+        try {
+            val started = CompletableDeferred<Unit>()
+            var loops = 0
+            val job = scope.launch {
+                SessionActivityTracker.registerChildCanceller("child-f", kotlinx.coroutines.currentCoroutineContext()[Job])
+                started.complete(Unit)
+                while (true) {
+                    delay(20)
+                    loops++
+                }
+            }
+            started.await()
+            delay(80)
+            assertTrue("the run must be doing work before the stop", loops > 0)
+            assertEquals("exactly the live run may be registered", 1, handleCount())
+
+            assertEquals(
+                "a live run must be handed the cancellation",
+                listOf("child-f"),
+                SessionActivityTracker.cancelChildSessions(listOf("child-f")),
+            )
+            withTimeout(5_000) { job.join() }
+            assertTrue(job.isCancelled)
         } finally {
             scope.cancel()
             clearHandles()

@@ -2,10 +2,12 @@ package com.openminis.app.ui.chat
 
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.util.concurrent.atomic.AtomicInteger
@@ -30,13 +32,37 @@ class ToolCallBatchSchedulerTest {
     @Test
     fun `dependency waits for prerequisite and does not serialize unrelated calls`() = runBlocking {
         val completed = mutableSetOf<String>()
-        val items = listOf(ToolBatchItem("a", value = "a"), ToolBatchItem("b", dependsOn = setOf("a"), value = "b"), ToolBatchItem("c", value = "c"))
+        // Input order deliberately puts the DEPENDENT first. Listing the calls the
+        // other way round — "a" before "b" — is what makes this test unable to see
+        // the gate at all: a scheduler that merely walks its input in order, with no
+        // dependency logic whatsoever, would still have run "a" by the time "b"
+        // starts (measured: removing the gate entirely kept the previous form of
+        // this test green). With "b" first, "a" can only be ahead of it because a
+        // dependency gate put it there.
+        val items = listOf(
+            ToolBatchItem("b", dependsOn = setOf("a"), value = "b"),
+            ToolBatchItem("a", value = "a"),
+            ToolBatchItem("c", value = "c"),
+        )
+        var dependentRanBeforePrerequisite = false
         val outcomes = ToolCallBatchScheduler.execute(items) { value ->
-            if (value == "b") assertTrue("a" in completed)
+            // Not load-bearing for the assertion below (input order alone is
+            // enough): it makes the violation take real time, so a gate-less
+            // scheduler that starts "b" while "a" is still running is reported
+            // with a diagnosable snapshot rather than by luck of ordering.
+            if (value == "a") delay(120)
+            if (value == "b" && "a" !in completed) dependentRanBeforePrerequisite = true
             completed += value
             ToolBatchExecution(success = true, value = value)
         }
-        assertEquals(listOf("a", "b", "c"), outcomes.map { it.item.id })
+        // Asserted OUTSIDE the operation. An assertion thrown inside it is caught by
+        // the scheduler's own `catch (error: Throwable)` and reported as a failed
+        // tool call, which hides which assertion failed.
+        assertFalse(
+            "the dependent call must not start before its prerequisite finished: completed=$completed",
+            dependentRanBeforePrerequisite,
+        )
+        assertEquals(listOf("b", "a", "c"), outcomes.map { it.item.id })
         assertEquals(setOf("a", "b", "c"), completed)
         assertTrue(outcomes.all { it.status == ToolBatchStatus.SUCCESS })
     }
