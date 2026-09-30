@@ -8,6 +8,8 @@ import com.openminis.app.feature.runtime.RuntimeModelSnapshot
 import com.openminis.app.feature.runtime.RuntimeSessionCoordinator
 import com.openminis.app.feature.runtime.RuntimeStopReport
 import com.openminis.app.feature.runtime.RuntimeTreeConfig
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -302,6 +304,27 @@ object SessionActivityTracker {
      * the session is "active" but has no canceller.
      */
     private val streamCancellers = mutableMapOf<String, () -> Unit>()
+
+    /**
+     * [T-android-stop-descendant-cancel] Per-child-session cancellation handles.
+     *
+     * [streamCancellers] above covers ROOT streams only: [setActive] puts the
+     * owning ChatViewModel's own `cancelStream` in it, and a delegated child is
+     * deliberately never a root ([_activeChildSessions] exists precisely so a
+     * child cannot alter the parent's send/stop state). A child's coroutine
+     * therefore had no cancellation entry point anywhere in the app.
+     *
+     * That is not a missing convenience, it is the difference between a stop that
+     * happens and a stop that is announced. `SessionTreeRuntime.stopDescendant`
+     * can only mark the node `STOP_REQUESTED` — a state, not a signal — so the
+     * child kept calling its provider, kept writing its transcript and ended only
+     * when it ran out of work by itself, while the stop receipt said "stopped".
+     *
+     * Populated by the child's own runner (`RuntimeChildRunner` is inside the
+     * coroutine it hands over) and cleaned up by that coroutine's own completion,
+     * so a later stop of the same session id cannot cancel a run that is over.
+     */
+    private val childCancellers = mutableMapOf<String, Job>()
 
     /**
      * T180-bg-notif: per-session "task is finishing — was it cancelled?"
@@ -650,6 +673,68 @@ object SessionActivityTracker {
                 Log.w(TAG, "stream canceller threw: ${e.message}")
             }
         }
+    }
+
+    /**
+     * [T-android-stop-descendant-cancel] Hand over the coroutine that IS
+     * [childSessionId]'s run, so an ancestor's stop can really stop it.
+     *
+     * [job] is null when the caller has no coroutine context: there is then
+     * nothing to cancel and the registration is skipped, rather than stored as a
+     * handle that would silently do nothing. Re-registering the same id REPLACES
+     * the handle — the restart path runs a second attempt on the same session id,
+     * and the replaced handle points at a coroutine that has already completed.
+     *
+     * Removal is driven by the coroutine itself ([Job.invokeOnCompletion]) rather
+     * than by an unregister call at the end of the run: a stop arriving between
+     * "the run's last line" and "the caller remembered to unregister" would
+     * otherwise cancel a finished run and have it reported as interrupted.
+     */
+    fun registerChildCanceller(childSessionId: String, job: Job?) {
+        if (childSessionId.isBlank() || job == null) return
+        synchronized(childCancellers) { childCancellers[childSessionId] = job }
+        job.invokeOnCompletion {
+            synchronized(childCancellers) {
+                // Only drop the entry this registration owns: the completion of a
+                // replaced handle must not remove its successor.
+                if (childCancellers[childSessionId] === job) childCancellers.remove(childSessionId)
+            }
+        }
+    }
+
+    /**
+     * [T-android-stop-descendant-cancel] Cancel the coroutines running
+     * [childSessionIds] and return the ids a cancellation was handed to.
+     *
+     * Called once `SessionTreeRuntime.stopDescendant` has accepted a request,
+     * with the node ids it reported as affected. Accepting the request is the
+     * tree's answer — "these nodes are now labelled stopped" — and this is the
+     * part that makes the label true. Returning the dispatched ids rather than a
+     * count of requests lets the caller answer "these runs were interrupted"
+     * instead of "the tree says so".
+     *
+     * Cancellation is asynchronous by nature: the coroutine unwinds on its own
+     * context, so this call does not wait for it. The direct parent is told the
+     * child settled through the runtime's own stop notification, which the
+     * cancelled run's cleanup files.
+     */
+    fun cancelChildSessions(childSessionIds: Collection<String>): List<String> {
+        if (childSessionIds.isEmpty()) return emptyList()
+        val targets = childSessionIds.filter { it.isNotBlank() }.distinct()
+        val dispatched = ArrayList<String>(targets.size)
+        for (childSessionId in targets) {
+            val job = synchronized(childCancellers) { childCancellers[childSessionId] } ?: continue
+            try {
+                job.cancel(
+                    CancellationException("stopped at the request of an ancestor (stop_descendant)"),
+                )
+                dispatched += childSessionId
+            } catch (e: Exception) {
+                Log.w(TAG, "child canceller threw for $childSessionId: ${e.message}")
+            }
+        }
+        Log.d(TAG, "cancelChildSessions: dispatched ${dispatched.size}/${targets.size} session(s)")
+        return dispatched
     }
 
     /**

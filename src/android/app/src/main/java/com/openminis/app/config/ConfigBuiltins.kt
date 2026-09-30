@@ -453,27 +453,50 @@ internal object ConfigBuiltins {
 
     // -- Background --
 
-    private fun registerBackground(r: ConfigRegistry, context: Context) {
-        val prefs = context.getSharedPreferences("background_settings", Context.MODE_PRIVATE)
-        r.register(
-            PrefsBoolField(
-                path = "background.enhanced",
-                displayName = "Enhanced background execution",
-                description = "Keep agent tasks running when the app is backgrounded.",
-                prefs = prefs,
-                key = "enhanced_background_execution",
-                defaultValue = false,
-                risk = ConfigRisk.SENSITIVE,
-            )
+    /**
+     * [T-android-config-prefs-mismatch-background] `internal` (not private) so a
+     * JVM unit test can drive this exact registration against an in-memory
+     * Context — see `BackgroundConfigPrefsBindingTest`, which reads back through
+     * the same objects the app's consumers use instead of matching source text.
+     */
+    internal fun registerBackground(r: ConfigRegistry, context: Context) {
+        // Handle first, and taken from BackgroundSettingsRepository: it owns the
+        // file name AND the keys, so this field cannot drift away from what the
+        // notifier/UI actually read.
+        val prefs = context.getSharedPreferences(
+            com.openminis.app.data.repository.BackgroundSettingsRepository.PREFS_NAME,
+            Context.MODE_PRIVATE,
         )
+        // [T-android-config-prefs-mismatch-background] REMOVED — `background.enhanced`
+        // (`enhanced_background_execution`, "Keep agent tasks running when the app is
+        // backgrounded"). Ported from iOS, where
+        // `BackgroundKeepAliveManager.enhancedBackgroundEnabled` really does gate a
+        // keep-alive leg, but NOTHING on Android ever read the key: `minis-config set
+        // background.enhanced true` answered `ok: true` and changed no behaviour.
+        // Android has no equivalent user knob to bind it to — the "keep running while
+        // backgrounded" machinery is `AgentForegroundService`, started unconditionally
+        // from `SessionActivityTracker.shouldRunService()` (runtime activity only, no
+        // preference gate) and holding its own PARTIAL_WAKE_LOCK; battery-optimisation
+        // exemption and OEM autostart are OS-side state the app can only deep-link to
+        // (`PowerOptimizationManager`, no persisted pref). Do NOT re-add this path
+        // without first adding a real Android mechanism to drive; if a user-facing
+        // toggle is wanted, add the matching row in
+        // `ui/settings/BackgroundSettingsScreen.kt` with the repository behind it.
         r.register(
             PrefsBoolField(
                 path = "background.notifications",
                 displayName = "Background notifications",
                 description = "Post a system notification when long-running tasks complete.",
                 prefs = prefs,
-                key = "background_notifications_enabled",
-                defaultValue = true,
+                // [T-android-config-prefs-mismatch-background] This used to be the
+                // hand-typed `background_notifications_enabled`, which nothing reads —
+                // while the Settings toggle and both notifiers use
+                // `taskNotificationsEnabled` in this same file. Bind the repository's
+                // own constant so the two sides cannot drift apart again.
+                key = com.openminis.app.data.repository.BackgroundSettingsRepository
+                    .KEY_TASK_NOTIFICATIONS,
+                defaultValue = com.openminis.app.data.repository.BackgroundSettingsRepository
+                    .DEFAULT_TASK_NOTIFICATIONS,
             )
         )
         // [T-android-config-feature-unavailable] Live Updates / "dynamic

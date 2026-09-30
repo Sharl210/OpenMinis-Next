@@ -109,10 +109,13 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.AppShortcut
 import androidx.compose.material.icons.filled.ArrowCircleUp
 import androidx.compose.material.icons.filled.ArrowUpward
+import androidx.compose.material.icons.filled.VerticalAlignTop
 import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.Extension
+import androidx.compose.material.icons.filled.Fingerprint
+import com.openminis.app.feature.runtime.ConversationIdProtocol
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Block
 import androidx.compose.material.icons.filled.CheckCircle
@@ -152,6 +155,7 @@ import com.openminis.app.logging.AppLogger
 import com.openminis.app.ui.components.MinisAlertDialog
 import com.openminis.app.ui.components.MinisMenu
 import com.openminis.app.ui.components.MinisMenuDivider
+import com.openminis.app.ui.components.copyToClipboardWithFeedback
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -517,6 +521,7 @@ fun ChatScreen(
      *  navigates to a fresh draft chat (same funnel as the session list's
      *  new-chat button), replacing this chat on the back stack. */
     onNewChat: () -> Unit = {},
+    onForkSession: (String) -> Unit = {},
     onOpenTerminal: () -> Unit = {},
     /** Open the in-app terminal with [command] pre-filled at the prompt
      *  (no trailing newline — the user reviews and presses Enter manually).
@@ -563,11 +568,20 @@ fun ChatScreen(
     // Callers needing the full history (compact / fork / regenerate / send)
     // continue to read viewModel.messages directly inside the VM.
     val messages by viewModel.uiMessages.collectAsState()
+    val inputText by viewModel.inputText.collectAsState()
+    val allMessages by viewModel.messages.collectAsState()
     val hasOlderMessages by viewModel.hasOlderMessages.collectAsState()
     val isStreaming by viewModel.isStreaming.collectAsState()
     val canResume by viewModel.canResume.collectAsState()
     // [T-android-compact-progress] null when no compaction is running.
     val compactProgress by viewModel.compactProgress.collectAsState()
+    // [T-android-auto-retry-progress] The backoff wait between two automatic
+    // attempts has no other on-screen trace; these three drive the
+    // "retrying in N s (attempt 2 of 5)" row. The ViewModel already published
+    // the first two before this change — nothing consumed them.
+    val autoRetryAttempt by viewModel.autoRetryAttempt.collectAsState()
+    val autoRetryCountdown by viewModel.autoRetryCountdown.collectAsState()
+    val autoRetryMaxAttempts by viewModel.autoRetryMaxAttempts.collectAsState()
     val error by viewModel.error.collectAsState()
     val modelName by viewModel.modelName.collectAsState()
     val sessionTitle by viewModel.sessionTitle.collectAsState()
@@ -630,7 +644,10 @@ fun ChatScreen(
     // T325: draft persists on the VM so navigation (e.g. push EnvVars and
     // pop back) doesn't wipe what the user has typed. Mirrors iOS
     // `AIChatView` which binds the composer against `vm.inputText`.
-    val inputText by viewModel.inputText.collectAsState()
+    LaunchedEffect(viewModel) {
+        viewModel.forkedSessionEvent.collect { forkedId -> onForkSession(forkedId) }
+    }
+
 
     // ─── T51: Share Injection + Move-to capsule ───────────────────────
     // Drain any pending share buffered by ShareCoordinator (cold start =
@@ -880,6 +897,20 @@ fun ChatScreen(
     var showConversationMap by remember { mutableStateOf(false) }
     var showAgentTopology by remember { mutableStateOf(false) }
     var pendingConversationMapMessageId by remember { mutableStateOf<String?>(null) }
+    // Bumped whenever a conversation-map jump could not land. It drives a
+    // SEPARATE snackbar effect instead of showing the snackbar inline: the jump
+    // effect is keyed on `pendingConversationMapMessageId`, so clearing that key
+    // to finish the jump also cancels everything the effect is still awaiting —
+    // an inline `showSnackbar` (which suspends until dismissed) would be killed
+    // by our own bookkeeping before the user could read it.
+    var conversationMapLocateFailures by remember { mutableStateOf(0) }
+    LaunchedEffect(conversationMapLocateFailures) {
+        if (conversationMapLocateFailures > 0) {
+            snackbarHostState.showSnackbar(
+                context.getString(R.string.conversation_map_locate_failed),
+            )
+        }
+    }
     var showSkillsSheet by remember { mutableStateOf(false) }
     // [T-mcp-integration-android] MCPs-in-Session sheet visibility.
     var showMcpsSheet by remember { mutableStateOf(false) }
@@ -947,7 +978,7 @@ fun ChatScreen(
         if (uris.size > ATTACHMENT_PICK_LIMIT) {
             android.widget.Toast.makeText(
                 context,
-                "Only the first $ATTACHMENT_PICK_LIMIT items were attached.",
+                context.getString(R.string.chat_attach_limit_items, ATTACHMENT_PICK_LIMIT),
                 android.widget.Toast.LENGTH_SHORT,
             ).show()
         }
@@ -1081,7 +1112,7 @@ fun ChatScreen(
         if (uris.size > ATTACHMENT_PICK_LIMIT) {
             android.widget.Toast.makeText(
                 context,
-                "Only the first $ATTACHMENT_PICK_LIMIT files were attached.",
+                context.getString(R.string.chat_attach_limit_files, ATTACHMENT_PICK_LIMIT),
                 android.widget.Toast.LENGTH_SHORT,
             ).show()
         }
@@ -1551,6 +1582,7 @@ fun ChatScreen(
         val topMessageId = topKey
             ?.split(':')
             ?.getOrNull(1)
+            ?.substringBefore('#')
             ?.takeIf { it.isNotEmpty() }
         // `messages` is a TAIL WINDOW (ChatViewModel.uiMessages + loadOlderMessages),
         // so the visible top row can belong to a message that is not loaded yet.
@@ -1623,7 +1655,7 @@ fun ChatScreen(
                     item.offset >= viewportTop &&
                     item.offset + item.size <= viewportBottom
             }
-            .mapNotNull { (it.key as? String)?.removePrefix("user:")?.takeIf { id -> id.isNotEmpty() } }
+            .mapNotNull { (it.key as? String)?.removePrefix("user:")?.substringBefore('#')?.takeIf { id -> id.isNotEmpty() } }
             .toSet()
 
         val target = if (steppedTarget in fullyVisibleUserIds) {
@@ -1754,6 +1786,7 @@ fun ChatScreen(
         val topMessageId = topKey
             ?.split(':')
             ?.getOrNull(1)
+            ?.substringBefore('#')
             ?.takeIf { it.isNotEmpty() }
         val topMsgIdx = topMessageId
             ?.let { id -> messages.indexOfFirst { it.id == id } }
@@ -1776,7 +1809,7 @@ fun ChatScreen(
                     item.offset >= viewportTop &&
                     item.offset + item.size <= viewportBottom
             }
-            .mapNotNull { (it.key as? String)?.removePrefix("user:") }
+            .mapNotNull { (it.key as? String)?.removePrefix("user:")?.substringBefore('#') }
             .toSet()
         while (targetPos < userIds.lastIndex && userIds[targetPos] in fullyVisibleUserIds) {
             targetPos++
@@ -1881,9 +1914,10 @@ fun ChatScreen(
     // userScrolledAway never flips true, so without this grace window the
     // three stages all run on the next chunk and the user sees the chat
     // "jump back" three times. 1 s covers a typical fling settle (~500-
-    // 800 ms) plus a small buffer; the user can re-engage follow at any
-    // time by scrolling all the way to the bottom (LE(isNearBottom) above
-    // resets userScrolledAway).
+    // 800 ms) plus a small buffer — note this is the same window in which the
+    // fling is still moving *after* DragInteraction.Stop already sampled the
+    // position; the user re-engages follow by parking at the bottom at all
+    // (the parked-at-end observer below resets userScrolledAway).
     var lastInterruptMs by remember { mutableStateOf(0L) }
     // [T-android-composer-input-blocked-while-streaming] True only while the
     // user's FINGER is actively dragging the message list. Programmatic scrolls
@@ -1924,6 +1958,24 @@ fun ChatScreen(
             }
         }
     }
+    // [T-android-list-parked-at-end] Resume half of the list's follow contract,
+    // and the net the DragInteraction.Stop note below refers to.
+    //
+    // DragInteraction.Stop is emitted *before* the fling runs (Compose
+    // DragGestureNode.processDragStop emits Stop, then calls onDragStopped, which
+    // performs the fling), so `atBottom = isNearBottom.value` above samples the
+    // position at finger-up. A flick towards the newest message therefore lands
+    // there after the only sample the gesture path takes: follow stayed disarmed
+    // at the bottom, and the jump-to-bottom FAB is hidden exactly there
+    // (`!isNearBottom`), so nothing was left to re-arm it. The position decides:
+    // parked at the end and no scroll in flight ⇒ follow again, however the list
+    // got there.
+    ObserveFollowResume(
+        key = listState,
+        atEnd = { isNearBottom.value },
+        scrollInProgress = { listState.isScrollInProgress },
+        onParkedAtEnd = { applyScrollFollow(ScrollFollowEvent.AtBottomReached) },
+    )
     // [T-android-tool-autoscroll] Start-of-turn edge from ViewModel: resume() /
     // retryLast() / retryFromMessage() / rerunFromToolBlock() emit Unit on
     // forceScrollToBottom because they don't append a new user-message row, so
@@ -2226,8 +2278,11 @@ fun ChatScreen(
                 ) {
                     tracedScrollToItem("settle-after-interaction", 0, 0)
                 }
-                // The state machine is updated only by DragInteraction.Stop above.
-                // Layout/fling geometry is intentionally not allowed to arm pause.
+                // The state machine pauses only on DragInteraction.Stop above.
+                // Layout/fling geometry is intentionally not allowed to arm pause
+                // — it may only *clear* it, via the parked-at-end observer that
+                // turns "position at the end with nothing in flight" back into
+                // following.
             }
     }
 
@@ -2821,7 +2876,7 @@ fun ChatScreen(
                     // [T-android-tablet-split] See `isTwoPane`.
                     if (!isTwoPane) {
                         IconButton(onClick = onBack) {
-                            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = stringResource(R.string.common_back))
                         }
                     } else if (onToggleSidebar != null) {
                         // [T-android-tablet-sidebar-collapse] The slot the back
@@ -2899,7 +2954,7 @@ fun ChatScreen(
                     // iOS: "..." circle button → dropdown menu
                     Box {
                         IconButton(onClick = { showChatMenu = true }) {
-                            Icon(Icons.Default.MoreVert, contentDescription = "More")
+                            Icon(Icons.Default.MoreVert, contentDescription = stringResource(R.string.common_more))
                         }
                         MinisMenu(
                             expanded = showChatMenu,
@@ -2932,7 +2987,7 @@ fun ChatScreen(
                             MinisMenuDivider()
                                                          // Conversation map: search and jump to any message.
                              DropdownMenuItem(
-                                 text = { Text("Conversation map") },
+                                 text = { Text(stringResource(R.string.chat_menu_conversation_map)) },
                                  onClick = {
                                      showChatMenu = false
                                      showConversationMap = true
@@ -2952,6 +3007,36 @@ fun ChatScreen(
                                      Icon(Icons.Default.AccountTree, contentDescription = null)
                                  },
                              )
+                             MinisMenuDivider()
+                             // [T-android-copy-conversation-id] request.md:136 asks
+                             // for this entry by name: 「在某个对话的右上角的三个点中增加
+                             // 这个功能条目，就是复制对话ID」. It sits with the other
+                             // id-bearing destinations (conversation map, agent topology)
+                             // rather than among the destructive items at the bottom.
+                             //
+                             // Hidden while the session is still a draft route: there is
+                             // no persisted row yet, so there is no id any runtime tool
+                             // could resolve.
+                             (viewModel.realSessionId.ifEmpty { sessionId })
+                                 .takeIf { it.isNotBlank() && !it.startsWith("__new__") }
+                                 ?.let { conversationId ->
+                                     DropdownMenuItem(
+                                         text = { Text(stringResource(R.string.chat_copy_conversation_id)) },
+                                         onClick = {
+                                             showChatMenu = false
+                                             val id = ConversationIdProtocol.prefixedConversationId(conversationId)
+                                             copyToClipboardWithFeedback(
+                                                 context,
+                                                 label = "conversation-id",
+                                                 value = id,
+                                                 successText = context.getString(R.string.selection_copied_toast, id),
+                                             )
+                                         },
+                                         leadingIcon = {
+                                             Icon(Icons.Default.Fingerprint, contentDescription = null)
+                                         },
+                                     )
+                                 }
                              MinisMenuDivider()
                              // Clear Chat (iOS parity, red)
                             DropdownMenuItem(
@@ -3376,6 +3461,43 @@ fun ChatScreen(
                 var flatItems by remember(sessionId) {
                     mutableStateOf<List<FlatChatItem>>(emptyList())
                 }
+                LaunchedEffect(sessionId, pendingConversationMapMessageId) {
+                    val targetId = pendingConversationMapMessageId ?: return@LaunchedEffect
+                    // Both dead ends below count as a failed jump and say so:
+                    // the user tapped a row, so a tap that does nothing reads as
+                    // a broken map rather than as "that message is gone".
+                    val plan = planConversationMapJump(
+                        messages = viewModel.messages.value,
+                        targetId = targetId,
+                        visibleCap = viewModel.visibleMessageCap.value,
+                        capStep = ChatViewModel.VISIBLE_MESSAGE_CAP_STEP,
+                    )
+                    if (plan !is ConversationMapJumpPlan.Ready) {
+                        conversationMapLocateFailures++
+                        pendingConversationMapMessageId = null
+                        return@LaunchedEffect
+                    }
+                    repeat(plan.pagesToLoad) {
+                        viewModel.loadOlderMessages()
+                        viewModel.visibleMessageCap.first {
+                            it >= minOf(plan.requiredCap, viewModel.messages.value.size)
+                        }
+                    }
+                    // Bounded wait: the row list is republished asynchronously and
+                    // keeps changing while a turn streams, so "wait until some row
+                    // matches" must have a deadline or the jump can hang forever.
+                    val rowIndex = conversationMapRowIndexWithin(
+                        rows = snapshotFlow { flatItems.asReversed() },
+                        targetId = targetId,
+                    )
+                    if (rowIndex < 0) {
+                        conversationMapLocateFailures++
+                        pendingConversationMapMessageId = null
+                        return@LaunchedEffect
+                    }
+                    listState.animateScrollToItem(rowIndex)
+                    pendingConversationMapMessageId = null
+                }
                 // [T-android-coldload-offmain-parse] Composition-snapshot
                 // prewarmer (captures the markdown palette) used by the
                 // flatten effect below to warm the parse caches for the
@@ -3676,6 +3798,11 @@ fun ChatScreen(
                     is FlatChatItem.AssistantThinking -> grayedMap[originalMessageId(messageId)] == true
                     is FlatChatItem.AssistantToolUse -> grayedMap[originalMessageId(messageId)] == true
                     is FlatChatItem.AssistantInfo -> false  // system rows never grayed
+                    // [T-android-r37-system-row] Unlike the in-memory system
+                    // cards above, an injected row IS a persisted transcript row
+                    // that a compact marker can fold away, so it fades with its
+                    // history like any other row.
+                    is FlatChatItem.SystemRow -> grayedMap[originalMessageId(messageId)] == true
                     is FlatChatItem.AssistantTyping -> false
                     is FlatChatItem.AssistantError -> grayedMap[originalMessageId(messageId)] == true
                     is FlatChatItem.AssistantLegacyContent -> grayedMap[originalMessageId(messageId)] == true
@@ -3931,6 +4058,19 @@ fun ChatScreen(
                             )
                         }
                     }
+                    // [T-android-auto-retry-progress] Live status for the wait
+                    // between two automatic attempts, so a transient failure
+                    // reads as "retrying in 2s" rather than silence (or a red
+                    // failure sticker). Null unless a backoff wait is actually
+                    // running; it is placed with the banners above the composer
+                    // so the user does not have to scroll to see it.
+                    AutoRetryUiState
+                        .of(autoRetryAttempt, autoRetryMaxAttempts, autoRetryCountdown)
+                        ?.let { retryState ->
+                            item(key = "__auto_retry__", contentType = "auto_retry") {
+                                AutoRetryIndicator(retryState)
+                            }
+                        }
                     if (canResume && !isStreaming && error == null && !lastAssistantHasError) {
                         item(key = "__resume_banner__", contentType = "resume_banner") {
                             ResumeBanner(onResume = {
@@ -4063,6 +4203,46 @@ fun ChatScreen(
                         ) {
                         when (item) {
                             is FlatChatItem.UserBubble -> {
+                                // Both gates come from QueuedPromptUiPolicy (the single
+                                // copy of these rules) instead of being re-derived here:
+                                //   • messageActionsApply — Retry / Edit / Delete-from-here
+                                //     only exist for a message the model already has and
+                                //     no turn in flight.
+                                //   • messageWithdrawable — 撤回 / 撤回并编辑 only exist
+                                //     while the prompt is still unread (ENQUEUED in the
+                                //     ledger), which the bubble flag mirrors.
+                                val messageActionsApply = QueuedPromptUiPolicy.canActOnSentMessage(
+                                    isQueued = item.message.isQueued,
+                                    isStreaming = isStreaming,
+                                )
+                                val messageWithdrawable = item.message.isQueued
+                                // [T-android-copy-conversation-id] The conversation id
+                                // this bubble belongs to, in the form the runtime tools
+                                // accept. `realSessionId` is empty only while a draft has
+                                // no persisted row yet, and the `__new__…` route prefix is
+                                // a pending-navigation marker rather than an id anything can
+                                // resolve — both cases hide the entry instead of copying a
+                                // string that would fail at the tool.
+                                val conversationIdForClipboard: String? =
+                                    viewModel.realSessionId.ifEmpty { sessionId }
+                                        .takeIf { it.isNotBlank() && !it.startsWith("__new__") }
+                                // A refused withdraw must never be silent. The ledger
+                                // refuses only once the model has claimed the prompt, so
+                                // this is exactly chat_queued_withdraw_failed's case.
+                                // Returns the result so the caller can keep its own
+                                // follow-up (focus the composer) on the happy path.
+                                val reportQueuedWithdraw: (Boolean) -> Boolean = { accepted ->
+                                    if (QueuedPromptUiPolicy.withdrawOutcome(accepted) !=
+                                        QueuedWithdrawOutcome.WITHDRAWN
+                                    ) {
+                                        coroutineScope.launch {
+                                            snackbarHostState.showSnackbar(
+                                                context.getString(R.string.chat_queued_withdraw_failed),
+                                            )
+                                        }
+                                    }
+                                    accepted
+                                }
                                 // User bubbles intentionally don't register
                                 // MinisTextKit shards — long-press on a user
                                 // bubble shows its own action menu (Copy /
@@ -4074,9 +4254,50 @@ fun ChatScreen(
                                 // gap when this bubble directly follows another
                                 // user bubble (back-to-back candidate sends).
                                 precededByUser = item.precededByUser,
+                                // [T-android-copy-conversation-id] Every clipboard
+                                // write on this bubble goes through one helper that
+                                // also reports the outcome. The plain "Copy" here
+                                // used to write the clipboard and say nothing at all,
+                                // so "did that work?" had no answer on screen — the
+                                // same silent-result defect class as the withdraw
+                                // notice above.
                                 onCopy = {
-                                    val clipboard = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
-                                    clipboard.setPrimaryClip(android.content.ClipData.newPlainText("message", item.message.content))
+                                    copyToClipboardWithFeedback(
+                                        context,
+                                        label = "message",
+                                        value = item.message.content,
+                                        successText = context.getString(R.string.common_copied),
+                                    )
+                                },
+                                // The message id locates THIS row; the conversation
+                                // id is what `conversation_query` takes. request.md:136
+                                // asks for both ("复制消息ID，或者叫做复制对话ID"), so
+                                // neither is guessed at.
+                                onCopyMessageId = {
+                                    val id = ConversationIdProtocol.prefixedMessageId(item.message.id)
+                                    copyToClipboardWithFeedback(
+                                        context,
+                                        label = "message-id",
+                                        value = id,
+                                        // Echo the id back, not just "Copied": the whole
+                                        // point of the entry is to hand the user a string
+                                        // they will paste somewhere else, so showing it
+                                        // is the confirmation.
+                                        successText = context.getString(R.string.selection_copied_toast, id),
+                                    )
+                                },
+                                // Hidden for a draft row: `__new__…` is a pending
+                                // route, not an id any runtime tool could resolve.
+                                onCopyConversationId = conversationIdForClipboard?.let { conversationId ->
+                                    {
+                                        val id = ConversationIdProtocol.prefixedConversationId(conversationId)
+                                        copyToClipboardWithFeedback(
+                                            context,
+                                            label = "conversation-id",
+                                            value = id,
+                                            successText = context.getString(R.string.selection_copied_toast, id),
+                                        )
+                                    }
                                 },
                                 // T119: pass null while a turn is in flight so
                                 // the long-press menu hides Retry; once the
@@ -4084,27 +4305,33 @@ fun ChatScreen(
                                 // option reappears. Gating execution alone
                                 // wasn't enough — users still saw a tappable
                                 // Retry that silently no-op'd.
-                                onRetry = if (isStreaming || item.message.isQueued) null else ({
+                                onRetry = if (messageActionsApply) ({
                                     coroutineScope.launch {
                                         tracedScrollToItem("RETRY-FROM-MSG", 0, 0)
                                     }
                                     safeMutate { viewModel.retryFromMessage(item.message.id) }
-                                }),
+                                }) else null,
                                 // [T-android-delete-from-here] Gated while
                                 // streaming for the same reason as Retry:
                                 // truncating rows under a live agent loop
                                 // leaves agentHistory describing messages that
                                 // no longer exist. Opens a confirmation rather
                                 // than cutting straight away — there is no undo.
-                                onDeleteFromHere = if (isStreaming || item.message.isQueued) null else ({
+                                onDeleteFromHere = if (messageActionsApply) ({
                                     deleteFromHereTargetId = item.message.id
-                                }),
+                                }) else null,
                                 // T187: long-press → Edit pulls the user message
                                 // text into the composer; the next send truncates
                                 // from this turn (inclusive) before persisting
                                 // the edited content. Gated on isStreaming the
                                 // same way Retry is.
-                                onEdit = if (isStreaming || item.message.isQueued) null else ({
+                                //
+                                // For a still-unread queued message this is null (same
+                                // as Retry): Edit is REPLACED by 撤回并编辑 — the compose
+                                // step would otherwise commit into the message the model
+                                // is about to read. See the requirement at
+                                // plans/ULW-2026-09-25-01/request.md:158.
+                                onEdit = if (messageActionsApply) ({
                                     val prefill = viewModel.editMessage(item.message.id)
                                     if (prefill != null) {
                                         coroutineScope.launch {
@@ -4112,12 +4339,16 @@ fun ChatScreen(
                                         }
                                         inputFocusRequester.requestFocus()
                                     }
-                                }),
-                                onWithdraw = if (item.message.isQueued) {
-                                    { safeMutate { if (viewModel.withdrawQueuedMessage(item.message.id)) inputFocusRequester.requestFocus() } }
+                                }) else null,
+                                onWithdraw = if (messageWithdrawable) {
+                                    { safeMutate {
+                                        if (reportQueuedWithdraw(viewModel.withdrawQueuedMessage(item.message.id))) {
+                                            inputFocusRequester.requestFocus()
+                                        }
+                                    } }
                                 } else null,
-                                onDiscardQueued = if (item.message.isQueued) {
-                                    { safeMutate { viewModel.discardQueuedMessage(item.message.id) } }
+                                onDiscardQueued = if (messageWithdrawable) {
+                                    { safeMutate { reportQueuedWithdraw(viewModel.discardQueuedMessage(item.message.id)) } }
                                 } else null,
                                 onPreviewFile = { uri, name ->
                                     // T150: turn the persisted file:// URI back
@@ -4141,7 +4372,7 @@ fun ChatScreen(
                                 },
                             )
                             } // close UserBubble SideEffect + UserMessageBubble block
-                            is FlatChatItem.AssistantHeader -> AssistantHeader()
+                            is FlatChatItem.AssistantHeader -> AssistantHeader(item.snapshot)
                             is FlatChatItem.AssistantText -> BoundsTrackedBlock(
                                 messageId = item.messageId,
                                 slotKey = "text:${item.block.id}",
@@ -4192,18 +4423,35 @@ fun ChatScreen(
                                 }
                             }
                             is FlatChatItem.AssistantThinking -> {
-                                // T300: hide Deep Thinking block when the user
-                                // currently has thinking turned off — even if
-                                // a forced-reasoning model (e.g. xAI Grok 4.x
-                                // via OpenRouter) still streams reasoning_-
-                                // content. Snapshot on the message wins so
-                                // toggling the level after a turn finishes
-                                // doesn't retro-hide an already-visible block;
-                                // legacy DB-restored messages (snapshot=null)
-                                // follow the chat's current level.
-                                val effectiveLevel = item.messageThinkingLevel
-                                    ?: viewModel.thinkingLevel.value
-                                if (effectiveLevel.isEnabled) {
+                                // T300: hide the Deep Thinking block for a turn
+                                // the user had thinking OFF for — even when a
+                                // forced-reasoning model (e.g. xAI Grok 4.x via
+                                // OpenRouter) streams reasoning_content anyway.
+                                //
+                                // [T-android-thinking-level-persist] The gate
+                                // reads the level recorded ON THE MESSAGE. It
+                                // used to fall back to
+                                // `viewModel.thinkingLevel.value`, which is one
+                                // mutable session setting: it made history
+                                // answer to a present-day choice — turn thinking
+                                // off and every older reply's reasoning
+                                // disappeared; turn it on and reasoning came
+                                // back for replies the user had asked not to
+                                // surface. That also happened to be the ONLY
+                                // value available, because nothing ever
+                                // persisted a per-message level.
+                                //
+                                // A row with NO recorded level (written before
+                                // messages.thinking_level existed, or by a path
+                                // with no turn level) is UNKNOWN, not "whatever
+                                // is selected now": it shows the reasoning the
+                                // model actually produced, matching the flat
+                                // builder's own `thinkingLevel?.isEnabled ?: true`
+                                // convention, and the header draws no level
+                                // capsule for it — so nothing claims a level that
+                                // was never recorded.
+                                val showThinkingBlock = item.messageThinkingLevel?.isEnabled ?: true
+                                if (showThinkingBlock) {
                                     // [T-android-thinking-auto-collapse] Use
                                     // `isLastBlockOverall` (not `isLast` =
                                     // last-thinking-only) so the block flips
@@ -4273,6 +4521,19 @@ fun ChatScreen(
                                 onRevert = if (item.block.toolName == "compact") {
                                     { viewModel.revertCompact() }
                                 } else null,
+                            )
+                            // [T-android-r37-system-row] A row the app
+                            // synthesised on the API's `user` role — an injected
+                            // `<system-reminder>`. R37 puts it in the app layer's
+                            // SYSTEM class: it reads as neither the human's words
+                            // nor the assistant's reply, so it draws as the same
+                            // neutral divider row the compact / slash notices use,
+                            // with the injected text behind a tap. It is NOT a
+                            // turn-navigation anchor — that walks
+                            // `isManualHumanUser()`, which is already false here.
+                            is FlatChatItem.SystemRow -> SystemInjectionRow(
+                                injectedText = item.injectedText,
+                                stableKey = item.key,
                             )
                             is FlatChatItem.AssistantTyping -> TypingIndicator()
                             is FlatChatItem.AssistantError -> InlineErrorBanner(
@@ -4894,7 +5155,7 @@ fun ChatScreen(
                                                     // they can keep typing
                                                     // without an extra tap on
                                                     // the composer.
-                                                    if (cmd.isSkill) {
+                                                    if (cmd.fillText != null) {
                                                         try {
                                                             inputFocusRequester.requestFocus()
                                                         } catch (_: IllegalStateException) {
@@ -5384,7 +5645,7 @@ fun ChatScreen(
                                     }
                                     Spacer(Modifier.width(6.dp))
                                     Text(
-                                        "Move to…",
+                                        stringResource(R.string.move_to_sheet_title),
                                         fontSize = 11.sp,
                                         fontWeight = FontWeight.Medium,
                                         color = ChatColors.secondaryText,
@@ -5546,7 +5807,7 @@ fun ChatScreen(
                                                 } catch (_: android.content.ActivityNotFoundException) {
                                                     android.widget.Toast.makeText(
                                                         context,
-                                                        "No app available to open this attachment.",
+                                                        context.getString(R.string.chat_attachment_no_app),
                                                         android.widget.Toast.LENGTH_SHORT,
                                                     ).show()
                                                 }
@@ -6104,7 +6365,7 @@ fun ChatScreen(
                             ) {
                                 Icon(
                                     Icons.Default.Add,
-                                    contentDescription = "Attach",
+                                    contentDescription = stringResource(R.string.chat_composer_attach),
                                     tint = MaterialTheme.colorScheme.onSurfaceVariant,
                                     modifier = Modifier.size(20.dp),
                                 )
@@ -6640,7 +6901,7 @@ fun ChatScreen(
                             ) {
                                 Icon(
                                     Icons.Default.Stop,
-                                    contentDescription = "Stop",
+                                    contentDescription = stringResource(R.string.common_stop),
                                     tint = Color.White,
                                     modifier = Modifier.size(20.dp),
                                 )
@@ -6674,8 +6935,19 @@ fun ChatScreen(
                                 contentAlignment = Alignment.Center,
                             ) {
                                 Icon(
-                                    Icons.Default.ArrowUpward,
-                                    contentDescription = "Send",
+                                    // [request.md:158] While a message is being edited this
+                                    // button must not read as "Send": tapping it commits the
+                                    // edit back onto the SAME message (ChatViewModel.sendMessage
+                                    // → commitEditIfActive) instead of dispatching a turn, and
+                                    // it never auto-retries. Same up-arrow family, glyph and
+                                    // label switched so the push-up-into-place meaning is what
+                                    // the user (and a screen reader) gets.
+                                    if (editingId != null) Icons.Default.VerticalAlignTop
+                                    else Icons.Default.ArrowUpward,
+                                    contentDescription = stringResource(
+                                        if (editingId != null) R.string.chat_edit_push_back
+                                        else R.string.send,
+                                    ),
                                     tint = if (canActivate) ChatColors.background
                                     else ChatColors.primaryText.copy(alpha = 0.5f),
                                     modifier = Modifier.size(20.dp),
@@ -6865,6 +7137,17 @@ fun ChatScreen(
                 modifier = Modifier.fillMaxSize(),
             )
         }
+    }
+
+    if (showConversationMap) {
+        ConversationMapScreen(
+            messages = allMessages,
+            onDismiss = { showConversationMap = false },
+            onMessageClick = { messageId ->
+                showConversationMap = false
+                pendingConversationMapMessageId = messageId
+            },
+        )
     }
 
     // Browser bottom sheet
@@ -7199,44 +7482,6 @@ fun ChatScreen(
  * enclosing subtitle Column — see the call site for the full gesture-separation
  * rationale.
  */
-@Composable
-private fun ThinkingLevelBadge(
-    level: com.openminis.app.data.model.ThinkingLevel,
-    onClick: () -> Unit,
-) {
-    val context = LocalContext.current
-    // Secondary grey for icon + label (iOS secondaryText parity) — no accent.
-    val badgeColor = MaterialTheme.colorScheme.onSurfaceVariant
-    Row(
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(2.dp),
-        modifier = Modifier
-            .clip(RoundedCornerShape(50))
-            // Faint translucent-grey capsule (iOS Color.secondary.opacity(0.10)).
-            .background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f))
-            // Own clickable → consumes the tap, opens the thinking sheet.
-            .clickable(onClick = onClick)
-            .padding(horizontal = 5.dp, vertical = 1.dp),
-    ) {
-        Icon(
-            imageVector = Icons.Default.Lightbulb,
-            contentDescription = null,
-            // Dimmed in the Off state (sheet Off-row convention) so "Off" reads
-            // as "thinking disabled" at a glance.
-            tint = if (level.isEnabled) badgeColor else badgeColor.copy(alpha = 0.4f),
-            modifier = Modifier.size(9.dp),
-        )
-        Text(
-            text = level.localizedName(context),
-            fontSize = 9.sp,
-            lineHeight = 11.sp,
-            fontWeight = FontWeight.Medium,
-            color = badgeColor,
-            maxLines = 1,
-        )
-    }
-}
-
 /**
  * [T-android-thinking-badge-navbar] Bottom-sheet thinking-level selector opened
  * from [ThinkingLevelBadge]. Mirrors iOS ThinkingLevelSheetView: an Off row
@@ -7312,5 +7557,6 @@ private fun ThinkingLevelSheet(
         }
     }
 }
+
 
 

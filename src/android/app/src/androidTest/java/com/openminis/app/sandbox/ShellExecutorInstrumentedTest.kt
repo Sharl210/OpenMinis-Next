@@ -5,6 +5,7 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import kotlinx.coroutines.runBlocking
 import org.junit.After
+import org.junit.Assume
 import org.junit.Assert.*
 import org.junit.Before
 import org.junit.Test
@@ -297,11 +298,32 @@ class ShellExecutorInstrumentedTest {
         }
     }
 
+    /**
+     * [T-android-assume-not-return] Mark the test SKIPPED when the sandbox
+     * assets are absent — do not merely print and continue.
+     *
+     * A bare `return` here returned from THIS HELPER, not from the caller. Every
+     * test that called it therefore kept running and blew up with
+     * "PRootKernel must be booted before executing commands" — 20 tests in this
+     * class and 16 in ExecutionCoordinatorInstrumentedTest failed for a missing
+     * optional asset, which is noise that hides genuine failures in the same
+     * run. (Correction: `return@runBlocking` inside the test body was previously
+     * believed to be an adequate skip — it is NOT. It exits the lambda, so JUnit
+     * records the test as PASSED, and 13 tests across that sibling and
+     * PRootKernelInstrumentedTest reported green while asserting nothing.) `assumeTrue` throws
+     * AssumptionViolatedException, which JUnit reports as SKIPPED with a
+     * reason, so an absent asset is visible as "not run" rather than "broken".
+     *
+     * The assets are architecture-specific (the prepare script ships aarch64
+     * rootfs + proot), so an x86_64 emulator can never satisfy this — skipping
+     * is the correct outcome there, not a red suite.
+     */
     private fun skipIfNoBoot() {
-        if (!PRootKernel.isBooted) {
-            println("SKIP: PRoot not booted (assets not available)")
-            return
-        }
+        Assume.assumeTrue(
+            "sandbox assets unavailable (alpine-minirootfs.tar.gz / proot-aarch64 not in assets, " +
+                "or PRoot not booted on this ABI)",
+            PRootKernel.isBooted,
+        )
     }
 
     private fun resetKernel() {

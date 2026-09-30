@@ -48,6 +48,8 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.openminis.app.i18n.uppercaseForDisplay
+import androidx.compose.ui.res.stringResource
+import com.openminis.app.R
 
 /**
  * Shared primitives for settings pages. Grouped-card layout (iOS/ChatGPT style).
@@ -97,7 +99,7 @@ fun SettingsScaffold(
                 when {
                     navigation != null -> navigation()
                     onBack != null -> IconButton(onClick = onBack) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = stringResource(R.string.common_back))
                     }
                 }
             }
@@ -469,7 +471,7 @@ fun SettingsChoiceRow(
             if (selected) {
                 Icon(
                     Icons.Default.Check,
-                    contentDescription = "Selected",
+                    contentDescription = stringResource(R.string.agent_loop_models_selected),
                     tint = MaterialTheme.colorScheme.primary,
                     modifier = Modifier.size(20.dp),
                 )

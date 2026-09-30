@@ -1,5 +1,6 @@
 package com.openminis.app.ui.browser
 
+import android.widget.Toast
 import com.openminis.app.R
 import com.openminis.app.browser.BrowserAction
 import com.openminis.app.browser.BrowserActionInput
@@ -59,6 +60,7 @@ import androidx.compose.material3.LocalTextStyle
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -139,6 +141,22 @@ fun BrowserSheet(
     val focusManager = LocalFocusManager.current
 
     val selectedTab = tabs.find { it.id == selectedTabId }
+
+    // [T-browser-user-viewing-tab] While this sheet is on screen the user is
+    // looking at the selected tab, so the pool must not sleep it. The
+    // requirement is explicit that a page may sleep only when the model isn't
+    // executing AND the user hasn't opened it to look; without this the evictor
+    // saw a user's page as idle and destroyed the WebView they were reading.
+    DisposableEffect(tabPool, selectedTabId) {
+        tabPool.setUserViewing(selectedTabId)
+        onDispose { tabPool.setUserViewing(null) }
+    }
+
+    // [T-browser-user-viewing-tab] User-driven operations (typing a URL,
+    // back/forward, reload, stop) are operations on the page too, so they
+    // refresh activity just like an agent action does.
+    val touchSelectedTab: () -> Unit = { selectedTab?.let { tabPool.touchTab(it.id) } }
+
     val currentURL = selectedTab?.manager?.currentURL?.collectAsState()?.value ?: ""
     val pageTitle = selectedTab?.manager?.pageTitle?.collectAsState()?.value ?: ""
     val isLoading = selectedTab?.manager?.isLoading?.collectAsState()?.value ?: false
@@ -282,10 +300,20 @@ fun BrowserSheet(
                     IconButton(
                         onClick = {
                             if (canBookmarkCurrentPage) {
-                                currentPageBookmarked = historyStore.toggleBookmark(
-                                    currentURL,
-                                    pageTitle,
-                                )
+                                val bookmarkWrite = historyStore.toggleBookmark(currentURL, pageTitle)
+                                // A failed write is rolled back by the store, so this
+                                // value already describes what a restart would show.
+                                // Keep the star honest and tell the user why it did
+                                // nothing instead of showing a saved state that is not
+                                // on disk.
+                                currentPageBookmarked = bookmarkWrite.value
+                                if (bookmarkWrite.failed) {
+                                    Toast.makeText(
+                                        context,
+                                        context.getString(R.string.browser_library_write_failed),
+                                        Toast.LENGTH_SHORT,
+                                    ).show()
+                                }
                             }
                         },
                         enabled = canBookmarkCurrentPage,
@@ -358,6 +386,7 @@ fun BrowserSheet(
                                 val trimmed = urlInput.trim()
                                 if (trimmed.isNotEmpty()) {
                                     val normalized = normalizeURLInput(trimmed)
+                                    touchSelectedTab()
                                     selectedTab?.manager?.loadURL(normalized)
                                     urlInput = normalized
                                 }
@@ -378,7 +407,7 @@ fun BrowserSheet(
                     if (isLoading) {
                         Spacer(modifier = Modifier.width(4.dp))
                         IconButton(
-                            onClick = { selectedTab?.manager?.stopLoading() },
+                            onClick = { touchSelectedTab(); selectedTab?.manager?.stopLoading() },
                             modifier = Modifier.size(28.dp),
                         ) {
                             Icon(
@@ -490,13 +519,13 @@ fun BrowserSheet(
                     icon = Icons.AutoMirrored.Filled.ArrowBack,
                     contentDesc = stringResource(R.string.browser_nav_back),
                     enabled = canGoBack && !isAgentBusy,
-                    onClick = { selectedTab?.manager?.goBack() },
+                    onClick = { touchSelectedTab(); selectedTab?.manager?.goBack() },
                 )
                 ToolbarIcon(
                     icon = Icons.AutoMirrored.Filled.ArrowForward,
                     contentDesc = stringResource(R.string.browser_nav_forward),
                     enabled = canGoForward && !isAgentBusy,
-                    onClick = { selectedTab?.manager?.goForward() },
+                    onClick = { touchSelectedTab(); selectedTab?.manager?.goForward() },
                 )
                 // [T-android-browser-download-ux] Downloads entry: shows while
                 // the session has ANY download records, disappears when the
@@ -526,7 +555,7 @@ fun BrowserSheet(
                         contentDesc = stringResource(R.string.browser_stop),
                         enabled = !isAgentBusy,
                         tint = accent,
-                        onClick = { selectedTab?.manager?.stopLoading() },
+                        onClick = { touchSelectedTab(); selectedTab?.manager?.stopLoading() },
                     )
                 } else {
                     ToolbarIcon(
@@ -534,7 +563,7 @@ fun BrowserSheet(
                         contentDesc = stringResource(R.string.browser_reload),
                         enabled = !isAgentBusy,
                         tint = accent,
-                        onClick = { selectedTab?.manager?.reload() },
+                        onClick = { touchSelectedTab(); selectedTab?.manager?.reload() },
                     )
                 }
                 ToolbarIcon(

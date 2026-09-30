@@ -51,6 +51,7 @@ class RuntimeCommunicationFileStore(private val file: File) {
         put("senderCapabilityVersion", version(record.senderCapabilityVersion))
         put("receiverCapabilityVersion", version(record.receiverCapabilityVersion))
         put("directoryPolicy", policy(record.directoryPolicy))
+        putNullable("attachedContext", record.attachedContext?.let(::attachment))
     }
 
     private fun decode(json: JSONObject): RuntimeCommunicationMetadata = RuntimeCommunicationMetadata(
@@ -66,7 +67,54 @@ class RuntimeCommunicationFileStore(private val file: File) {
         senderCapabilityVersion = decodeVersion(json.getJSONObject("senderCapabilityVersion")),
         receiverCapabilityVersion = decodeVersion(json.getJSONObject("receiverCapabilityVersion")),
         directoryPolicy = decodePolicy(json.getJSONObject("directoryPolicy")),
+        attachedContext = json.optJSONObject("attachedContext")?.let(::decodeAttachment),
     )
+
+    /**
+     * The attachment is written as a locator plus indices and nothing else.
+     * There is no branch here that could write message text — the only fields
+     * this function knows about are the ones [RuntimeContextAttachment] has, and
+     * it has no text field by construction.
+     */
+    private fun attachment(value: RuntimeContextAttachment) = JSONObject().apply {
+        put("conversationId", value.conversationId.value)
+        when (val selection = value.selection) {
+            is RuntimeContextSelection.All -> {
+                put("mode", MODE_ALL)
+                put("messageCount", selection.messageCount)
+            }
+            is RuntimeContextSelection.Indices -> {
+                put("mode", MODE_INDICES)
+                put("indices", JSONArray(selection.indices.toList()))
+            }
+        }
+    }
+
+    private fun decodeAttachment(value: JSONObject): RuntimeContextAttachment? {
+        val address = value.optString("conversationId", null)
+            ?.let { RuntimeConversationAddress.parse(it) } ?: return null
+        return when (value.optString("mode", null)) {
+            MODE_ALL -> RuntimeContextAttachment(
+                conversationId = address,
+                selection = RuntimeContextSelection.All(value.optInt("messageCount", 0)),
+            )
+            MODE_INDICES -> {
+                val rows = value.optJSONArray("indices") ?: JSONArray()
+                val indices = buildList(rows.length()) {
+                    for (index in 0 until rows.length()) add(rows.optInt(index, -1))
+                }.filter { it >= 0 }.distinct().sorted()
+                if (indices.isEmpty()) null
+                else RuntimeContextAttachment(
+                    conversationId = address,
+                    selection = RuntimeContextSelection.Indices(indices),
+                )
+            }
+            // An unknown mode is a record this build cannot interpret. Dropping
+            // the attachment is right — inventing a selection would tell the
+            // receiver to query for messages the sender never offered.
+            else -> null
+        }
+    }
 
     private fun peer(value: RuntimeCommunicationPeer) = JSONObject().apply {
         put("address", value.address.value)
@@ -110,5 +158,15 @@ class RuntimeCommunicationFileStore(private val file: File) {
         put(key, value ?: JSONObject.NULL)
     }
 
-    companion object { private const val SCHEMA_VERSION = 1 }
+    companion object {
+        private const val SCHEMA_VERSION = 1
+
+        /**
+         * Attachment selection tags. Wire values are explicit strings rather
+         * than enum ordinals so reordering [RuntimeContextSelection] can never
+         * reinterpret a record already on disk.
+         */
+        private const val MODE_ALL = "ALL"
+        private const val MODE_INDICES = "INDICES"
+    }
 }

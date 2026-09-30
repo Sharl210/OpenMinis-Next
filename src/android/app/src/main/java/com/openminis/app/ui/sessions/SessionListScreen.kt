@@ -55,6 +55,7 @@ import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.Fingerprint
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.DriveFileMove
 import androidx.compose.material.icons.filled.Edit
@@ -105,9 +106,11 @@ import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Surface
+import com.openminis.app.feature.runtime.ConversationIdProtocol
 import com.openminis.app.ui.components.MinisAlertDialog
 import com.openminis.app.ui.components.MinisOutlinedButton
 import com.openminis.app.ui.components.MinisMenu
+import com.openminis.app.ui.components.copyToClipboardWithFeedback
 import com.openminis.app.ui.components.MinisMenuDivider
 import com.openminis.app.ui.components.SectionDesign
 import com.openminis.app.ui.components.SectionTextField
@@ -226,13 +229,16 @@ private fun categoryStyle(category: String?): CategoryStyle {
 }
 
 // Date period for section grouping (matching iOS)
-private enum class DatePeriod(val label: String) {
-    PINNED("Pinned"),     // labels are i18n'd at render time via sectionLabelFor
-    TODAY("Today"),
-    YESTERDAY("Yesterday"),
-    THIS_WEEK("This Week"),
-    THIS_MONTH("This Month"),
-    EARLIER("Earlier"),
+// [R14 i18n] The human-readable section title lives in resources; this enum
+// only carries the resource id (its `label` string used to be an English
+// literal that nothing read).
+private enum class DatePeriod(val labelRes: Int) {
+    PINNED(R.string.sessionlist_section_pinned),
+    TODAY(R.string.sessionlist_section_today),
+    YESTERDAY(R.string.sessionlist_section_yesterday),
+    THIS_WEEK(R.string.sessionlist_section_this_week),
+    THIS_MONTH(R.string.sessionlist_section_this_month),
+    EARLIER(R.string.sessionlist_section_earlier),
 }
 
 /**
@@ -1174,14 +1180,7 @@ fun SessionListScreen(
 
                         trailingDateGroups.forEach { (period, periodSessions) ->
                             item(key = "header_${period.name}") {
-                                SectionHeader(title = stringResource(when (period) {
-                                    DatePeriod.PINNED -> R.string.sessionlist_section_pinned
-                                    DatePeriod.TODAY -> R.string.sessionlist_section_today
-                                    DatePeriod.YESTERDAY -> R.string.sessionlist_section_yesterday
-                                    DatePeriod.THIS_WEEK -> R.string.sessionlist_section_this_week
-                                    DatePeriod.THIS_MONTH -> R.string.sessionlist_section_this_month
-                                    DatePeriod.EARLIER -> R.string.sessionlist_section_earlier
-                                }))
+                                SectionHeader(title = stringResource(period.labelRes))
                             }
                             renderSessionRows(periodSessions)
                         }
@@ -1702,7 +1701,12 @@ private fun DualFabRow(
                     .shadow(8.dp, CircleShape, ambientColor = Color.Black.copy(alpha = 0.2f)),
                 elevation = FloatingActionButtonDefaults.elevation(defaultElevation = 6.dp),
             ) {
-                Icon(Icons.Outlined.Forum, contentDescription = "New Chat", tint = Color.White, modifier = Modifier.size(24.dp))
+                Icon(
+                    Icons.Outlined.Forum,
+                    contentDescription = stringResource(R.string.new_chat),
+                    tint = Color.White,
+                    modifier = Modifier.size(24.dp),
+                )
             }
             DropdownMenu(
                 expanded = showGroupMenu,
@@ -1976,6 +1980,9 @@ private fun SessionItemContent(
      * welded fill shows through; null keeps the default surface.
      */
     rowBackground: Color? = null,
+    // [T-android-copy-conversation-id] Read here rather than threaded through every
+    // call site: the row only needs it for its own clipboard entry.
+    rowContext: Context = LocalContext.current,
     /**
      * [T-android-split-selection-shape] True when this row sits inside a folder
      * container. Kept separate from [rowBackground] because that colour now
@@ -2149,6 +2156,31 @@ private fun SessionItemContent(
                     },
                     leadingIcon = {
                         Icon(Icons.Default.ContentCopy, contentDescription = null)
+                    },
+                )
+                // [T-android-copy-conversation-id] request.md:136 — 「我的主界面去
+                // 长按那一个会话…它有一个…复制对话ID」. The SAME id string the chat
+                // overflow menu copies and the same prefix every model-facing exit
+                // uses, so a value copied here can be pasted straight into
+                // `conversation_query`.
+                //
+                // The toast echoes the id rather than saying a bare "Copied": the
+                // point of the entry is to hand the user a string they will paste
+                // somewhere else, so showing it IS the confirmation.
+                DropdownMenuItem(
+                    text = { Text(stringResource(R.string.chat_copy_conversation_id)) },
+                    onClick = {
+                        showContextMenu = false
+                        val id = ConversationIdProtocol.prefixedConversationId(session.id)
+                        copyToClipboardWithFeedback(
+                            rowContext,
+                            label = "conversation-id",
+                            value = id,
+                            successText = rowContext.getString(R.string.selection_copied_toast, id),
+                        )
+                    },
+                    leadingIcon = {
+                        Icon(Icons.Default.Fingerprint, contentDescription = null)
                     },
                 )
                 // Move to / Change Group
@@ -2978,7 +3010,7 @@ private fun SessionRow(
             modifier = Modifier.weight(1f),
             verticalArrangement = Arrangement.spacedBy(1.dp),
         ) {
-            val titleText = session.title ?: "New Chat"
+            val titleText = session.title ?: stringResource(R.string.new_chat)
             if (searchQuery.isNotBlank()) {
                 Text(
                     text = highlightedAnnotatedString(titleText, searchQuery),
@@ -3011,7 +3043,7 @@ private fun SessionRow(
                 )
             } else {
                 Text(
-                    text = session.lastMessage ?: "No messages yet",
+                    text = session.lastMessage ?: stringResource(R.string.sessionlist_no_messages_yet),
                     fontSize = 14.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 1,
@@ -3320,11 +3352,26 @@ private fun SetupStepCard(
 
 // ─── Edit Title & Category Sheet (matching iOS SessionEditSheet) ──────────
 
+// [R14 i18n] Each entry pairs the STABLE persisted key (lowercase English, what
+// the DB stores and `categoryStyle` switches on — never translate it) with the
+// resource id of the label the user actually sees.
 private val allCategories = listOf(
-    "Code", "Writing", "Research", "Analysis",
-    "Creative", "Chat", "Math", "Translation",
-    "Health", "Finance", "Travel", "Education",
-    "Design", "Productivity", "Support", "Other",
+    "code" to R.string.session_category_code,
+    "writing" to R.string.session_category_writing,
+    "research" to R.string.session_category_research,
+    "analysis" to R.string.session_category_analysis,
+    "creative" to R.string.session_category_creative,
+    "chat" to R.string.session_category_chat,
+    "math" to R.string.session_category_math,
+    "translation" to R.string.session_category_translation,
+    "health" to R.string.session_category_health,
+    "finance" to R.string.session_category_finance,
+    "travel" to R.string.session_category_travel,
+    "education" to R.string.session_category_education,
+    "design" to R.string.session_category_design,
+    "productivity" to R.string.session_category_productivity,
+    "support" to R.string.session_category_support,
+    "other" to R.string.session_category_other,
 )
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -3345,6 +3392,9 @@ internal fun SessionEditSheet(
 ) {
     var title by remember { mutableStateOf(session.title ?: "") }
     var selectedCategory by remember { mutableStateOf(session.category) }
+    // [R14 i18n] Copy needed by non-composable lambdas below.
+    val newChatLabel = stringResource(R.string.new_chat)
+    val editSessionTitle = stringResource(R.string.session_edit_title)
 
     // [T-android-sessionedit-regenerate-button] When a regeneration run writes a
     // new title/category to the DB, `liveSession` updates — mirror those values
@@ -3371,17 +3421,17 @@ internal fun SessionEditSheet(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                MinisTextButton(onClick = onDismiss) { Text("Cancel") }
+                MinisTextButton(onClick = onDismiss) { Text(stringResource(R.string.cancel)) }
                 Spacer(Modifier.weight(1f))
                 Text(
-                    "Edit Session",
+                    editSessionTitle,
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.SemiBold,
                 )
                 Spacer(Modifier.weight(1f))
                 MinisTextButton(
-                    onClick = { onSave(title.ifBlank { "New Chat" }, selectedCategory) },
-                ) { Text("Save") }
+                    onClick = { onSave(title.ifBlank { newChatLabel }, selectedCategory) },
+                ) { Text(stringResource(R.string.save)) }
             }
 
             Spacer(Modifier.height(16.dp))
@@ -3390,7 +3440,7 @@ internal fun SessionEditSheet(
             OutlinedTextField(
                 value = title,
                 onValueChange = { title = it },
-                label = { Text("Title") },
+                label = { Text(stringResource(R.string.common_title)) },
                 modifier = Modifier.fillMaxWidth(),
                 singleLine = true,
             )
@@ -3398,7 +3448,7 @@ internal fun SessionEditSheet(
             Spacer(Modifier.height(20.dp))
 
             Text(
-                "Category",
+                stringResource(R.string.common_category),
                 style = MaterialTheme.typography.titleSmall,
                 modifier = Modifier.padding(bottom = 8.dp),
             )
@@ -3410,9 +3460,9 @@ internal fun SessionEditSheet(
                 verticalArrangement = Arrangement.spacedBy(8.dp),
                 modifier = Modifier.height(240.dp),
             ) {
-                items(allCategories) { cat ->
-                    val isSelected = selectedCategory?.equals(cat, ignoreCase = true) == true
-                    val style = categoryStyle(cat.lowercase())
+                items(allCategories) { (categoryKey, categoryLabelRes) ->
+                    val isSelected = selectedCategory?.equals(categoryKey, ignoreCase = true) == true
+                    val style = categoryStyle(categoryKey)
                     Box(
                         modifier = Modifier
                             .clip(RoundedCornerShape(10.dp))
@@ -3421,7 +3471,7 @@ internal fun SessionEditSheet(
                                 else MaterialTheme.colorScheme.surfaceContainerHigh
                             )
                             .clickable {
-                                selectedCategory = if (isSelected) null else cat.lowercase()
+                                selectedCategory = if (isSelected) null else categoryKey
                             }
                             .padding(vertical = 10.dp),
                         contentAlignment = Alignment.Center,
@@ -3435,7 +3485,7 @@ internal fun SessionEditSheet(
                             )
                             Spacer(Modifier.height(4.dp))
                             Text(
-                                cat,
+                                stringResource(categoryLabelRes),
                                 fontSize = 11.sp,
                                 color = if (isSelected) style.color
                                 else MaterialTheme.colorScheme.onSurfaceVariant,
@@ -3504,14 +3554,21 @@ private fun exportSession(
 ) {
     scope.launch {
         try {
-            val (uri, _) = com.openminis.app.share.ChatExporter.exportToZip(
+            val topology = com.openminis.app.feature.runtime.RuntimeSessionCoordinator
+                .open(context)
+                .topologySnapshot()
+            val runtimeChildren = topology.descendantsForChatSession(session.id)
+            val (uri, summary) = com.openminis.app.share.ChatExporter.exportForRuntimeTree(
                 context = context,
                 session = session,
                 repository = chatRepository,
                 format = format,
+                topology = topology,
             )
+            val isZip = runtimeChildren.isNotEmpty()
+            val mime = if (isZip) "application/zip" else if (format == "json") "application/json" else "text/plain"
             val intent = Intent(Intent.ACTION_SEND).apply {
-                type = "application/zip"
+                type = mime
                 putExtra(Intent.EXTRA_SUBJECT, session.title ?: "Conversation")
                 putExtra(Intent.EXTRA_STREAM, uri)
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
@@ -3520,6 +3577,23 @@ private fun exportSession(
                 intent,
                 context.getString(R.string.sessionlist_export),
             ).apply { addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION) }
+            // [T-android-runtime-export-honest-degradation] The archive is still worth
+            // sharing — the nodes that DO have chats are complete — but handing it over
+            // while saying nothing turned "an archive that is missing nodes" into "the
+            // whole tree, successfully exported". Say it out loud instead; the same
+            // list is written into the archive as `export-degraded.json`, so the fact
+            // survives leaving this screen.
+            if (summary.missingRuntimeNodeIds.isNotEmpty()) {
+                android.widget.Toast.makeText(
+                    context,
+                    context.getString(
+                        R.string.sessionlist_export_incomplete,
+                        summary.missingRuntimeNodeIds.size,
+                        runtimeChildren.size,
+                    ),
+                    android.widget.Toast.LENGTH_LONG,
+                ).show()
+            }
             context.startActivity(chooser)
         } catch (t: Throwable) {
             android.widget.Toast.makeText(

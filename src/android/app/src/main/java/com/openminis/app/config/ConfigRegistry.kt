@@ -20,7 +20,13 @@ import java.util.concurrent.atomic.AtomicBoolean
  * (no actor isolation needed — handler threads are the writers and the
  * registry is initialized once at boot before any reads).
  */
-class ConfigRegistry private constructor() {
+class ConfigRegistry
+// [T-android-config-prefs-mismatch-background] `internal` rather than
+// `private` so a JVM unit test can build a throwaway registry and run a real
+// `ConfigBuiltins.registerX(...)` against a fake Context — the only way to
+// assert on the REGISTERED binding instead of on source text. Production code
+// still goes through [init] and its process-wide singleton.
+internal constructor() {
     private val fields = LinkedHashMap<String, ConfigField>()
     private val collections = LinkedHashMap<String, ConfigCollection>()
     private val initialized = AtomicBoolean(false)

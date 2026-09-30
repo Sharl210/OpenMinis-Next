@@ -415,7 +415,7 @@ fun ModelGroupsScreen(
             text = {
                 Column {
                     Text(
-                        "Enter a name for the new model group.",
+                        stringResource(R.string.model_groups_new_group_hint),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -525,7 +525,8 @@ private fun ModelEntryDropdown(
 ) {
     var expanded by remember { mutableStateOf(false) }
     val selected = entries.firstOrNull { it.id == selectedId }
-    val selectedName = selected?.let { "${it.model.displayName} (${it.model.id})" } ?: "Use current default"
+    val selectedName = selected?.let { "${it.model.displayName} (${it.model.id})" }
+        ?: stringResource(R.string.model_groups_use_current_default)
     ExposedDropdownMenuBox(expanded = expanded, onExpandedChange = { expanded = it }, modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)) {
         OutlinedTextField(
             value = selectedName,
@@ -1092,9 +1093,14 @@ private fun GroupRow(
             // group; the parenthetical reports disabled count.
             val disabledCount = totalMembers - enabledMembers
             val subtitleText = if (disabledCount > 0) {
-                "$strategyLabel · $totalMembers models ($disabledCount disabled)"
+                stringResource(
+                    R.string.model_groups_summary_models_disabled,
+                    strategyLabel,
+                    totalMembers,
+                    disabledCount,
+                )
             } else {
-                "$strategyLabel · $totalMembers models"
+                stringResource(R.string.model_groups_summary_models, strategyLabel, totalMembers)
             }
             Text(
                 text = subtitleText,

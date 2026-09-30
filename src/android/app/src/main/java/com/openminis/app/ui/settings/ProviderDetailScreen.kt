@@ -445,7 +445,7 @@ fun ProviderDetailScreen(
                                 }
                             },
                             shape = SegmentedButtonDefaults.itemShape(index = 0, count = 3),
-                        ) { Text("Auto") }
+                        ) { Text(stringResource(R.string.provider_image_endpoint_auto)) }
                         SegmentedButton(
                             selected = mode == com.openminis.app.data.model.ImageEndpointMode.imagesGenerations,
                             onClick = {
@@ -460,7 +460,7 @@ fun ProviderDetailScreen(
                                 }
                             },
                             shape = SegmentedButtonDefaults.itemShape(index = 1, count = 3),
-                        ) { Text("Images API") }
+                        ) { Text(stringResource(R.string.provider_image_endpoint_images_api)) }
                         SegmentedButton(
                             selected = mode == com.openminis.app.data.model.ImageEndpointMode.chatCompletions,
                             onClick = {
@@ -474,7 +474,7 @@ fun ProviderDetailScreen(
                                 }
                             },
                             shape = SegmentedButtonDefaults.itemShape(index = 2, count = 3),
-                        ) { Text("Chat") }
+                        ) { Text(stringResource(R.string.provider_image_endpoint_chat)) }
                     }
                 }
             }
@@ -817,7 +817,7 @@ private fun OAuthCredentialBlock(
 
     Row(verticalAlignment = Alignment.CenterVertically) {
         Text(
-            "OAuth",
+            stringResource(R.string.provider_oauth_title),
             style = MaterialTheme.typography.bodyLarge,
             fontWeight = FontWeight.Medium,
         )
@@ -838,7 +838,7 @@ private fun OAuthCredentialBlock(
         } else {
             Spacer(modifier = Modifier.weight(1f))
             Text(
-                "Not connected",
+                stringResource(R.string.provider_status_not_connected),
                 color = MaterialTheme.colorScheme.error,
                 style = MaterialTheme.typography.bodySmall,
             )
@@ -947,7 +947,7 @@ private fun ApiKeyCredentialBlock(
                 IconButton(onClick = onToggleVisibility) {
                     Icon(
                         if (keyVisible) Icons.Default.VisibilityOff else Icons.Default.Visibility,
-                        contentDescription = if (keyVisible) "Hide" else "Show",
+                        contentDescription = if (keyVisible) stringResource(R.string.common_hide) else stringResource(R.string.common_show),
                     )
                 }
             },
@@ -982,7 +982,7 @@ private fun ApiKeyCredentialBlock(
             IconButton(onClick = onToggleVisibility) {
                 Icon(
                     if (keyVisible) Icons.Default.VisibilityOff else Icons.Default.Visibility,
-                    contentDescription = if (keyVisible) "Hide" else "Show",
+                    contentDescription = if (keyVisible) stringResource(R.string.common_hide) else stringResource(R.string.common_show),
                 )
             }
             MinisSmallTextButton(onClick = onBeginEdit) {
@@ -1103,7 +1103,7 @@ private fun ManualBearerTokenSection(
     if (hasToken) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(
-                "Configured",
+                stringResource(R.string.provider_status_configured),
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurface,
                 modifier = Modifier.weight(1f),

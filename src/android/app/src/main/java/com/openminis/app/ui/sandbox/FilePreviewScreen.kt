@@ -454,7 +454,7 @@ private fun MarkdownPreview(item: FileItem) {
             ),
         )
         else -> Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            Text("Loading...", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(stringResource(R.string.filepreview_loading), color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
 }
@@ -1100,10 +1100,10 @@ private fun openExternally(context: Context, item: FileItem, mime: String) {
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
-        context.startActivity(Intent.createChooser(intent, "Open with…"))
+        context.startActivity(Intent.createChooser(intent, context.getString(R.string.filepreview_open_with)))
     } catch (e: Exception) {
         AppLogger.warning("FilePreview", "openExternally failed: ${e.message}")
-        Toast.makeText(context, "No app available to open this file.", Toast.LENGTH_SHORT).show()
+        Toast.makeText(context, context.getString(R.string.filepreview_no_app), Toast.LENGTH_SHORT).show()
     }
 }
 

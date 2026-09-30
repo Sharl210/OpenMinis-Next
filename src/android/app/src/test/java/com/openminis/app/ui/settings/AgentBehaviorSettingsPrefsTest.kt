@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.ContextWrapper
 import android.content.SharedPreferences
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Test
 
 class AgentBehaviorSettingsPrefsTest {
@@ -28,9 +29,75 @@ class AgentBehaviorSettingsPrefsTest {
         val context = TestContext()
         val prefs = AgentBehaviorSettingsPrefs(context)
         listOf(-1, 0, 12).forEach { budget ->
-            prefs.save(AgentBehaviorSettings(maxRetryAttempts = budget))
+            assertEquals(true, prefs.save(AgentBehaviorSettings(maxRetryAttempts = budget)))
             assertEquals(budget, prefs.load().maxRetryAttempts)
         }
+    }
+
+    @Test
+    fun `failed commit keeps prior preference values`() {
+        val context = TestContext()
+        val prefs = AgentBehaviorSettingsPrefs(context)
+        assertEquals(true, prefs.save(AgentBehaviorSettings(recursionDepth = 1, parallelAgentLimit = 8)))
+        context.preferences.commitSucceeds = false
+
+        assertEquals(false, prefs.save(AgentBehaviorSettings(recursionDepth = 2, parallelAgentLimit = 10)))
+        context.preferences.commitSucceeds = true
+        assertEquals(1, prefs.load().recursionDepth)
+        assertEquals(8, prefs.load().parallelAgentLimit)
+    }
+    @Test
+    fun `recursion depth and parallel limit boundary values round trip`() {
+        val prefs = AgentBehaviorSettingsPrefs(TestContext())
+        listOf(0, 1, 2).forEach { depth ->
+            assertEquals(true, prefs.save(AgentBehaviorSettings(recursionDepth = depth)))
+            assertEquals(depth, prefs.load().recursionDepth)
+        }
+        listOf(1, 150).forEach { parallel ->
+            assertEquals(true, prefs.save(AgentBehaviorSettings(parallelAgentLimit = parallel)))
+            assertEquals(parallel, prefs.load().parallelAgentLimit)
+        }
+    }
+    @Test
+    fun `web search settings round trip`() {
+        val prefs = AgentBehaviorSettingsPrefs(TestContext())
+        val expected = AgentBehaviorSettings(
+            webSearchMaxResults = 37,
+            webRequestTimeoutMs = 45_000L,
+        )
+
+        assertEquals(true, prefs.save(expected))
+        val loaded = prefs.load()
+        assertEquals(37, loaded.webSearchMaxResults)
+        assertEquals(45_000L, loaded.webRequestTimeoutMs)
+    }
+
+    @Test
+    fun `web search settings clamp to configured bounds`() {
+        val prefs = AgentBehaviorSettingsPrefs(TestContext())
+        assertEquals(
+            true,
+            prefs.save(
+                AgentBehaviorSettings(
+                    webSearchMaxResults = AgentBehaviorSettingsPrefs.MAX_WEB_SEARCH_MAX_RESULTS + 1,
+                    webRequestTimeoutMs = AgentBehaviorSettingsPrefs.MAX_WEB_REQUEST_TIMEOUT_MS + 1,
+                ),
+            ),
+        )
+        assertEquals(AgentBehaviorSettingsPrefs.MAX_WEB_SEARCH_MAX_RESULTS, prefs.load().webSearchMaxResults)
+        assertEquals(AgentBehaviorSettingsPrefs.MAX_WEB_REQUEST_TIMEOUT_MS, prefs.load().webRequestTimeoutMs)
+
+        assertEquals(
+            true,
+            prefs.save(
+                AgentBehaviorSettings(
+                    webSearchMaxResults = AgentBehaviorSettingsPrefs.MIN_WEB_SEARCH_MAX_RESULTS - 1,
+                    webRequestTimeoutMs = AgentBehaviorSettingsPrefs.MIN_WEB_REQUEST_TIMEOUT_MS - 1,
+                ),
+            ),
+        )
+        assertEquals(AgentBehaviorSettingsPrefs.MIN_WEB_SEARCH_MAX_RESULTS, prefs.load().webSearchMaxResults)
+        assertEquals(AgentBehaviorSettingsPrefs.MIN_WEB_REQUEST_TIMEOUT_MS, prefs.load().webRequestTimeoutMs)
     }
 
     @Test
@@ -41,7 +108,7 @@ class AgentBehaviorSettingsPrefsTest {
     }
 
     private class TestContext : ContextWrapper(null) {
-        private val preferences = MemoryPreferences()
+        val preferences = MemoryPreferences()
 
         override fun getApplicationContext(): Context = this
 
@@ -50,6 +117,7 @@ class AgentBehaviorSettingsPrefsTest {
 
     private class MemoryPreferences : SharedPreferences {
         private val values = linkedMapOf<String, Any?>()
+        var commitSucceeds = true
         override fun getAll(): Map<String, *> = values.toMap()
         override fun getString(key: String, defValue: String?): String? = values[key] as? String ?: defValue
         override fun getStringSet(key: String, defValues: Set<String>?): Set<String>? = values[key] as? Set<String> ?: defValues
@@ -73,6 +141,7 @@ class AgentBehaviorSettingsPrefsTest {
             override fun remove(key: String): SharedPreferences.Editor = apply { updates.remove(key) }
             override fun clear(): SharedPreferences.Editor = apply { updates.clear(); values.clear() }
             override fun commit(): Boolean {
+                if (!commitSucceeds) return false
                 updates.forEach { (key, value) -> values[key] = value }
                 return true
             }

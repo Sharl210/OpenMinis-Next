@@ -23,14 +23,49 @@ enum class RuntimeNodeStatus {
     ABNORMAL_INTERRUPTION,
 }
 
+/** What a stopped child tells its direct parent. See `request.md:248`. */
 data class RuntimeStopReport(
     val nodeId: String,
     val statusCode: Int? = null,
     val errorResponse: String? = null,
     val responseHeaders: Map<String, String> = emptyMap(),
     val debugInfo: String? = null,
+    /**
+     * The last body text this child's model produced, reported so the parent can
+     * see where the child stopped. [lastSentBodyTail] keeps only the final
+     * [MAX_TAIL_CHARS] characters, which is the 「最后200个字」 `request.md:248`
+     * asks for.
+     *
+     * A run that died before producing any output has no model text to carry; the
+     * constructors fall back to the last request body sent on the child's behalf,
+     * which is the closest honest substitute and is never a fabricated value.
+     */
     val lastSentBody: String? = null,
+    /**
+     * Whether the child declared a natural end. Drives which fields reach the
+     * parent: `true` means the notification is a terse "completed" and every
+     * diagnostic field above is stripped; `false` means they are all reported.
+     * See [RuntimeSystemMessageMetadata.from].
+     */
     val completedNormally: Boolean = false,
+    /**
+     * [T-android-stop-request-kind] Whether this run ended because somebody asked
+     * it to, rather than because it died on its own.
+     *
+     * This is the same distinction the node status draws between ABORTED and
+     * ABNORMAL_INTERRUPTION, carried into the notification instead of dying with
+     * the node row: [abort] sets it from its own `abnormal` parameter, which is
+     * `false` exactly on the deliberate paths (a stop an ancestor requested, a
+     * subtree its owner purged) and `true` on the paths nobody asked for (a lapsed
+     * lease, a crashed process).
+     *
+     * It exists because `completedNormally = false` cannot tell those two apart.
+     * With only that flag, a user pressing 「停止」 got a notification whose kind,
+     * card and model reminder all described a crash, and the parent agent was
+     * invited to decide whether to restart the child — an ordinary action
+     * explained by the wrong cause. See [RuntimeSystemMessageMetadata.from].
+     */
+    val stoppedByRequest: Boolean = false,
 ) {
     val lastSentBodyTail: String?
         get() = lastSentBody?.takeLast(MAX_TAIL_CHARS)
@@ -62,7 +97,23 @@ data class RuntimeSystemMessageMetadata(
 
     companion object {
         fun from(report: RuntimeStopReport): RuntimeSystemMessageMetadata = RuntimeSystemMessageMetadata(
-            kind = if (report.completedNormally) "child_completed" else "child_abnormal_stop",
+            // Three outcomes, three kinds. `stoppedByRequest` is tested BEFORE the
+            // abnormal fallback because a deliberate stop and an accidental one both
+            // report `completedNormally = false`, and collapsing them into one kind
+            // is precisely what let a requested stop be announced as an abnormal one.
+            //
+            // The tokens are literals on purpose: this file compiles on its own (no
+            // Android, no other class of this feature), which the runtime harnesses in
+            // this repo rely on, so it must not reach into the class that RENDERS the
+            // kinds. The two sides are held together by
+            // `RuntimeStoppedByRequestNotificationTest`, which asserts the kind emitted
+            // here and the card `RuntimeInboxSurfacing` draws from it in one run — so a
+            // drift between the two tokens turns that test red.
+            kind = when {
+                report.completedNormally -> "child_completed"
+                report.stoppedByRequest -> "child_stopped_by_request"
+                else -> "child_abnormal_stop"
+            },
             childNodeId = report.nodeId,
             statusCode = if (report.completedNormally) null else report.statusCode,
             errorResponse = if (report.completedNormally) null else report.errorResponse,
@@ -110,6 +161,25 @@ data class DeleteSubtreeReceipt(
 data class DeleteSubtreeOperation(
     val request: DeleteSubtreeRequest,
     val receipt: DeleteSubtreeReceipt,
+)
+
+/**
+ * What [RuntimeSessionTree.purgeSubtrees] took out of the tree.
+ *
+ * [abortedNodeIds] are the nodes that were still live and had to be stamped
+ * terminal before removal — reported separately because "the user deleted a
+ * conversation whose sub-agent was still working" is a fact the caller should
+ * be able to log, not something to discover later from the event ledger.
+ */
+data class PurgeSubtreesReceipt(
+    val removedNodeIds: List<String>,
+    val abortedNodeIds: List<String>,
+    /**
+     * False only when the caller wrapped this purge in a persistence attempt
+     * that failed. The store restores the previous tree on a failed persist, so
+     * false means *nothing* was removed and the whole purge is still owed.
+     */
+    val persisted: Boolean = true,
 )
 
 data class RuntimeStopRequest(
@@ -191,6 +261,22 @@ data class RuntimeTopologySnapshot(
 
     val activeSubscriptions: List<RuntimeSubscription>
         get() = subscriptions.filter(RuntimeSubscription::active)
+
+    /** Runtime roots may use sessionId#run-N after a repeated run. */
+    fun descendantsForChatSession(sessionId: String): List<RuntimeSessionNode> {
+        val byId = nodes.associateBy { it.id }
+        val roots = nodes.filter { node ->
+            node.id == sessionId || node.id.startsWith("$sessionId#run-")
+        }.map { it.id }.toSet()
+        return nodes.filter { node ->
+            var parent = node.parentId
+            while (parent != null) {
+                if (parent in roots) return@filter true
+                parent = byId[parent]?.parentId
+            }
+            false
+        }
+    }
 }
 
 data class RuntimeEdgeReceipt(
@@ -199,6 +285,20 @@ data class RuntimeEdgeReceipt(
     val createdAtMillis: Long? = null,
     val revokedAtMillis: Long? = null,
     val reason: String? = null,
+)
+
+/**
+ * [team-peer-mesh] What one Team-membership event did to the peer mesh.
+ *
+ * Returned by [SessionTreeRuntime.linkTeamPeers] so a caller (or a test) can tell
+ * "this member already knew everyone" from "this member just joined and the mesh
+ * grew", without diffing a whole topology snapshot. [createdEdgeIds] is empty on a
+ * repeated call, which makes idempotence observable instead of merely asserted.
+ */
+data class RuntimeTeamPeerMesh(
+    val nodeId: String,
+    val peerNodeIds: List<String>,
+    val createdEdgeIds: List<String>,
 )
 
 data class RuntimeModelSnapshot(
@@ -246,17 +346,119 @@ data class RuntimeEnvelope(
     val delivery: RuntimeDelivery,
     val payload: String,
     val createdAtMillis: Long,
-    val claimed: Boolean = false,
+    /**
+     * Claim-lease stamp. A claim is honored only while its lease is unexpired
+     * (see [RuntimeSessionTree.MESSAGE_CLAIM_LEASE_MILLIS]); a claimant that
+     * dies before consuming the message leaves an expired stamp instead of a
+     * permanent tombstone, so the message becomes claimable again.
+     */
+    val claimedAtMillis: Long? = null,
     val taskIntent: String = "",
     val capabilitySnapshot: AgentCapabilitySnapshot? = null,
     val senderCapabilitySnapshot: AgentCapabilitySnapshot? = null,
-)
+) {
+    /** Derived, so the flag and the stamp it is read from can never disagree. */
+    val claimed: Boolean get() = claimedAtMillis != null
+}
 
 data class RuntimeTreeConfig(
     var maxDepth: Int = 2,
     var maxParallelSubagents: Int = 5,
     var leaseMillis: Long = 120_000L,
     var mode: DelegationMode = DelegationMode.TRADITIONAL,
+    /**
+     * Retention ceiling for one node's runtime transcript, in messages.
+     *
+     * Oldest messages are evicted first; the newest message of a node is always
+     * retained, so a single oversized message can exceed the ceiling but is
+     * never dropped on arrival. See [DEFAULT_TRANSCRIPT_MESSAGES_PER_NODE] for
+     * the requirement this traces to and the arithmetic behind the default.
+     */
+    var maxTranscriptMessagesPerNode: Int = DEFAULT_TRANSCRIPT_MESSAGES_PER_NODE,
+    /**
+     * Retention ceiling for one node's runtime transcript, in retained
+     * `content` + `metadata` characters. Independent of
+     * [maxTranscriptMessagesPerNode]: eviction starts when either budget is
+     * exceeded. See [DEFAULT_TRANSCRIPT_CHARS_PER_NODE].
+     */
+    var maxTranscriptCharsPerNode: Int = DEFAULT_TRANSCRIPT_CHARS_PER_NODE,
+    /**
+     * Retention ceiling for the tree's event ledger, in events.
+     *
+     * The event ledger is the tree's *history*, not a work queue: nothing in
+     * the app reads it to decide what to do next (only tests and the export
+     * surfaces do), yet every state transition appends to it forever. It is
+     * therefore the single largest growth term of a long single session — in
+     * the measurement that motivated this field, 20 000 appends produced
+     * 20 001 events carrying 86.7% of the tree JSON. Oldest events are evicted
+     * first, the newest is never a casualty of its own arrival, and everything
+     * evicted is counted in [RuntimeEventRetention] so a trimmed ledger is
+     * never mistaken for a complete one.
+     */
+    var maxEvents: Int = DEFAULT_EVENTS_LIMIT,
+    /**
+     * Retention ceiling for the event ledger, in retained `nodeId` + `kind` +
+     * `payload` characters. Independent of [maxEvents]: eviction starts when
+     * either budget is exceeded.
+     */
+    var maxEventChars: Int = DEFAULT_EVENT_CHARS_LIMIT,
+    /**
+     * Retention ceiling for the delivery-receipt ledger, in receipts.
+     *
+     * Same reasoning as [maxEvents], and the same evidence: `receipts()` has no
+     * production caller anywhere in the app, so the ledger is a pure audit
+     * trail — and it is appended to on every accepted *and* every rejected
+     * send. Counted by [RuntimeReceiptRetention] once it trims.
+     */
+    var maxDeliveryReceipts: Int = DEFAULT_DELIVERY_RECEIPTS_LIMIT,
+    /**
+     * Retention ceiling for the delivery-receipt ledger, in retained
+     * `fromNodeId` + `toNodeId` + `reason` characters. Independent of
+     * [maxDeliveryReceipts].
+     */
+    var maxDeliveryReceiptChars: Int = DEFAULT_DELIVERY_RECEIPT_CHARS_LIMIT,
+    /**
+     * Retention ceiling for the control ledger — the tree's record of stop
+     * operations — in receipts.
+     *
+     * This one is not a pure audit trail like the two above, and that is the
+     * whole difficulty: it is also the tree's *idempotency table*.
+     * [stopDescendant] answers a repeat of a stop request out of it, so what
+     * this budget bounds is the window in which a retried stop is recognised as
+     * a retry instead of being carried out a second time — which for a
+     * destructive operation is the difference between one stop and two. The
+     * number is therefore a behavioural choice, not only a memory one.
+     *
+     * The index that makes the lookup work (`controlOperationIdByIdempotencyKey`)
+     * is not a second table with its own budget: it is a *derived view* of this
+     * one, and it is capped **together with it**. Evicting a receipt evicts every
+     * key that pointed at it, looked up by value rather than by position, so the
+     * index can never name an operation this ledger no longer holds. Without
+     * that coupling, bounding this map alone would leave the index to grow
+     * forever and would turn "this key is known" into a statement that is no
+     * longer true.
+     *
+     * Why 2 000: measured on this tree, one stop receipt costs about 1 982 bytes
+     * of tree JSON — roughly ten times a delivery receipt, because it carries the
+     * actor's and the target's capability snapshots. Matching the delivery
+     * ledger's [DEFAULT_DELIVERY_RECEIPTS_LIMIT] would therefore let this single
+     * ledger hold ~15.9 MB, more than the rest of the tree together, while 2 000
+     * still covers every stop one session can realistically issue: a stop is a
+     * user- or supervisor-initiated interruption, and 2 000 of them is far past
+     * any interactive or delegated run. Oldest receipts are evicted first, so the
+     * window that survives is the newest one — the retry that arrives moments
+     * after the original is always inside it. It is a ceiling, not a target: a
+     * tree that stays inside it serializes byte-for-byte as before.
+     */
+    var maxControlReceipts: Int = DEFAULT_CONTROL_RECEIPTS_LIMIT,
+    /**
+     * Retention ceiling for the control ledger, in retained `actorNodeId` +
+     * `targetNodeId` + `reason` characters — the same shape the delivery ledger
+     * counts, because `reason` is likewise the only free-text field a stop
+     * receipt carries. Independent of [maxControlReceipts]: eviction starts when
+     * either budget is exceeded.
+     */
+    var maxControlReceiptChars: Int = DEFAULT_CONTROL_RECEIPT_CHARS_LIMIT,
 ) {
     init {
         require(maxDepth in 0..MAX_DEPTH_LIMIT) { "maxDepth must be between 0 and $MAX_DEPTH_LIMIT" }
@@ -264,11 +466,167 @@ data class RuntimeTreeConfig(
             "maxParallelSubagents must be between 1 and $MAX_PARALLEL_LIMIT"
         }
         require(leaseMillis > 0) { "leaseMillis must be positive" }
+        require(maxTranscriptMessagesPerNode in 1..MAX_TRANSCRIPT_MESSAGES_LIMIT) {
+            "maxTranscriptMessagesPerNode must be between 1 and $MAX_TRANSCRIPT_MESSAGES_LIMIT"
+        }
+        require(maxTranscriptCharsPerNode in 1..MAX_TRANSCRIPT_CHARS_LIMIT) {
+            "maxTranscriptCharsPerNode must be between 1 and $MAX_TRANSCRIPT_CHARS_LIMIT"
+        }
+        require(maxEvents in 1..MAX_EVENTS_LIMIT) {
+            "maxEvents must be between 1 and $MAX_EVENTS_LIMIT"
+        }
+        require(maxEventChars in 1..MAX_EVENT_CHARS_LIMIT) {
+            "maxEventChars must be between 1 and $MAX_EVENT_CHARS_LIMIT"
+        }
+        require(maxDeliveryReceipts in 1..MAX_DELIVERY_RECEIPTS_LIMIT) {
+            "maxDeliveryReceipts must be between 1 and $MAX_DELIVERY_RECEIPTS_LIMIT"
+        }
+        require(maxDeliveryReceiptChars in 1..MAX_DELIVERY_RECEIPT_CHARS_LIMIT) {
+            "maxDeliveryReceiptChars must be between 1 and $MAX_DELIVERY_RECEIPT_CHARS_LIMIT"
+        }
+        require(maxControlReceipts in 1..MAX_CONTROL_RECEIPTS_LIMIT) {
+            "maxControlReceipts must be between 1 and $MAX_CONTROL_RECEIPTS_LIMIT"
+        }
+        require(maxControlReceiptChars in 1..MAX_CONTROL_RECEIPT_CHARS_LIMIT) {
+            "maxControlReceiptChars must be between 1 and $MAX_CONTROL_RECEIPT_CHARS_LIMIT"
+        }
     }
 
     companion object {
         const val MAX_DEPTH_LIMIT = 150
         const val MAX_PARALLEL_LIMIT = 150
+
+        /**
+         * Retention ceiling for ONE node's runtime transcript.
+         *
+         * Why a ceiling exists at all: the only sanctioned reason to restrict
+         * anything in this project is an explicit user requirement, a proven
+         * hard boundary, or catastrophic-resource protection. This one is the
+         * first. `plans/ULW-2026-09-25-01/request.md:136`, verbatim:
+         *
+         *   「我或者就是占用的内存然后系统强制性的给他杀掉，这是我唯一能容忍的
+         *     ……它不能够自发性的自杀……我不希望这种事情发生在我们开发的这个APP
+         *     上，所以你你要去保证这个APP绝对没有这种问题」
+         *
+         * A per-node transcript with no ceiling is exactly a self-inflicted
+         * growth surface, so the tree owns a finite budget for it.
+         *
+         * Why these numbers, and why they are ceilings rather than targets:
+         * 2000 messages plus 262 144 retained characters (the two budgets are
+         * independent — a node may hit either one first) caps a single node at
+         * roughly 1 MiB of retained text even in the pathological case where
+         * every message is as long as the node budget allows. That is small
+         * enough to be survivable per node, and it is generous enough that no
+         * realistic conversation is affected: at the cap the node is holding
+         * more text than a provider context window can consume in one turn.
+         *
+         * Both budgets are `var` fields, so the app may raise or lower them;
+         * nothing here is a hard-coded silent truncation. Eviction is always
+         * reported — see [RuntimeSessionTree.transcriptRetention] — and
+         * [RuntimeSessionTree.reclaimTranscripts] applies a lowered budget to
+         * already-retained history instead of waiting for the next append.
+         */
+        const val DEFAULT_TRANSCRIPT_MESSAGES_PER_NODE = 2_000
+
+        /**
+         * Upper bound accepted for [maxTranscriptMessagesPerNode]. A validation
+         * rail for the config, not a second retention policy: it only stops a
+         * caller from configuring a budget so large that it re-introduces the
+         * unbounded behaviour this field exists to remove.
+         */
+        const val MAX_TRANSCRIPT_MESSAGES_LIMIT = 200_000
+
+        /** Retained `content` + `metadata` characters per node. See above. */
+        const val DEFAULT_TRANSCRIPT_CHARS_PER_NODE = 262_144
+
+        /** Upper bound accepted for [maxTranscriptCharsPerNode]; see above. */
+        const val MAX_TRANSCRIPT_CHARS_LIMIT = 200_000_000
+
+        /**
+         * Retention ceiling for the tree's event ledger.
+         *
+         * Traces to the same requirement as the transcript ceilings above
+         * (`plans/ULW-2026-09-25-01/request.md:136`: the app must never kill
+         * itself by growing). Measured on this tree, a single long session's
+         * ledger is the dominant growth term — at 20 000 appends it held 86.7%
+         * of the serialized tree, growing one event per append, forever.
+         *
+         * Why 8 000: the ledger's job is to answer "what happened to this tree
+         * recently, and was this node ever interrupted" — the restart and
+         * abnormal-finish decisions read the newest events of a node, and those
+         * arrive within one delegation cycle of the question. 8 000 events is
+         * several hundred delegated children' worth of transitions for a single
+         * run, so no realistic single-session diagnosis is cut off, while the
+         * ledger stops being able to grow without bound. It is a ceiling, not a
+         * target: a tree that stays inside it is serialized byte-for-byte as
+         * before.
+         */
+        const val DEFAULT_EVENTS_LIMIT = 8_000
+
+        /**
+         * Upper bound accepted for [maxEvents]. A validation rail for the
+         * config, not a second retention policy: it only stops a caller from
+         * configuring a ceiling so large that it re-introduces the unbounded
+         * behaviour the field exists to remove.
+         */
+        const val MAX_EVENTS_LIMIT = 2_000_000
+
+        /**
+         * Retained `nodeId` + `kind` + `payload` characters in the event
+         * ledger. Independent of [DEFAULT_EVENTS_LIMIT]: eviction starts when
+         * either budget is exceeded. Sized so the ledger's retained text stays
+         * in the same order as one node's transcript budget.
+         */
+        const val DEFAULT_EVENT_CHARS_LIMIT = 512_000
+
+        /** Upper bound accepted for [maxEventChars]; see above. */
+        const val MAX_EVENT_CHARS_LIMIT = 400_000_000
+
+        /**
+         * Retention ceiling for the delivery-receipt ledger. Same requirement
+         * and same measurement as [DEFAULT_EVENTS_LIMIT]; kept equal because
+         * `send` appends exactly one receipt per appended event, so the ledger
+         * that would grow faster would decide the tree's growth on its own.
+         */
+        const val DEFAULT_DELIVERY_RECEIPTS_LIMIT = 8_000
+
+        /** Upper bound accepted for [maxDeliveryReceipts]; see above. */
+        const val MAX_DELIVERY_RECEIPTS_LIMIT = 2_000_000
+
+        /** Retained `fromNodeId` + `toNodeId` + `reason` characters. */
+        const val DEFAULT_DELIVERY_RECEIPT_CHARS_LIMIT = 512_000
+
+        /** Upper bound accepted for [maxDeliveryReceiptChars]; see above. */
+        const val MAX_DELIVERY_RECEIPT_CHARS_LIMIT = 400_000_000
+
+        /**
+         * Retention ceiling for the control (stop) ledger, in receipts.
+         *
+         * Traces to the same requirement as [DEFAULT_EVENTS_LIMIT] — the app must
+         * never kill itself by growing — and was found the same way the other two
+         * ledgers were: every stop appends exactly one receipt to the tree's
+         * `stopReceipts` array and nothing ever removed one, so a session that is
+         * stopped repeatedly grows without bound (measured on this tree: ~1 982
+         * bytes of JSON per stop, linear with no knee, and a restart did not trim
+         * it either).
+         *
+         * Smaller than [DEFAULT_DELIVERY_RECEIPTS_LIMIT] on purpose, because a
+         * receipt here costs about ten times as much to serialize: it carries the
+         * actor's and the target's capability snapshots. The same count would be
+         * an order of magnitude more memory for the same number of operations.
+         * See [RuntimeTreeConfig.maxControlReceipts] for the behavioural side of
+         * the number — this ledger doubles as the stop idempotency table.
+         */
+        const val DEFAULT_CONTROL_RECEIPTS_LIMIT = 2_000
+
+        /** Upper bound accepted for [maxControlReceipts]; see above. */
+        const val MAX_CONTROL_RECEIPTS_LIMIT = 2_000_000
+
+        /** Retained `actorNodeId` + `targetNodeId` + `reason` characters. */
+        const val DEFAULT_CONTROL_RECEIPT_CHARS_LIMIT = 512_000
+
+        /** Upper bound accepted for [maxControlReceiptChars]; see above. */
+        const val MAX_CONTROL_RECEIPT_CHARS_LIMIT = 400_000_000
     }
 }
 
@@ -287,6 +645,13 @@ data class RuntimeDeliveryReceipt(
     val messageId: String?,
     val effectiveDelivery: RuntimeDelivery?,
     val reason: String? = null,
+)
+
+data class RuntimeSupervisionSnapshot(
+    val actorNode: RuntimeSessionNode?,
+    val actorCapabilities: AgentCapabilitySnapshot?,
+    val descendants: List<RuntimeSessionNode>,
+    val configurationRevision: Long,
 )
 
 data class AgentCapabilitySnapshot(
@@ -328,6 +693,118 @@ data class RuntimeTranscriptMessage(
     val metadata: String = "",
 )
 
+/**
+ * What one node's transcript still holds, and what the retention budget has
+ * already taken from it.
+ *
+ * This type exists so a reader can never mistake "this is all there is" for
+ * "this is all that survived". A node whose [droppedMessages] is zero really
+ * has its complete transcript; a node whose [droppedMessages] is non-zero is
+ * *truncated*, and the count says by how much.
+ *
+ * Eviction order is oldest-first, so the messages still retained are the
+ * newest [retainedMessages] ones and [droppedMessages] is also the absolute
+ * position of the first retained message: absolute position `i` (counting from
+ * the node's very first message, oldest first) is held at list index
+ * `i - droppedMessages`. A caller that stored an absolute position before the
+ * node was trimmed can therefore still tell whether its message is gone, and
+ * which retained index replaced it.
+ */
+data class RuntimeTranscriptRetention(
+    /** Transcript messages still held in memory for this node. */
+    val retainedMessages: Int,
+    /** Retained `content` + `metadata` characters for this node. */
+    val retainedChars: Int,
+    /** Messages evicted from the front so far. `0` means nothing was lost. */
+    val droppedMessages: Int,
+    /** Characters those evicted messages carried. */
+    val droppedChars: Int,
+) {
+    /** True when the budget has taken messages from this node. */
+    val truncated: Boolean get() = droppedMessages > 0
+}
+
+/**
+ * What the tree's event ledger still holds, and what its retention budget has
+ * already taken from it.
+ *
+ * Same contract as [RuntimeTranscriptRetention], for the same reason: a reader
+ * must never mistake "this is all there is" for "this is all that survived". A
+ * ledger whose [droppedEvents] is zero really is the complete history; one whose
+ * [droppedEvents] is non-zero is *truncated*, and the count says by how much.
+ *
+ * Note that [retainedEvents] is the whole tree's ledger, not one node's: the
+ * events of a specific node are a filtered view of it, so a per-node count
+ * cannot be stated here without lying about the events of other nodes. A caller
+ * asking "how many events does this node have" reads the filtered list.
+ */
+data class RuntimeEventRetention(
+    /** Events still held in memory for the whole tree. */
+    val retainedEvents: Int,
+    /** Retained `nodeId` + `kind` + `payload` characters for the whole tree. */
+    val retainedChars: Int,
+    /** Events evicted from the front so far. `0` means nothing was lost. */
+    val droppedEvents: Int,
+    /** Characters those evicted events carried. */
+    val droppedChars: Int,
+) {
+    /** True when the budget has taken events from the ledger. */
+    val truncated: Boolean get() = droppedEvents > 0
+}
+
+/**
+ * What the tree's delivery-receipt ledger still holds, and what its retention
+ * budget has already taken from it. Same three-state contract as
+ * [RuntimeEventRetention].
+ */
+data class RuntimeReceiptRetention(
+    /** Receipts still held in memory for the whole tree. */
+    val retainedReceipts: Int,
+    /** Retained `fromNodeId` + `toNodeId` + `reason` characters. */
+    val retainedChars: Int,
+    /** Receipts evicted from the front so far. `0` means nothing was lost. */
+    val droppedReceipts: Int,
+    /** Characters those evicted receipts carried. */
+    val droppedChars: Int,
+) {
+    /** True when the budget has taken receipts from the ledger. */
+    val truncated: Boolean get() = droppedReceipts > 0
+}
+
+/**
+ * What the tree's control (stop) ledger still holds, and what its retention
+ * budget has already taken from it — including the idempotency index that had
+ * to leave with the receipts.
+ *
+ * Same three-state contract as [RuntimeReceiptRetention], and one field more,
+ * because this ledger is not only an audit trail: [RuntimeSessionTree
+ * .stopDescendant] answers a retried stop out of it. [droppedIdempotencyKeys] is
+ * what makes the *coupling* visible — the index entry for a receipt that is gone
+ * is deleted in the same step, so a non-zero count is the proof that the two
+ * were capped as one unit rather than the receipts alone. An index left holding
+ * keys for evicted receipts would grow forever and would keep claiming that a
+ * retry is recognised when the ledger it points into can no longer answer.
+ */
+data class RuntimeControlReceiptRetention(
+    /** Stop receipts still held in memory for the whole tree. */
+    val retainedReceipts: Int,
+    /** Retained `actorNodeId` + `targetNodeId` + `reason` characters. */
+    val retainedChars: Int,
+    /** Receipts evicted from the front so far. `0` means nothing was lost. */
+    val droppedReceipts: Int,
+    /** Characters those evicted receipts carried. */
+    val droppedChars: Int,
+    /**
+     * Idempotency keys deleted together with those receipts. Every key that
+     * pointed at an evicted operation is counted here, so a receipt reachable
+     * under several keys contributes several.
+     */
+    val droppedIdempotencyKeys: Int,
+) {
+    /** True when the budget has taken receipts from the ledger. */
+    val truncated: Boolean get() = droppedReceipts > 0
+}
+
 data class RuntimeExport(
     val format: String,
     val fileName: String,
@@ -342,12 +819,94 @@ class RuntimeSessionTree(
     val config: RuntimeTreeConfig = RuntimeTreeConfig(),
     private val clock: () -> Long = { System.currentTimeMillis() },
 ) {
+    companion object {
+        /**
+         * How long a claim on an inbox envelope is honored.
+         *
+         * A claim is taken immediately before the claimant builds its request,
+         * but the *next* claim by the same claimant only happens at the start of
+         * its next turn. The window therefore has to exceed one delegated turn
+         * (provider call plus tool loop), otherwise a live child would be re-fed
+         * a message it already consumed. It is five times
+         * [RuntimeTreeConfig.leaseMillis] (the node liveness lease) because a
+         * turn is much longer than a heartbeat, and it stays finite so a message
+         * claimed by a claimant that died before consuming it returns to the
+         * claimable set instead of being lost forever.
+         */
+        const val MESSAGE_CLAIM_LEASE_MILLIS = 600_000L
+    }
+
     private val nodes = LinkedHashMap<String, RuntimeSessionNode>()
     private val children = LinkedHashMap<String, MutableList<String>>()
     private val events = ArrayList<RuntimeEvent>()
     private val inbox = ArrayList<RuntimeEnvelope>()
     private val deliveryReceipts = ArrayList<RuntimeMessageReceipt>()
     private val transcripts = LinkedHashMap<String, MutableList<RuntimeTranscriptMessage>>()
+    /**
+     * Running retained-character total per node, kept incrementally so the
+     * append path stays O(1) in the retained size: recomputing the total on
+     * every append would make a capped transcript quadratic in its own ceiling.
+     * Must stay in sync with [transcripts] (append, evict, remove, clear,
+     * restore) — [transcriptRetention] and [enforceTranscriptBudget] both read
+     * it instead of summing the list.
+     */
+    private val transcriptChars = LinkedHashMap<String, Int>()
+    /**
+     * Per-node eviction ledger. Absent means "this node never lost a message";
+     * the map only ever holds nodes that did.
+     */
+    private val transcriptEvictions = LinkedHashMap<String, TranscriptEviction>()
+
+    /** Mutable running total for [transcriptEvictions]. */
+    private class TranscriptEviction(var messages: Int = 0, var chars: Int = 0)
+
+    /**
+     * Running retained-character total for [events], kept incrementally so the
+     * append path stays O(1) in the retained size — recomputing it per append
+     * would make a capped ledger quadratic in its own ceiling. Must stay in
+     * sync with [events] (append, evict, clear, restore).
+     */
+    private var eventChars = 0
+    /**
+     * Tree-wide eviction ledger for [events]. Unlike [transcriptEvictions] this
+     * is not keyed by node, because the budget is per tree: what grows without
+     * bound is the tree's history, and one node losing events while another
+     * keeps them would be a policy nobody asked for.
+     */
+    private val eventEvictions = LedgerEviction()
+    /**
+     * Per-node count of events the *tree-wide* budget has taken, so a per-node
+     * reader can answer "is this node's event list complete" about that node
+     * rather than about the tree. Only nodes that actually lost events appear.
+     * Persisted (see [toJson]) for the same reason the tree-wide counters are:
+     * otherwise a restart would launder a trimmed node into a complete-looking
+     * one. Bounded by the number of nodes, which [nodes] already bounds.
+     */
+    private val eventDropsByNode = LinkedHashMap<String, Int>()
+    /** Counterpart of [eventChars] for [deliveryReceipts]. */
+    private var receiptChars = 0
+    /** Counterpart of [eventEvictions] for [deliveryReceipts]. */
+    private val receiptEvictions = LedgerEviction()
+    /** Counterpart of [eventChars] for [controlReceipts]. */
+    private var controlReceiptChars = 0
+    /** Counterpart of [eventEvictions] for [controlReceipts]. */
+    private val controlReceiptEvictions = ControlLedgerEviction()
+
+    /** Mutable running eviction total for one tree-wide ledger budget. */
+    private class LedgerEviction(var dropped: Int = 0, var droppedChars: Int = 0)
+
+    /**
+     * [LedgerEviction] plus the count of index entries that had to leave with
+     * it. The control ledger is the one ledger whose index is memory too, so
+     * "what did the budget cost" is not answerable from the receipt counts
+     * alone: see [RuntimeControlReceiptRetention.droppedIdempotencyKeys].
+     */
+    private class ControlLedgerEviction(
+        var dropped: Int = 0,
+        var droppedChars: Int = 0,
+        var droppedIdempotencyKeys: Int = 0,
+    )
+
     private val topologyEdges = LinkedHashMap<String, RuntimeTopologyEdge>()
     private val subscriptions = LinkedHashMap<String, RuntimeSubscription>()
     private val controlReceipts = LinkedHashMap<String, RuntimeStopReceipt>()
@@ -445,6 +1004,14 @@ class RuntimeSessionTree(
             authorizedByNodeId = parent.id,
         )
         record(parent.id, "child_created", now, node.id)
+        // [team-peer-mesh] A member born into a Team must know the team it was born
+        // into, and be known by it: request.md:160 describes the team members as
+        // building each other's addresses, which is a property of joining, not a
+        // follow-up call someone has to remember. `linkTeamPeers` links this child to
+        // every existing Team node under the same root in both directions and is a
+        // no-op in TRADITIONAL mode, which is what keeps the default sub-agent mode
+        // addressless (request.md:5).
+        if (node.delegationMode == DelegationMode.TEAM) linkTeamPeers(node.id)
         return Result.success(node)
     }
 
@@ -463,6 +1030,20 @@ class RuntimeSessionTree(
         config.mode = mode
         configRevision++
         record(root, "delegation_mode_changed", clock(), mode.name)
+        // [team-peer-mesh] Turning a root into Team mode is a team-formation event for
+        // EVERY node under it — this switch is root-wide, not node-local — so the
+        // members that already exist have to become peers of each other too, not only
+        // of whichever node the caller happened to name. Idempotent, so a repeat
+        // switch to TEAM just re-confirms the mesh; TRADITIONAL deliberately does
+        // nothing here beyond revoking, so no default-mode dispatch can create a peer
+        // address.
+        if (mode == DelegationMode.TEAM) {
+            nodes.values
+                .filter { it.rootId == root && it.delegationMode == DelegationMode.TEAM }
+                .map { it.id }
+                .sorted()
+                .forEach { linkTeamPeers(it) }
+        }
         return true
     }
 
@@ -476,10 +1057,14 @@ class RuntimeSessionTree(
         require(maxDepth in 0..RuntimeTreeConfig.MAX_DEPTH_LIMIT)
         require(maxParallelSubagents in 1..RuntimeTreeConfig.MAX_PARALLEL_LIMIT)
         require(leaseMillis > 0)
+        val modeChanges = mode != config.mode
+        if (modeChanges && rootId == null) return false
         config.maxDepth = maxDepth
         config.maxParallelSubagents = maxParallelSubagents
         config.leaseMillis = leaseMillis
-        if (mode != config.mode) setDelegationMode(rootId ?: return false, mode) else {
+        if (modeChanges) {
+            setDelegationMode(rootId!!, mode)
+        } else {
             config.mode = mode
             configRevision++
         }
@@ -493,17 +1078,136 @@ class RuntimeSessionTree(
         nowMillis: Long,
         reason: String,
     ): RuntimeDeliveryReceipt {
-        deliveryReceipts += RuntimeMessageReceipt(
-            id = UUID.randomUUID().toString(), messageId = null,
-            fromNodeId = fromNodeId, toNodeId = toNodeId, delivery = delivery,
-            accepted = false, createdAtMillis = nowMillis, reason = reason,
-            status = RuntimeReceiptStatus.REJECTED,
+        appendReceipt(
+            RuntimeMessageReceipt(
+                id = UUID.randomUUID().toString(), messageId = null,
+                fromNodeId = fromNodeId, toNodeId = toNodeId, delivery = delivery,
+                accepted = false, createdAtMillis = nowMillis, reason = reason,
+                status = RuntimeReceiptStatus.REJECTED,
+            )
         )
         return RuntimeDeliveryReceipt(false, null, null, reason)
     }
 
     @Synchronized
     fun start(nodeId: String): Boolean = updateStatus(nodeId, RuntimeNodeStatus.RUNNING, "started")
+
+    /**
+     * [T-android-child-restart] Bring a TERMINAL node back to RUNNING.
+     *
+     * Why this cannot go through [start]: `updateStatus` refuses any terminal
+     * node (`if (node.status.isTerminal()) return false`), which is the correct
+     * guard for ordinary transitions — a finished node must not silently
+     * un-finish. A restart is the one transition that is *supposed* to leave a
+     * terminal state, so it needs its own door rather than a weakened guard.
+     *
+     * The interruption evidence is deliberately NOT erased: the existing
+     * `abnormal_interruption` / `aborted` / `failed` event stays in [events]
+     * forever, and the restart is appended as its own `restarted` event. The
+     * `abnormal` flag is the only thing cleared, because it answers "is this
+     * node running right now from a state that never ended?" — once the node is
+     * running again the answer is no. "Was this node ever interrupted?" stays
+     * answerable from the event log, which is exactly what the caller needs to
+     * decide whether to restart.
+     *
+     * Returns false (and changes nothing) for a non-terminal node: restarting
+     * live work is a no-op, not an error to paper over.
+     */
+    @Synchronized
+    fun restart(nodeId: String, reason: String = ""): Boolean {
+        val node = nodes[nodeId] ?: return false
+        if (!node.status.isTerminal()) return false
+        val now = clock()
+        val previousStatus = node.status
+        nodes[nodeId] = node.copy(
+            status = RuntimeNodeStatus.RUNNING,
+            updatedAtMillis = now,
+            leaseUntilMillis = now + config.leaseMillis,
+            abnormal = false,
+        )
+        clearStopBookkeeping(nodeId)
+        record(
+            nodeId,
+            "restarted",
+            now,
+            buildString {
+                append("from=").append(previousStatus.name)
+                if (reason.isNotBlank()) append(';').append(reason)
+            },
+        )
+        return true
+    }
+
+    /**
+     * [T-android-child-restart] Drop the stop bookkeeping that belonged to the run
+     * that just ended, so the NEXT run is not judged by it.
+     *
+     * This exists because restart invalidates a once-true assumption: before it,
+     * a node could stop exactly once in its lifetime, so "we already told the
+     * parent" and "here is the report to send" could legitimately be remembered
+     * forever. Restart makes a second stop possible for the same node, and
+     * everything below was keyed on the node id alone — i.e. on "which node",
+     * never on "which run". Left alone, each of these three turns into a lie
+     * after a restart:
+     *
+     *  - [stopNotificationSentForNodeIds]: the parent was already told about the
+     *    first stop, so `notifyParentOnStop` returns early and the second stop is
+     *    NEVER announced. The parent keeps believing a terminal child is alive and
+     *    waits for a result that cannot come. This is the one that matters most —
+     *    request.md:248 requires a stopping child to notify its direct parent.
+     *  - [pendingStopReportByNodeId]: `maybeNotifyWhenSettled` only clears this on
+     *    the branch that actually notifies. Once the dedup set blocks that branch
+     *    the entry survives, so a later delivery would carry the PREVIOUS run's
+     *    stop report as if it described this one.
+     *  - [pendingStopOperationByNodeId]: restart accepts STOP_REQUESTED (it is
+     *    terminal). An abandoned stop request left pending here is consumed by the
+     *    NEXT `abort`, which stamps its `stateAfter` onto the OLD receipt — filing
+     *    a new stop under someone else's operation id.
+     *
+     * Deliberately narrow: [events] is NOT touched, so "this node was interrupted"
+     * stays answerable, and `abnormal` is cleared by the caller as its own
+     * decision rather than as a side effect here.
+     */
+    private fun clearStopBookkeeping(nodeId: String) {
+        stopNotificationSentForNodeIds.remove(nodeId)
+        pendingStopReportByNodeId.remove(nodeId)
+        pendingStopOperationByNodeId.remove(nodeId)
+    }
+
+    /**
+     * [T-android-child-restart] Whether [restart] would accept [nodeId].
+     *
+     * Exists so callers OUTSIDE this file (the coordinator, deciding whether an
+     * existing child needs a restart rather than a start) can ask the question
+     * without re-deriving it. [isTerminal] is a private extension on
+     * [RuntimeNodeStatus] precisely to keep "which states are final" defined in
+     * exactly one place; a second copy of
+     * `status == ABORTED || status == ABNORMAL_INTERRUPTION || …` in another
+     * class is how those two answers drift apart. A caller that cannot see the
+     * concept asks this predicate instead of restating it.
+     *
+     * The answer is scoped to restart specifically, not to that class of states:
+     * "is this node finished" is a different question from "may this node be
+     * brought back", and only the second one is what a caller needs here.
+     */
+    @Synchronized
+    fun canRestart(nodeId: String): Boolean = nodes[nodeId]?.status?.isTerminal() == true
+
+    /**
+     * [T-android-stop-request-terminal] Whether [nodeId] is currently marked as
+     * stopped at the request of an ancestor.
+     *
+     * Exists for the same reason as [canRestart]: a caller outside this file has
+     * to distinguish "this run ended on its own terms" from "this run ended
+     * because it was told to", and re-deriving that from the status enum in
+     * another class is how two answers to one question start to drift.
+     * `RuntimeSessionCoordinator.finishChild` is the caller that needs it — a
+     * deliberately stopped child is not an abnormal interruption, and the only
+     * place that knows a stop was requested is this tree.
+     */
+    @Synchronized
+    fun stopRequested(nodeId: String): Boolean =
+        nodes[nodeId]?.status == RuntimeNodeStatus.STOP_REQUESTED
 
     @Synchronized
     fun capabilitySnapshot(nodeId: String): AgentCapabilitySnapshot? {
@@ -565,8 +1269,26 @@ class RuntimeSessionTree(
         if (changed) {
             pendingStopReportByNodeId[nodeId] = report ?: RuntimeStopReport(nodeId = nodeId, completedNormally = !failed)
             maybeNotifyWhenSettled(nodeId)
+            return true
         }
-        return changed
+        // [T-android-stop-request-terminal] A node whose stop was REQUESTED is
+        // already terminal, so [updateStatus] refuses to rewrite it into
+        // SUCCEEDED/FAILED and the "stopped on request" verdict stands. That
+        // verdict is right; what was wrong was that the refusal swallowed the rest
+        // of this method with it — no stop report was filed and the direct parent
+        // was told NOTHING. A child that finished its work in the instant between
+        // the stop request and that request's cancellation therefore looked, from
+        // the parent's side, like a live child that never reports back, which is
+        // the one outcome `request.md:248` exists to prevent.
+        //
+        // Only the missing notification is restored: the status and the return
+        // value are untouched, because "may this node be brought back" / "is it
+        // settled" must keep exactly one answer (see [canRestart]).
+        if (nodes[nodeId]?.status == RuntimeNodeStatus.STOP_REQUESTED) {
+            pendingStopReportByNodeId[nodeId] = report ?: RuntimeStopReport(nodeId = nodeId, completedNormally = !failed)
+            maybeNotifyWhenSettled(nodeId)
+        }
+        return false
     }
 
     @Synchronized
@@ -625,8 +1347,7 @@ class RuntimeSessionTree(
                 ),
             )
             val stored = rejected.copy(eventId = event.id)
-            controlReceipts[stored.operationId] = stored
-            controlOperationIdByIdempotencyKey[stored.idempotencyKey] = stored.operationId
+            storeControlReceipt(stored)
             return stored
         }
 
@@ -668,8 +1389,7 @@ class RuntimeSessionTree(
                 reason = reason,
                 eventId = event.id,
             )
-            controlReceipts[rejected.operationId] = rejected
-            controlOperationIdByIdempotencyKey[rejected.idempotencyKey] = rejected.operationId
+            storeControlReceipt(rejected)
             return rejected
         }
 
@@ -721,8 +1441,7 @@ class RuntimeSessionTree(
             reason = if (changed.isEmpty()) "target is not active" else request.reason.ifBlank { null },
             eventId = event.id,
         )
-        controlReceipts[accepted.operationId] = accepted
-        controlOperationIdByIdempotencyKey[accepted.idempotencyKey] = accepted.operationId
+        storeControlReceipt(accepted)
         return accepted
     }
 
@@ -747,9 +1466,30 @@ class RuntimeSessionTree(
             return receipt
         }
         if (target == null || executor == null || initiator == null) return reject(DeleteSubtreeResult.NOT_FOUND, "unknown initiator, executor, or target")
-        if (executor.rootId != target.rootId || initiator.rootId != target.rootId || (request.rootId != null && request.rootId != target.rootId)) {
+        // [T-android-conversation-scope] Ownership is a property of the
+        // CONVERSATION, not of one root generation. `ConversationIdProtocol
+        // .conversationIdOf` is this package's one answer to "which conversation
+        // does this runtime id belong to" — the identity
+        // `descendantsForChatSession` already walks by — so the `"$sessionId#run-N"`
+        // root a re-run mints does not, on its own, put a target out of the
+        // executor's reach. Nothing else moves: two different sessions share no
+        // conversation id and are still refused here, and the executor must still
+        // own the target.
+        if (ConversationIdProtocol.conversationIdOf(executor.rootId) != ConversationIdProtocol.conversationIdOf(target.rootId) ||
+            ConversationIdProtocol.conversationIdOf(initiator.rootId) != ConversationIdProtocol.conversationIdOf(target.rootId) ||
+            (request.rootId != null && !isScopedRootOf(request.rootId, target.rootId))
+        ) {
             return reject(DeleteSubtreeResult.REJECTED, "cross-root deletion is not authorized")
         }
+        // [T-android-conversation-scope] DELETION IS NARROWER THAN DELIVERY.
+        // The conversation-scope predicate lets a generation root reach every
+        // member of its conversation, which is what `request.md:111` needs for
+        // sending. Reused for deletion it also let ANY generation root delete a
+        // target it has no ancestry over — e.g. the crashed root `S` deleting a
+        // child of the re-run root `S#run-1` — and `request.md:9` never asked for
+        // cross-generation deletion: it asks to VIEW interrupted descendants and
+        // to RESTART them. Destroying a subtree stays what this comment always
+        // said it was, a strict-ancestor operation:
         if (executor.id == target.id || !isAncestor(executor.id, target.id)) {
             return reject(DeleteSubtreeResult.REJECTED, "executor must be a strict ancestor of target")
         }
@@ -758,20 +1498,7 @@ class RuntimeSessionTree(
         }
         val oldParentId = target.parentId
         val snapshot = affected.mapNotNull(nodes::get)
-        affected.forEach { id ->
-            nodes.remove(id)
-            children.remove(id)
-            transcripts.remove(id)
-            pendingStopOperationByNodeId.remove(id)
-            pendingStopReportByNodeId.remove(id)
-            stopNotificationSentForNodeIds.remove(id)
-        }
-        children.values.forEach { it.removeAll(affected.toSet()) }
-        topologyEdges.entries.removeIf { it.value.fromNodeId in affected || it.value.toNodeId in affected }
-        subscriptions.entries.removeIf { it.value.subscriberNodeId in affected || it.value.publisherNodeId in affected }
-        inbox.removeAll { it.fromNodeId in affected || it.toNodeId in affected }
-        deliveryReceipts.removeAll { it.fromNodeId in affected || it.toNodeId in affected }
-        rootIds.removeAll(affected)
+        removeNodes(affected)
         val scope = affected.joinToString(",")
         record(request.executorNodeId, "subtree_deleted", now, "operationId=${request.operationId};target=${target.id};affected=$scope")
         oldParentId?.let { parentId ->
@@ -798,12 +1525,109 @@ class RuntimeSessionTree(
     @Synchronized
     fun deleteSubtreeReceipt(operationId: String): DeleteSubtreeReceipt? = deletionReceipts[operationId]
 
+    /**
+     * Owner-authorized removal of whole subtrees, used when the *user* deletes
+     * conversations from the session list.
+     *
+     * [deleteSubtree] deliberately cannot serve this caller and is left exactly
+     * as it was: it demands a strict-ancestor executor inside the same root, and
+     * the human owner is not a node in this tree — deleting a conversation that
+     * is itself a root has no legal executor at all. The authorization model
+     * here is therefore not "an agent proved ancestry" but "the UI asked on the
+     * user's behalf", which is also why this is a separate entry point rather
+     * than a flag on [deleteSubtree]: nothing in the tool/agent surface reaches
+     * it, so an agent still cannot delete itself (or anyone else) through it.
+     *
+     * Two differences from an agent-issued delete, both deliberate:
+     *
+     *  - No BUSY refusal. The user's delete is not a negotiation: a sub-agent
+     *    that is still running is first stamped [RuntimeNodeStatus.ABORTED]
+     *    (`abortedNodeIds`) so the tree records "this run did not finish"
+     *    instead of leaving a node that looks live forever, and the nodes are
+     *    then removed. Refusing would make "delete" a lie, and there is no
+     *    cancel handle for an in-flight child run to wait on.
+     *  - Unknown ids are skipped instead of rejected, because the caller passes
+     *    a subtree computed from a snapshot that may already be stale.
+     *
+     * The removal body itself is shared with [deleteSubtree] (see [removeNodes]),
+     * so edges, subscriptions, inbox envelopes, transcripts and root ids are
+     * cleaned identically no matter which entry point ran.
+     */
+    @Synchronized
+    fun purgeSubtrees(targetNodeIds: Collection<String>, reason: String = ""): PurgeSubtreesReceipt {
+        val affected = LinkedHashSet<String>()
+        for (raw in targetNodeIds) {
+            val id = raw.trim()
+            if (id.isEmpty() || nodes[id] == null) continue
+            affected += id
+            affected += descendantsOf(id)
+        }
+        if (affected.isEmpty()) return PurgeSubtreesReceipt(emptyList(), emptyList())
+        val now = clock()
+        val parents = affected.associateWith { nodes[it]?.parentId }
+        // Deepest first, so an ancestor is not stamped terminal while a live
+        // child is still attached to it.
+        val aborted = affected.sortedByDescending { nodes[it]?.depth ?: 0 }
+            .filter { abort(it, abnormal = false, reason = reason) }
+        removeNodes(affected)
+        record(affected.first(), "session_subtree_purged", now, "affected=${affected.joinToString(",")};reason=$reason")
+        // The parent that survives the purge is told its child subtree is gone;
+        // notifications *between* removed nodes were dropped with them above.
+        for (id in affected) {
+            val parentId = parents[id] ?: continue
+            if (parentId in affected) continue
+            val metadata = JSONObject().put("kind", "child_subtree_deleted")
+                .put("targetNodeId", id).put("affectedNodeIds", JSONArray(affected.toList())).toString()
+            inbox += RuntimeEnvelope(UUID.randomUUID().toString(), id, parentId, RuntimeDelivery.NOTIFY,
+                "Subtree ${id} deleted.", now, taskIntent = metadata)
+        }
+        return PurgeSubtreesReceipt(affected.toList(), aborted)
+    }
+
+    /**
+     * Shared removal body: drop every trace of [affected] from the tree.
+     *
+     * Extracted so [deleteSubtree] (agent-authorized) and [purgeSubtrees]
+     * (owner-authorized) cannot drift apart in *what* they clean — only in who
+     * is allowed to ask.
+     */
+    private fun removeNodes(affected: Collection<String>) {
+        val doomed = affected.toSet()
+        doomed.forEach { id ->
+            nodes.remove(id)
+            children.remove(id)
+            transcripts.remove(id)
+            transcriptChars.remove(id)
+            transcriptEvictions.remove(id)
+            eventDropsByNode.remove(id)
+            pendingStopOperationByNodeId.remove(id)
+            pendingStopReportByNodeId.remove(id)
+            stopNotificationSentForNodeIds.remove(id)
+        }
+        children.values.forEach { it.removeAll(doomed) }
+        topologyEdges.entries.removeIf { it.value.fromNodeId in doomed || it.value.toNodeId in doomed }
+        subscriptions.entries.removeIf { it.value.subscriberNodeId in doomed || it.value.publisherNodeId in doomed }
+        inbox.removeAll { it.fromNodeId in doomed || it.toNodeId in doomed }
+        deliveryReceipts.removeAll { it.fromNodeId in doomed || it.toNodeId in doomed }
+        // The receipt ledger's cached character total must follow the ledger it
+        // describes: receipts that leave with a deleted subtree would otherwise
+        // keep counting against a budget they are no longer part of, so the
+        // total would claim a size the ledger does not have.
+        receiptChars = deliveryReceipts.sumOf { it.retainedChars() }
+        rootIds.removeAll(doomed)
+    }
+
 
     @Synchronized
     fun stopReceipt(operationId: String): RuntimeStopReceipt? = controlReceipts[operationId]
 
     @Synchronized
-    fun abort(nodeId: String, abnormal: Boolean, reason: String = ""): Boolean {
+    fun abort(
+        nodeId: String,
+        abnormal: Boolean,
+        reason: String = "",
+        report: RuntimeStopReport? = null,
+    ): Boolean {
         val node = nodes[nodeId] ?: return false
         if (!node.status.isActive() && node.status != RuntimeNodeStatus.STOP_REQUESTED) return false
         val now = clock()
@@ -818,7 +1642,13 @@ class RuntimeSessionTree(
         if (operationId != null) {
             controlReceipts[operationId]?.let { receipt ->
                 if (receipt.targetNodeId == nodeId) {
-                    controlReceipts[operationId] = receipt.copy(stateAfter = finalStatus)
+                    // Through the same single writer as every other change to this
+                    // ledger, so the cached character total and the idempotency
+                    // index stay in step with it. An in-place edit that skipped the
+                    // accounting is the exact defect the delivery ledger's
+                    // `replaceReceiptAt` was centralised to prevent; there is no
+                    // reason to reintroduce it one ledger over.
+                    storeControlReceipt(receipt.copy(stateAfter = finalStatus))
                 }
             }
         }
@@ -831,9 +1661,21 @@ class RuntimeSessionTree(
                 if (reason.isNotBlank()) append(reason)
             },
         )
-        val stopReport = RuntimeStopReport(
+        val stopReport = report?.copy(
             nodeId = nodeId,
             completedNormally = false,
+            // [T-android-stop-request-kind] The caller's report cannot know whether
+            // anybody asked for this stop — the diagnosis is the caller's, the
+            // verdict is ours, and this is the only place that has it.
+            stoppedByRequest = !abnormal,
+            debugInfo = listOfNotNull(
+                report.debugInfo?.takeIf { it.isNotBlank() },
+                reason.takeIf { it.isNotBlank() },
+            ).joinToString("; ").takeIf { it.isNotBlank() },
+        ) ?: RuntimeStopReport(
+            nodeId = nodeId,
+            completedNormally = false,
+            stoppedByRequest = !abnormal,
             debugInfo = reason.takeIf { it.isNotBlank() },
         )
         pendingStopReportByNodeId[nodeId] = stopReport
@@ -872,7 +1714,16 @@ class RuntimeSessionTree(
             fromNodeId = nodeId,
             toNodeId = parentId,
             delivery = RuntimeDelivery.NOTIFY,
-            payload = if (report.completedNormally) "Child ${nodeId} completed." else "Child ${nodeId} stopped abnormally.",
+            // The sentence a reader falls back to when it cannot phrase this kind.
+            // It must agree with the kind [RuntimeSystemMessageMetadata.from] chose:
+            // a fallback that says "abnormally" while the record says "on request"
+            // would reinstate the wrong cause this notification was fixed to stop
+            // reporting.
+            payload = when {
+                report.completedNormally -> "Child ${nodeId} completed."
+                report.stoppedByRequest -> "Child ${nodeId} stopped on request."
+                else -> "Child ${nodeId} stopped abnormally."
+            },
             createdAtMillis = now,
             taskIntent = metadata.toJson(),
             capabilitySnapshot = capabilitySnapshot(parentId),
@@ -880,10 +1731,12 @@ class RuntimeSessionTree(
         )
         inbox += envelope
         record(parentId, "child_stop_notification_enqueued", now, metadata.toJson())
-        deliveryReceipts += RuntimeMessageReceipt(
-            id = UUID.randomUUID().toString(), messageId = envelope.id,
-            fromNodeId = nodeId, toNodeId = parentId, delivery = RuntimeDelivery.NOTIFY,
-            accepted = true, createdAtMillis = now, status = RuntimeReceiptStatus.ENQUEUED,
+        appendReceipt(
+            RuntimeMessageReceipt(
+                id = UUID.randomUUID().toString(), messageId = envelope.id,
+                fromNodeId = nodeId, toNodeId = parentId, delivery = RuntimeDelivery.NOTIFY,
+                accepted = true, createdAtMillis = now, status = RuntimeReceiptStatus.ENQUEUED,
+            )
         )
     }
     @Synchronized
@@ -893,6 +1746,23 @@ class RuntimeSessionTree(
         }.map { it.id }
         stale.forEach { abort(it, abnormal = true, reason = "lease expired") }
         return stale
+    }
+
+    /**
+     * Requeues every inbox envelope whose claim lease expired, so a message
+     * claimed by a claimant that died before consuming it returns to the
+     * claimable set. Returns the affected message ids; empty when nothing
+     * lapsed. Idempotent: an envelope already requeued is not touched again.
+     *
+     * [reconcileLeases] reconciles node liveness and deliberately keeps its own
+     * contract (it returns stale node ids), so message claims are reconciled by
+     * this separate entry point.
+     */
+    @Synchronized
+    fun reconcileMessageClaims(nowMillis: Long = clock()): List<String> {
+        val expired = inbox.filter { it.claimedAtMillis != null && !isClaimLeaseActive(it, nowMillis) }
+        expired.forEach { requeueExpiredClaim(it, nowMillis) }
+        return expired.map { it.id }
     }
 
     /**
@@ -930,19 +1800,32 @@ class RuntimeSessionTree(
             RuntimeDelivery.QUEUE -> RuntimeEdgePermission.SEND
             RuntimeDelivery.NOTIFY -> RuntimeEdgePermission.NOTIFY
         }
+        // [T-android-conversation-scope] A message can also travel DOWN an
+        // ancestry line, not only across one delegation edge. `createChild` mints
+        // exactly one PARENT_CHILD edge — parent to DIRECT child — so "the main
+        // agent sends to its third-level sub-agent" (request.md:111) had no edge
+        // that could authorize it even though the target is an ordinary
+        // descendant, and the same conversation across two root generations had
+        // none either. Descending inside one conversation grants exactly the
+        // permission the direct edge would have granted, and never the reverse
+        // direction: a sibling, a parent, a peer and another conversation are
+        // still refused. Team delivery is deliberately outside this — a peer edge
+        // is a different relationship with its own rule — so the TEAM_PEER branch
+        // below is untouched.
+        val downwardWithinConversation = isWithinConversationScope(from, to)
         val authorized = when (delivery) {
             RuntimeDelivery.TEAM_PEER -> topologyEdges.values.any {
                 it.fromNodeId == fromNodeId && it.toNodeId == toNodeId &&
                     it.kind == RuntimeEdgeKind.TEAM_PEER && it.allows(permission)
             }
-            RuntimeDelivery.NOTIFY -> topologyEdges.values.any {
+            RuntimeDelivery.NOTIFY -> downwardWithinConversation || topologyEdges.values.any {
                 it.fromNodeId == fromNodeId && it.toNodeId == toNodeId &&
                     it.kind == RuntimeEdgeKind.PARENT_CHILD && it.allows(permission)
             } || subscriptions.values.any {
                 it.subscriberNodeId == toNodeId && it.publisherNodeId == fromNodeId &&
                     it.active && RuntimeEdgePermission.NOTIFY in it.permissions
             }
-            else -> topologyEdges.values.any {
+            else -> downwardWithinConversation || topologyEdges.values.any {
                 it.fromNodeId == fromNodeId && it.toNodeId == toNodeId &&
                     (it.kind == RuntimeEdgeKind.PARENT_CHILD || it.kind == RuntimeEdgeKind.TEAM_PEER) &&
                     it.allows(permission)
@@ -975,12 +1858,14 @@ class RuntimeSessionTree(
         )
         inbox += message
         record(toNodeId, "message_enqueued", now, message.id)
-        deliveryReceipts += RuntimeMessageReceipt(
-            id = UUID.randomUUID().toString(), messageId = message.id,
-            fromNodeId = fromNodeId, toNodeId = toNodeId, delivery = effective,
-            accepted = true, createdAtMillis = now,
-            reason = if (effective != delivery) "delivery window closed; queued" else null,
-            status = RuntimeReceiptStatus.ENQUEUED,
+        appendReceipt(
+            RuntimeMessageReceipt(
+                id = UUID.randomUUID().toString(), messageId = message.id,
+                fromNodeId = fromNodeId, toNodeId = toNodeId, delivery = effective,
+                accepted = true, createdAtMillis = now,
+                reason = if (effective != delivery) "delivery window closed; queued" else null,
+                status = RuntimeReceiptStatus.ENQUEUED,
+            )
         )
         return RuntimeDeliveryReceipt(
             true, message.id, effective,
@@ -1046,6 +1931,87 @@ class RuntimeSessionTree(
         return RuntimeEdgeReceipt(true, edge.id, now)
     }
 
+    /**
+     * [team-peer-mesh] Materialize the mesh a Team mode team is supposed to have:
+     * [nodeId] and every other Team-mode node under the same root, connected in
+     * BOTH directions, so any member can address any other member.
+     *
+     * Why this exists instead of leaving it to a caller: the capability is stated
+     * as a property of the team, not as an action anyone has to remember.
+     * request.md:5 — "all sub-agents can communicate with each other"; request.md:160
+     * — "the whole team knows each other ... they build [addresses] for themselves,
+     * like IP addresses, so they can interact". A team whose members each hold a
+     * mailbox but no route is exactly the traditional mode the requirement
+     * contrasts with ("no address, no direction"), so the mesh is created when the
+     * team is created, not on a second, optional call.
+     *
+     * Where it is called: the two moments a team changes shape — [setDelegationMode]
+     * turning a root into Team mode (every member becomes a peer at once) and
+     * [createChild] adding a member into an already-Team team (the new member must
+     * learn every existing peer, and they must learn it). Nothing else calls this,
+     * and in particular a TRADITIONAL dispatch never does: request.md:5 — without
+     * `/team` the sub-agent mode is the default one, which has no addresses.
+     *
+     * Direction is deliberately both ways. Peer delivery is directed — [send]
+     * matches `fromNodeId -> toNodeId`, and [RuntimeChildRunner] mirrors an inbound
+     * TEAM_PEER back along the reply direction — so a one-way mesh would make an
+     * answer undeliverable in exactly the direction that would answer it.
+     *
+     * Authorization is NOT re-implemented here: every edge is requested from
+     * [addTeamPeerEdge], which stays the single owner of "both nodes are Team and
+     * share a root". This function only decides WHICH pairs should be linked and
+     * which are already linked.
+     *
+     * Idempotence: per direction, an edge that is already active and already carries
+     * SEND grants everything the mesh wants to grant, so it is left alone and
+     * reported as pre-existing. Without that check a repeat call would stack a
+     * duplicate edge every time (`addTopologyEdge` mints a fresh id on each call),
+     * and the topology would grow with the number of dispatches rather than the
+     * number of members. The observable contract is therefore: a direction carries
+     * at most one active SEND-bearing TEAM_PEER edge, and [RuntimeTeamPeerMesh]
+     * .createdEdgeIds is empty for a member that was already fully linked.
+     *
+     * Revocation: a revoked direction stays revoked, and an unrelated member joining
+     * does not silently resurrect it — this only ever links the member whose
+     * membership just changed to its current peers, so a pair that both sides
+     * already belong to is never revisited. It comes back when that node re-enters
+     * Team mode, i.e. on the next Team dispatch, which is the moment the team is
+     * being formed again and a missing route would be a surprise rather than a
+     * decision. Revoking therefore means "these two must not talk right now" and
+     * holds until the team is re-formed, instead of being a one-dispatch hiccup or a
+     * permanent veto that would need a second, unstated mechanism to undo.
+     */
+    @Synchronized
+    fun linkTeamPeers(nodeId: String): RuntimeTeamPeerMesh {
+        val self = nodes[nodeId] ?: return RuntimeTeamPeerMesh(nodeId, emptyList(), emptyList())
+        if (self.delegationMode != DelegationMode.TEAM) return RuntimeTeamPeerMesh(nodeId, emptyList(), emptyList())
+        val peers = nodes.values
+            .filter { it.id != nodeId && it.rootId == self.rootId && it.delegationMode == DelegationMode.TEAM }
+            .map { it.id }
+            .sorted()
+        val created = mutableListOf<String>()
+        peers.forEach { peer ->
+            created += linkTeamPeerDirection(nodeId, peer)
+            created += linkTeamPeerDirection(peer, nodeId)
+        }
+        return RuntimeTeamPeerMesh(nodeId, peers, created)
+    }
+
+    /**
+     * One direction of [linkTeamPeers]: link `from -> to` unless that direction is
+     * already authorized, and return the id of the edge that was created (empty when
+     * the direction was already present).
+     */
+    private fun linkTeamPeerDirection(fromNodeId: String, toNodeId: String): List<String> {
+        val alreadyAuthorized = topologyEdges.values.any {
+            it.fromNodeId == fromNodeId && it.toNodeId == toNodeId &&
+                it.kind == RuntimeEdgeKind.TEAM_PEER && it.allows(RuntimeEdgePermission.SEND)
+        }
+        if (alreadyAuthorized) return emptyList()
+        val receipt = addTeamPeerEdge(fromNodeId, toNodeId, setOf(RuntimeEdgePermission.SEND))
+        return if (receipt.accepted) listOfNotNull(receipt.edgeId) else emptyList()
+    }
+
     @Synchronized
     fun revokeTopologyEdge(edgeId: String, nowMillis: Long = clock()): RuntimeEdgeReceipt {
         val edge = topologyEdges[edgeId] ?: return RuntimeEdgeReceipt(false, edgeId = edgeId, reason = "unknown edge")
@@ -1075,7 +2041,7 @@ class RuntimeSessionTree(
         createdAtMillis: Long = clock(),
     ): Boolean {
         if (nodes[nodeId] == null || role.isBlank() || content.isBlank()) return false
-        transcripts.getOrPut(nodeId) { mutableListOf() } += RuntimeTranscriptMessage(
+        val message = RuntimeTranscriptMessage(
             id = messageId,
             nodeId = nodeId,
             role = role,
@@ -1083,6 +2049,9 @@ class RuntimeSessionTree(
             createdAtMillis = createdAtMillis,
             metadata = metadata,
         )
+        transcripts.getOrPut(nodeId) { mutableListOf() } += message
+        transcriptChars[nodeId] = transcriptChars.getOrDefault(nodeId, 0) + message.retainedChars()
+        evictTranscriptOverflow(nodeId)
         record(nodeId, "transcript_appended", createdAtMillis, messageId)
         return true
     }
@@ -1090,9 +2059,181 @@ class RuntimeSessionTree(
     @Synchronized
     fun transcript(nodeId: String): List<RuntimeTranscriptMessage> = transcripts[nodeId].orEmpty().toList()
 
+    /**
+     * What this node's transcript holds and what the retention budget took from
+     * it — the only honest way to read [transcript] as "complete".
+     *
+     * Returns `null` when [nodeId] is not a node of this tree. That is a real
+     * third state and not a variation of "empty": `null` = "there is no such
+     * node", a value with [RuntimeTranscriptRetention.truncated] `false` = "this
+     * is genuinely all of it", and a value with `truncated` `true` = "older
+     * messages were evicted, here is how many". Reading [transcript] alone
+     * cannot tell the last two apart, which is exactly why this accessor
+     * exists.
+     */
+    @Synchronized
+    fun transcriptRetention(nodeId: String): RuntimeTranscriptRetention? {
+        if (nodes[nodeId] == null) return null
+        val eviction = transcriptEvictions[nodeId]
+        return RuntimeTranscriptRetention(
+            retainedMessages = transcripts[nodeId]?.size ?: 0,
+            retainedChars = transcriptChars.getOrDefault(nodeId, 0),
+            droppedMessages = eviction?.messages ?: 0,
+            droppedChars = eviction?.chars ?: 0,
+        )
+    }
+
+    /**
+     * Apply the *current* [RuntimeTreeConfig] retention budget to transcripts
+     * that are already in memory, and report how many messages that freed.
+     *
+     * Appends enforce the budget on their own; this exists for the other order
+     * — the app lowering a budget on a live tree — because a ceiling that only
+     * applies to future writes cannot reclaim memory that has already been
+     * spent. Returns 0 when nothing needed evicting, so "called and there was
+     * nothing to do" stays distinguishable from "called and it worked".
+     */
+    @Synchronized
+    fun reclaimTranscripts(): Int {
+        val before = transcriptEvictions.values.sumOf { it.messages }
+        transcripts.keys.toList().forEach { evictTranscriptOverflow(it) }
+        return transcriptEvictions.values.sumOf { it.messages } - before
+    }
+
+    /**
+     * Evict oldest-first until both budgets hold, keeping at least the newest
+     * message: the message currently being appended is never a casualty of its
+     * own arrival, so [appendTranscript] cannot silently swallow a write.
+     *
+     * Cost is proportional to what is actually evicted, not to the ceiling; the
+     * steady state under a full node is one `removeAt(0)` per append.
+     */
+    private fun evictTranscriptOverflow(nodeId: String) {
+        val list = transcripts[nodeId] ?: return
+        var chars = transcriptChars.getOrDefault(nodeId, 0)
+        val maxMessages = config.maxTranscriptMessagesPerNode
+        val maxChars = config.maxTranscriptCharsPerNode
+        if (list.size <= maxMessages && chars <= maxChars) return
+        var doomedMessages = 0
+        var doomedChars = 0
+        var firstSurvivor = 0
+        while (firstSurvivor < list.size - 1 &&
+            (list.size - firstSurvivor > maxMessages || chars > maxChars)
+        ) {
+            val evicted = list[firstSurvivor]
+            doomedMessages++
+            doomedChars += evicted.retainedChars()
+            firstSurvivor++
+            chars -= evicted.retainedChars()
+        }
+        if (doomedMessages == 0) return
+        list.subList(0, firstSurvivor).clear()
+        transcriptChars[nodeId] = chars
+        val ledger = transcriptEvictions.getOrPut(nodeId) { TranscriptEviction() }
+        ledger.messages += doomedMessages
+        ledger.chars += doomedChars
+    }
+
     @Synchronized
     fun receipts(): List<RuntimeMessageReceipt> = deliveryReceipts.toList()
 
+    /**
+     * What the tree's delivery-receipt ledger holds, and what its budget has
+     * already taken from it — the only honest way to read [receipts] as
+     * "complete". `truncated` `false` means "this really is every receipt";
+     * `truncated` `true` means older ones were evicted and by how many.
+     *
+     * Consumer status, stated plainly so nobody assumes otherwise: as of this
+     * change **no production code calls this accessor**; only tests do. The same
+     * facts are carried by [toJson]'s `ledgerRetention` block (which production
+     * does write, though nothing reads that block back yet) and by the `text`
+     * export's `ledgerEvicted=...` line. A future "your agent history was
+     * trimmed" surface should read them from there rather than invent a second
+     * source; until such a surface exists this accessor is a diagnostic and test
+     * seam, not a live path.
+     */
+    @Synchronized
+    fun receiptRetention(): RuntimeReceiptRetention = RuntimeReceiptRetention(
+        retainedReceipts = deliveryReceipts.size,
+        retainedChars = receiptChars,
+        droppedReceipts = receiptEvictions.dropped,
+        droppedChars = receiptEvictions.droppedChars,
+    )
+
+    /**
+     * What the tree's event ledger holds, and what its budget has already taken
+     * from it. See [receiptRetention]; the same distinction applies, including
+     * the consumer status note — no production code calls this yet.
+     *
+     * The counts are the *whole tree's* ledger, which is what the budget is
+     * measured against. For one node's events use [eventsOf], whose `null`
+     * answers "is this even a node of this tree" — a question this accessor
+     * cannot answer, because the tree it describes always exists.
+     */
+    @Synchronized
+    fun eventRetention(): RuntimeEventRetention = RuntimeEventRetention(
+        retainedEvents = events.size,
+        retainedChars = eventChars,
+        droppedEvents = eventEvictions.dropped,
+        droppedChars = eventEvictions.droppedChars,
+    )
+
+    /**
+     * Apply the *current* [RuntimeTreeConfig] ledger budgets to events and
+     * receipts already in memory, and report how many entries that freed.
+     *
+     * The append paths enforce their budgets on their own; this exists for the
+     * other orders, because a ceiling that only applies to future writes cannot
+     * reclaim memory that has already been spent:
+     *
+     *  - **Restore.** [restoreJson] calls this once it has loaded everything, so
+     *    a tree loaded from a file becomes bounded immediately instead of only
+     *    at its next append. This is the reachable case that matters most: the
+     *    ceilings are new, so every tree already on disk was written without
+     *    them and is therefore over budget by definition.
+     *  - **A budget lowered on a live tree.** A caller that assigns a smaller
+     *    [RuntimeTreeConfig.maxEvents] &c. and wants it applied to what is
+     *    already held calls this explicitly. Note that no such caller exists in
+     *    this codebase today: [updateConfig] does not take the budget fields, so
+     *    the budgets are not reachable through the tree's own config API — a
+     *    future config path for them should call this.
+     *
+     * Returns `0` when nothing needed evicting, so "called and there was nothing
+     * to do" stays distinguishable from "called and it worked". It does not
+     * report failures as `0`: an untenable budget is rejected by the config
+     * itself (see [RuntimeTreeConfig.init]) and any exception propagates to the
+     * caller rather than being laundered into an empty success.
+     */
+    @Synchronized
+    fun reclaimLedgers(): Int {
+        val before = eventEvictions.dropped + receiptEvictions.dropped
+        evictEventOverflow()
+        evictReceiptOverflow()
+        return (eventEvictions.dropped + receiptEvictions.dropped) - before
+    }
+
+    /**
+     * Events belonging to [nodeId], or `null` when [nodeId] is not a node of
+     * this tree.
+     *
+     * That `null` is a genuine third state and not a variation of "empty":
+     * `null` = "there is no such node" — an unknown query, which must not read
+     * as "this node has no events"; a non-null empty list = "this node exists
+     * and genuinely produced nothing"; and the list itself, read together with
+     * [eventRetention]`.truncated`, tells "these are all of them" from "the
+     * tree's ledger dropped older events, so this node's list may be partial".
+     * A caller that collapsed the first two would make its own `?:` dead code.
+     *
+     * Consumer status, stated plainly so nobody assumes otherwise: as of this
+     * change **no production code calls this**; only tests do. It exists so the
+     * per-node question above has exactly one answer defined in one place (the
+     * tree), rather than being re-derived by a caller that cannot see
+     * [eventEvictions]. Nothing in the app asks it yet, and it is deliberately
+     * not given a synthetic caller to look busy.
+     */
+    @Synchronized
+    fun eventsOf(nodeId: String): List<RuntimeEvent>? =
+        if (nodes[nodeId] == null) null else events.filter { it.nodeId == nodeId }
 
     @Synchronized
     fun node(nodeId: String): RuntimeSessionNode? = nodes[nodeId]
@@ -1129,6 +2270,27 @@ class RuntimeSessionTree(
             put("leaseMillis", config.leaseMillis)
             put("mode", config.mode.name)
             put("configRevision", configRevision)
+            // Additive: an older reader ignores these, and a tree persisted
+            // before they existed restores to the defaults.
+            put("maxTranscriptMessagesPerNode", config.maxTranscriptMessagesPerNode)
+            put("maxTranscriptCharsPerNode", config.maxTranscriptCharsPerNode)
+            // Written only when they differ from the defaults, so a tree running
+            // on the shipped budgets still serializes to exactly the bytes it
+            // serialized before these ceilings existed. Restoring a tree that
+            // does not carry them keeps whatever config the store was opened
+            // with, which is the same value.
+            if (config.maxEvents != RuntimeTreeConfig.DEFAULT_EVENTS_LIMIT) {
+                put("maxEvents", config.maxEvents)
+            }
+            if (config.maxEventChars != RuntimeTreeConfig.DEFAULT_EVENT_CHARS_LIMIT) {
+                put("maxEventChars", config.maxEventChars)
+            }
+            if (config.maxDeliveryReceipts != RuntimeTreeConfig.DEFAULT_DELIVERY_RECEIPTS_LIMIT) {
+                put("maxDeliveryReceipts", config.maxDeliveryReceipts)
+            }
+            if (config.maxDeliveryReceiptChars != RuntimeTreeConfig.DEFAULT_DELIVERY_RECEIPT_CHARS_LIMIT) {
+                put("maxDeliveryReceiptChars", config.maxDeliveryReceiptChars)
+            }
         })
         out.put("nodes", JSONArray().apply { nodes.values.forEach { put(nodeJson(it)) } })
         out.put("events", JSONArray().apply { events.forEach { put(eventJson(it)) } })
@@ -1140,6 +2302,51 @@ class RuntimeSessionTree(
         out.put("transcripts", JSONArray().apply {
             transcripts.values.flatten().forEach { put(transcriptJson(it)) }
         })
+        // Only nodes that actually lost something appear here, so a tree that
+        // never hit the budget serializes to exactly the bytes it used to. When
+        // a node is present, a reader of the restored tree can still tell
+        // "truncated" from "complete" — without this, a restart would launder a
+        // trimmed transcript into a transcript that looks whole.
+        if (transcriptEvictions.isNotEmpty()) {
+            out.put("transcriptRetention", JSONObject().apply {
+                transcriptEvictions.forEach { (nodeId, eviction) ->
+                    put(nodeId, JSONObject().apply {
+                        put("droppedMessages", eviction.messages)
+                        put("droppedChars", eviction.chars)
+                    })
+                }
+            })
+        }
+        // Same rule as transcriptRetention above, extended to the two tree-wide
+        // ledgers: only a ledger that actually lost entries appears here, so a
+        // tree that never hit a ceiling serializes to exactly the bytes it used
+        // to. When a ledger *is* present, a reader of the restored tree can
+        // still tell "complete" from "trimmed" — without this, a restart would
+        // launder a trimmed history into one that looks whole.
+        if (eventEvictions.dropped > 0 || receiptEvictions.dropped > 0) {
+            out.put("ledgerRetention", JSONObject().apply {
+                if (eventEvictions.dropped > 0) {
+                    put("events", JSONObject().apply {
+                        put("droppedEvents", eventEvictions.dropped)
+                        put("droppedChars", eventEvictions.droppedChars)
+                    })
+                    // Per-node detail, written only when some node actually lost
+                    // events, so an under-budget tree still serializes to exactly
+                    // the bytes it used to.
+                    if (eventDropsByNode.isNotEmpty()) {
+                        put("eventsByNode", JSONObject().apply {
+                            eventDropsByNode.forEach { (nodeId, dropped) -> put(nodeId, dropped) }
+                        })
+                    }
+                }
+                if (receiptEvictions.dropped > 0) {
+                    put("deliveryReceipts", JSONObject().apply {
+                        put("droppedReceipts", receiptEvictions.dropped)
+                        put("droppedChars", receiptEvictions.droppedChars)
+                    })
+                }
+            })
+        }
         return out.toString()
     }
 
@@ -1149,13 +2356,51 @@ class RuntimeSessionTree(
             val json = JSONObject(raw)
             nodes.clear(); children.clear(); events.clear(); inbox.clear()
             topologyEdges.clear(); subscriptions.clear(); deliveryReceipts.clear(); transcripts.clear()
+            transcriptChars.clear(); transcriptEvictions.clear()
+            eventChars = 0
+            eventEvictions.dropped = 0; eventEvictions.droppedChars = 0
+            eventDropsByNode.clear()
+            receiptChars = 0
+            receiptEvictions.dropped = 0; receiptEvictions.droppedChars = 0
             controlReceipts.clear(); controlOperationIdByIdempotencyKey.clear()
             pendingStopOperationByNodeId.clear()
             rootIds.clear()
             val configJson = json.optJSONObject("config")
             if (configJson != null) {
-                config.mode = runCatching { DelegationMode.valueOf(configJson.optString("mode")) }
+                val restoredMaxDepth = configJson.optInt("maxDepth", config.maxDepth)
+                val restoredMaxParallel = configJson.optInt("maxParallelSubagents", config.maxParallelSubagents)
+                val restoredLease = configJson.optLong("leaseMillis", config.leaseMillis)
+                val restoredMode = runCatching { DelegationMode.valueOf(configJson.optString("mode")) }
                     .getOrDefault(config.mode)
+                require(restoredMaxDepth in 0..RuntimeTreeConfig.MAX_DEPTH_LIMIT)
+                require(restoredMaxParallel in 1..RuntimeTreeConfig.MAX_PARALLEL_LIMIT)
+                require(restoredLease > 0)
+                config.maxDepth = restoredMaxDepth
+                config.maxParallelSubagents = restoredMaxParallel
+                config.leaseMillis = restoredLease
+                config.mode = restoredMode
+                configRevision = configJson.optLong("configRevision", configRevision).coerceAtLeast(0L)
+                // Coerced rather than required: a config file written before
+                // these keys existed must keep restoring, and restoring must
+                // never be the thing that decides a bad value becomes live.
+                config.maxTranscriptMessagesPerNode = configJson
+                    .optInt("maxTranscriptMessagesPerNode", config.maxTranscriptMessagesPerNode)
+                    .coerceIn(1, RuntimeTreeConfig.MAX_TRANSCRIPT_MESSAGES_LIMIT)
+                config.maxTranscriptCharsPerNode = configJson
+                    .optInt("maxTranscriptCharsPerNode", config.maxTranscriptCharsPerNode)
+                    .coerceIn(1, RuntimeTreeConfig.MAX_TRANSCRIPT_CHARS_LIMIT)
+                config.maxEvents = configJson
+                    .optInt("maxEvents", config.maxEvents)
+                    .coerceIn(1, RuntimeTreeConfig.MAX_EVENTS_LIMIT)
+                config.maxEventChars = configJson
+                    .optInt("maxEventChars", config.maxEventChars)
+                    .coerceIn(1, RuntimeTreeConfig.MAX_EVENT_CHARS_LIMIT)
+                config.maxDeliveryReceipts = configJson
+                    .optInt("maxDeliveryReceipts", config.maxDeliveryReceipts)
+                    .coerceIn(1, RuntimeTreeConfig.MAX_DELIVERY_RECEIPTS_LIMIT)
+                config.maxDeliveryReceiptChars = configJson
+                    .optInt("maxDeliveryReceiptChars", config.maxDeliveryReceiptChars)
+                    .coerceIn(1, RuntimeTreeConfig.MAX_DELIVERY_RECEIPT_CHARS_LIMIT)
             }
             val legacyRoot = json.optString("rootId").takeIf { it.isNotBlank() && it != "null" }
             val serializedRoots = json.optJSONArray("rootIds")
@@ -1175,7 +2420,11 @@ class RuntimeSessionTree(
             }
             nodes.values.forEach { node -> node.parentId?.let { children.getOrPut(it) { mutableListOf() }.add(node.id) } }
             val eventArray = json.optJSONArray("events") ?: JSONArray()
-            for (i in 0 until eventArray.length()) events += parseEvent(eventArray.getJSONObject(i))
+            for (i in 0 until eventArray.length()) {
+                val event = parseEvent(eventArray.getJSONObject(i))
+                events += event
+                eventChars += event.retainedChars()
+            }
             val inboxArray = json.optJSONArray("inbox") ?: JSONArray()
             for (i in 0 until inboxArray.length()) inbox += parseEnvelope(inboxArray.getJSONObject(i))
             val edgeArray = json.optJSONArray("topologyEdges") ?: JSONArray()
@@ -1189,7 +2438,11 @@ class RuntimeSessionTree(
                 subscriptions[subscription.id] = subscription
             }
             val receiptArray = json.optJSONArray("deliveryReceipts") ?: JSONArray()
-            for (i in 0 until receiptArray.length()) deliveryReceipts += parseReceipt(receiptArray.getJSONObject(i))
+            for (i in 0 until receiptArray.length()) {
+                val receipt = parseReceipt(receiptArray.getJSONObject(i))
+                deliveryReceipts += receipt
+                receiptChars += receipt.retainedChars()
+            }
             val stopReceiptArray = json.optJSONArray("stopReceipts") ?: JSONArray()
             for (i in 0 until stopReceiptArray.length()) {
                 val receipt = parseStopReceipt(stopReceiptArray.getJSONObject(i))
@@ -1205,11 +2458,84 @@ class RuntimeSessionTree(
             for (i in 0 until transcriptArray.length()) {
                 val message = parseTranscript(transcriptArray.getJSONObject(i))
                 transcripts.getOrPut(message.nodeId) { mutableListOf() } += message
+                transcriptChars[message.nodeId] =
+                    transcriptChars.getOrDefault(message.nodeId, 0) + message.retainedChars()
+            }
+            // Restored last and deliberately without eviction: a tree that was
+            // already inside its budget when it was persisted must come back
+            // byte-for-byte, and one that was truncated must come back still
+            // saying so. Restore is not the place to discover a smaller budget.
+            json.optJSONObject("transcriptRetention")?.let { retentionJson ->
+                retentionJson.keys().forEach { nodeId ->
+                    val entry = retentionJson.optJSONObject(nodeId) ?: return@forEach
+                    val dropped = entry.optInt("droppedMessages", 0)
+                    if (dropped > 0) {
+                        transcriptEvictions[nodeId] = TranscriptEviction(
+                            messages = dropped,
+                            chars = entry.optInt("droppedChars", 0),
+                        )
+                    }
+                }
+            }
+            // The eviction counters are read back *before* the budgets are
+            // applied at the end of this method, so a tree that was already
+            // trimmed restores still saying so and its counts are added to
+            // (never replaced by) whatever the current budgets then take.
+            json.optJSONObject("ledgerRetention")?.let { ledgerJson ->
+                ledgerJson.optJSONObject("events")?.let { entry ->
+                    val dropped = entry.optInt("droppedEvents", 0)
+                    if (dropped > 0) {
+                        eventEvictions.dropped = dropped
+                        eventEvictions.droppedChars = entry.optInt("droppedChars", 0)
+                    }
+                }
+                // A sibling of `events`, not a child of it: the per-node tally is
+                // a different question ("which node lost events") from the
+                // tree-wide total, and nesting it would have made its level an
+                // accident of formatting rather than of meaning.
+                ledgerJson.optJSONObject("eventsByNode")?.let { byNode ->
+                    byNode.keys().forEach { nodeId ->
+                        val nodeDropped = byNode.optInt(nodeId, 0)
+                        if (nodeDropped > 0) eventDropsByNode[nodeId] = nodeDropped
+                    }
+                }
+                ledgerJson.optJSONObject("deliveryReceipts")?.let { entry ->
+                    val dropped = entry.optInt("droppedReceipts", 0)
+                    if (dropped > 0) {
+                        receiptEvictions.dropped = dropped
+                        receiptEvictions.droppedChars = entry.optInt("droppedChars", 0)
+                    }
+                }
             }
             val actualRoots = nodes.values.filter { it.parentId == null }.map { it.id }.toSet()
             rootIds.retainAll(actualRoots)
             rootIds.addAll(actualRoots)
             rootId = rootId?.takeIf(actualRoots::contains) ?: rootIds.firstOrNull()
+            // Apply the current budgets to what was just loaded.
+            //
+            // A restored tree can be over its budgets with nothing appended yet,
+            // and on this version that is not a corner case at all: these
+            // ceilings are new, so *every* tree already on disk was written
+            // without them. Loading one and leaving it over budget would hold the
+            // whole legacy history in memory until some later append happened to
+            // evict it — while every `toJson()` in between (and `RuntimeTreeStore
+            // .update` performs two per state mutation) still serialized all of
+            // it. Eviction-and-count is what makes the ceiling true of the tree
+            // that was just loaded rather than only of the next write, and it is
+            // the same "reclaim" the explicit [reclaimLedgers] performs.
+            //
+            // A tree that was already inside its budgets has nothing to evict,
+            // so it still restores byte-for-byte and gains no retention block.
+            reclaimLedgers()
+            // The transcript ceiling is the third budget that is newer than every
+            // tree already on disk, so the paragraph above applies to it verbatim:
+            // without this line an over-budget transcript restored from a file
+            // stays over budget until that node happens to append again, and every
+            // `toJson()` in between (two per `RuntimeTreeStore.update`) still
+            // serializes all of it. `reclaimTranscripts` returns 0 on a tree that is
+            // already inside its budget, so an under-budget tree still restores
+            // byte-for-byte.
+            reclaimTranscripts()
             true
         }.getOrDefault(false)
     }
@@ -1277,19 +2603,58 @@ class RuntimeSessionTree(
     }
 
     private fun claim(nodeId: String, predicate: (RuntimeEnvelope) -> Boolean): RuntimeEnvelope? {
-        val index = inbox.indexOfFirst { !it.claimed && it.toNodeId == nodeId && predicate(it) }
+        val now = clock()
+        val index = inbox.indexOfFirst {
+            it.toNodeId == nodeId && predicate(it) && !isClaimLeaseActive(it, now)
+        }
         if (index < 0) return null
-        val claimed = inbox[index].copy(claimed = true)
+        val previous = inbox[index]
+        if (previous.claimedAtMillis != null) requeueExpiredClaim(previous, now)
+        val claimed = previous.copy(claimedAtMillis = now)
         inbox[index] = claimed
         val receiptIndex = deliveryReceipts.indexOfLast { it.messageId == claimed.id }
         if (receiptIndex >= 0) {
-            deliveryReceipts[receiptIndex] = deliveryReceipts[receiptIndex].copy(
-                status = RuntimeReceiptStatus.CLAIMED,
-                reason = "message claimed",
+            replaceReceiptAt(
+                receiptIndex,
+                deliveryReceipts[receiptIndex].copy(
+                    status = RuntimeReceiptStatus.CLAIMED,
+                    reason = "message claimed",
+                ),
             )
         }
-        record(nodeId, "message_claimed", clock(), claimed.id)
+        record(nodeId, "message_claimed", now, claimed.id)
         return claimed
+    }
+
+    /**
+     * True while an earlier claim still holds, i.e. while its holder may be
+     * consuming the message right now. An unstamped envelope is never held.
+     */
+    private fun isClaimLeaseActive(message: RuntimeEnvelope, nowMillis: Long): Boolean {
+        val claimedAt = message.claimedAtMillis ?: return false
+        return nowMillis - claimedAt < MESSAGE_CLAIM_LEASE_MILLIS
+    }
+
+    /**
+     * Clears an expired claim so the message can be claimed again, and makes the
+     * transition visible: the receipt returns to ENQUEUED with a distinct reason
+     * and the durable event ledger records the expiry. The envelope itself is
+     * kept (same id, same position), never duplicated or removed.
+     */
+    private fun requeueExpiredClaim(message: RuntimeEnvelope, nowMillis: Long) {
+        val index = inbox.indexOfFirst { it.id == message.id }
+        if (index >= 0) inbox[index] = inbox[index].copy(claimedAtMillis = null)
+        val receiptIndex = deliveryReceipts.indexOfLast { it.messageId == message.id }
+        if (receiptIndex >= 0) {
+            replaceReceiptAt(
+                receiptIndex,
+                deliveryReceipts[receiptIndex].copy(
+                    status = RuntimeReceiptStatus.ENQUEUED,
+                    reason = "claim lease expired; message requeued",
+                ),
+            )
+        }
+        record(message.toNodeId, "message_claim_lease_expired", nowMillis, message.id)
     }
 
     private fun descendantsOf(nodeId: String): List<String> = children[nodeId].orEmpty().flatMap { listOf(it) + descendantsOf(it) }
@@ -1297,7 +2662,124 @@ class RuntimeSessionTree(
     private fun record(nodeId: String, kind: String, timestamp: Long, payload: String = ""): RuntimeEvent {
         val event = RuntimeEvent(UUID.randomUUID().toString(), nodeId, kind, timestamp, payload)
         events += event
+        eventChars += event.retainedChars()
+        evictEventOverflow()
         return event
+    }
+
+    /**
+     * Single producer for the receipt ledger. Centralized so the retention
+     * budget cannot be bypassed by one of the three call sites that append a
+     * receipt — `send`, [rejectDelivery] and the stop-notification enqueue —
+     * because a budget that one path can walk around is not a budget.
+     */
+    private fun appendReceipt(receipt: RuntimeMessageReceipt) {
+        deliveryReceipts += receipt
+        receiptChars += receipt.retainedChars()
+        evictReceiptOverflow()
+    }
+
+    /**
+     * The only way a receipt already in the ledger may change.
+     *
+     * The claim and lease-expiry paths rewrite a receipt's `reason` in place,
+     * and `reason` is a *counted* field — so an edit that bypassed the cache
+     * would leave [receiptChars] claiming a size the ledger no longer has, and a
+     * budget that reads a stale total is a budget that stops firing: the
+     * character ceiling could be exceeded in truth while the cached total still
+     * looked under it. Centralizing the edit is the fix, not "remember to adjust
+     * the counter at each call site" — the original defect was exactly a call
+     * site that did not.
+     */
+    private fun replaceReceiptAt(index: Int, replacement: RuntimeMessageReceipt) {
+        val previous = deliveryReceipts[index]
+        receiptChars += replacement.retainedChars() - previous.retainedChars()
+        deliveryReceipts[index] = replacement
+        // A reason string is caller-supplied, so an edit can grow a receipt past
+        // the ceiling the same way an append can.
+        evictReceiptOverflow()
+    }
+
+    /**
+     * What one event costs against [RuntimeTreeConfig.maxEventChars].
+     *
+     * All three text fields are counted because all three are retained in
+     * memory and written to the tree JSON; a budget that ignored `payload`
+     * would keep exactly the growing thing it exists to bound.
+     */
+    private fun RuntimeEvent.retainedChars(): Int = nodeId.length + kind.length + payload.length
+
+    /**
+     * What one receipt costs against [RuntimeTreeConfig.maxDeliveryReceiptChars].
+     * `reason` is nullable and is the only free-text field a receipt carries.
+     */
+    private fun RuntimeMessageReceipt.retainedChars(): Int =
+        fromNodeId.length + toNodeId.length + (reason?.length ?: 0)
+
+    /**
+     * Evict the oldest events until both event budgets hold, keeping the newest
+     * event: the event currently being appended is never a casualty of its own
+     * arrival, so [record] cannot silently swallow the evidence of the very
+     * transition that caused it.
+     *
+     * Cost is proportional to what is actually evicted, not to the ceiling; the
+     * steady state under a full ledger is one `removeAt(0)` per append.
+     */
+    private fun evictEventOverflow() {
+        val maxEvents = config.maxEvents
+        val maxChars = config.maxEventChars
+        if (events.size <= maxEvents && eventChars <= maxChars) return
+        var doomedEvents = 0
+        var doomedChars = 0
+        var firstSurvivor = 0
+        while (firstSurvivor < events.size - 1 &&
+            (events.size - firstSurvivor > maxEvents || eventChars > maxChars)
+        ) {
+            val evicted = events[firstSurvivor]
+            val cost = evicted.retainedChars()
+            // The budget is per tree, but the *question a reader asks* is per
+            // node: "is this node's list of events complete". Without this
+            // per-node tally the only available signal is the tree-wide one, and
+            // a node whose own events were never touched would then be reported
+            // as trimmed — or, worse, a node whose events were all evicted would
+            // be indistinguishable from a node that never had any.
+            eventDropsByNode[evicted.nodeId] = (eventDropsByNode[evicted.nodeId] ?: 0) + 1
+            doomedEvents++
+            doomedChars += cost
+            firstSurvivor++
+            eventChars -= cost
+        }
+        if (doomedEvents == 0) return
+        events.subList(0, firstSurvivor).clear()
+        eventEvictions.dropped += doomedEvents
+        eventEvictions.droppedChars += doomedChars
+    }
+
+    /**
+     * Counterpart of [evictEventOverflow] for the receipt ledger: oldest first,
+     * newest never evicted, every eviction counted.
+     */
+    private fun evictReceiptOverflow() {
+        val maxReceipts = config.maxDeliveryReceipts
+        val maxChars = config.maxDeliveryReceiptChars
+        if (deliveryReceipts.size <= maxReceipts && receiptChars <= maxChars) return
+        var doomedReceipts = 0
+        var doomedChars = 0
+        var firstSurvivor = 0
+        while (firstSurvivor < deliveryReceipts.size - 1 &&
+            (deliveryReceipts.size - firstSurvivor > maxReceipts || receiptChars > maxChars)
+        ) {
+            val evicted = deliveryReceipts[firstSurvivor]
+            val cost = evicted.retainedChars()
+            doomedReceipts++
+            doomedChars += cost
+            firstSurvivor++
+            receiptChars -= cost
+        }
+        if (doomedReceipts == 0) return
+        deliveryReceipts.subList(0, firstSurvivor).clear()
+        receiptEvictions.dropped += doomedReceipts
+        receiptEvictions.droppedChars += doomedChars
     }
 
     private fun isAncestor(ancestorNodeId: String, nodeId: String): Boolean {
@@ -1309,17 +2791,76 @@ class RuntimeSessionTree(
         return false
     }
 
+    /**
+     * [T-android-conversation-scope] Whether [actor] may act on [target] as one of
+     * its own, across the generations a crash or a re-run splits a conversation
+     * into.
+     *
+     * The conversation identity is [ConversationIdProtocol.conversationIdOf] — the
+     * package's single definition of "which conversation is this runtime node
+     * part of", and the identity
+     * [RuntimeTopologySnapshot.descendantsForChatSession] already walks by — so a
+     * reopen that mints `"$sessionId#run-N"` does not by itself move the target out
+     * of the actor's reach.
+     *
+     * What a crash must NOT buy is authority, so the rule stays narrower than
+     * "same conversation":
+     *
+     *  - the target is never the actor itself (no self-stop, self-delete or
+     *    self-send), and never a generation root — those are this conversation's
+     *    own main agent at another point in time, and one agent acting on another
+     *    main agent is not a relationship this tree endorses;
+     *  - a node that is not a root keeps the strict-ancestor rule it always had, so
+     *    a sub-agent still cannot reach a sibling or its own parent;
+     *  - only a root — the conversation's main agent, the one actor request.md:9
+     *    is about — additionally reaches the members of the OTHER generations,
+     *    which is exactly the run union
+     *    [RuntimeSessionCoordinator.supervisedDescendants] already reports.
+     */
+    private fun isWithinConversationScope(actor: RuntimeSessionNode, target: RuntimeSessionNode): Boolean {
+        if (actor.id == target.id) return false
+        if (target.parentId == null) return false
+        if (ConversationIdProtocol.conversationIdOf(actor.rootId) !=
+            ConversationIdProtocol.conversationIdOf(target.rootId)
+        ) {
+            return false
+        }
+        return actor.parentId == null || isAncestor(actor.id, target.id)
+    }
+
+    /**
+     * [T-android-conversation-scope] Whether a caller-named `root_id` really names
+     * a root of the conversation [nodeRootId] belongs to.
+     *
+     * The tool schema calls the argument an "expected runtime root ID", so a caller
+     * that read it from `supervise_descendants` hands over the node's own
+     * generation root — which, for a descendant a crash left behind, is the OLD
+     * generation. Accepting only `== actor.rootId` therefore turned the honest
+     * answer into a refusal; accepting only roots of the same conversation still
+     * refuses a name that belongs to another conversation, a node that is not a
+     * root at all, or an id that does not exist.
+     */
+    private fun isScopedRootOf(namedRootId: String, nodeRootId: String): Boolean =
+        nodes[namedRootId]?.parentId == null &&
+            ConversationIdProtocol.conversationIdOf(namedRootId) ==
+            ConversationIdProtocol.conversationIdOf(nodeRootId)
+
     private fun authorizeDescendantStop(
         actor: RuntimeSessionNode?,
         target: RuntimeSessionNode?,
         requestedRootId: String?,
     ): String? {
         if (actor == null || target == null) return "unknown actor or target"
-        if (actor.rootId != target.rootId || (requestedRootId != null && requestedRootId != actor.rootId)) {
+        if (ConversationIdProtocol.conversationIdOf(actor.rootId) !=
+            ConversationIdProtocol.conversationIdOf(target.rootId)
+        ) {
             return "cross-root stop is not authorized"
         }
-        if (actor.id == target.id || !isAncestor(actor.id, target.id)) {
-            return "stop is limited to actor descendants"
+        if (requestedRootId != null && !isScopedRootOf(requestedRootId, actor.rootId)) {
+            return "cross-root stop is not authorized"
+        }
+        if (actor.id == target.id || !isWithinConversationScope(actor, target)) {
+            return "stop is limited to strict ancestors, plus the conversation root stopping any of its descendants"
         }
         return null
     }
@@ -1389,7 +2930,7 @@ class RuntimeSessionTree(
     }
 
     private fun envelopeJson(message: RuntimeEnvelope) = JSONObject().apply {
-        put("id", message.id); put("fromNodeId", message.fromNodeId); put("toNodeId", message.toNodeId); put("delivery", message.delivery.name); put("payload", message.payload); put("createdAtMillis", message.createdAtMillis); put("claimed", message.claimed); put("taskIntent", message.taskIntent)
+        put("id", message.id); put("fromNodeId", message.fromNodeId); put("toNodeId", message.toNodeId); put("delivery", message.delivery.name); put("payload", message.payload); put("createdAtMillis", message.createdAtMillis); put("claimed", message.claimed); put("claimedAtMillis", message.claimedAtMillis); put("taskIntent", message.taskIntent)
         put("capabilitySnapshot", snapshotJson(message.capabilitySnapshot))
         put("senderCapabilitySnapshot", snapshotJson(message.senderCapabilitySnapshot))
     }
@@ -1465,6 +3006,24 @@ class RuntimeSessionTree(
     private fun nodeExportJson(node: RuntimeSessionNode) = JSONObject().apply {
         put("node", nodeJson(node))
         put("transcript", JSONArray(transcripts[node.id].orEmpty().map(::transcriptJson)))
+        // Per-node export is read on its own, without the tree's `nodes` block
+        // in hand, so "this node's transcript is complete" and "this node's
+        // transcript was trimmed" have to be decidable from this object alone.
+        put("transcriptRetention", JSONObject().apply {
+            put("retainedMessages", transcripts[node.id]?.size ?: 0)
+            put("retainedChars", transcriptChars.getOrDefault(node.id, 0))
+            put("droppedMessages", transcriptEvictions[node.id]?.messages ?: 0)
+            put("droppedChars", transcriptEvictions[node.id]?.chars ?: 0)
+        })
+        // The ledger budget is per tree, but this document is per node and is
+        // read on its own, so it has to answer *this node's* question: the count
+        // is the events the budget took from this node, not the tree's total.
+        // Always present (zeros included), like `transcriptRetention` above, so
+        // "zero" and "field missing" can never be confused for each other.
+        put("ledgerRetention", JSONObject().apply {
+            put("retainedEvents", events.count { it.nodeId == node.id })
+            put("droppedEvents", eventDropsByNode[node.id] ?: 0)
+        })
         put("events", JSONArray(events.filter { it.nodeId == node.id }.map(::eventJson)))
         put("inbox", JSONArray(inbox.filter { it.toNodeId == node.id || it.fromNodeId == node.id }.map(::envelopeJson)))
         put("receipts", JSONArray(deliveryReceipts.filter { it.toNodeId == node.id || it.fromNodeId == node.id }.map(::receiptJson)))
@@ -1563,16 +3122,45 @@ class RuntimeSessionTree(
     private fun parseEnvelope(json: JSONObject) = RuntimeEnvelope(
         id = json.optString("id"), fromNodeId = json.optString("fromNodeId"), toNodeId = json.optString("toNodeId"),
         delivery = runCatching { RuntimeDelivery.valueOf(json.optString("delivery")) }.getOrDefault(RuntimeDelivery.QUEUE),
-        payload = json.optString("payload"), createdAtMillis = json.optLong("createdAtMillis"), claimed = json.optBoolean("claimed"),
+        payload = json.optString("payload"), createdAtMillis = json.optLong("createdAtMillis"),
+        claimedAtMillis = if (json.has("claimedAtMillis") && !json.isNull("claimedAtMillis")) {
+            json.optLong("claimedAtMillis")
+        } else if (json.optBoolean("claimed")) {
+            legacyClaimStamp()
+        } else {
+            null
+        },
         taskIntent = json.optString("taskIntent"),
         capabilitySnapshot = parseSnapshot(json.optJSONObject("capabilitySnapshot")),
         senderCapabilitySnapshot = parseSnapshot(json.optJSONObject("senderCapabilitySnapshot")),
     )
 
+    /**
+     * Envelopes written before claim leases existed carry only the boolean
+     * `claimed`, so the moment they were claimed is unknowable. They are stamped
+     * exactly one lease in the past: already expired, hence claimable again. For
+     * an old record, re-delivering the message once is strictly better than
+     * leaving it invisible to every claim path forever.
+     */
+    private fun legacyClaimStamp(): Long = clock() - MESSAGE_CLAIM_LEASE_MILLIS
+
     private fun textExport(): String = buildString {
         appendLine("session-tree")
         nodes.values.filter { it.parentId == null }.forEach { appendNode(this, it.id, 0) }
-        appendLine("events=${events.size} inbox=${inbox.count { !it.claimed }}")
+        appendLine("events=${events.size} inbox=${inbox.count { !isClaimLeaseActive(it, clock()) }}")
+        // A trimmed ledger must not read as a short but complete one: the
+        // eviction counts are printed here for the same reason the per-node
+        // transcript marker exists.
+        appendLine(
+            "ledgerBudget=${config.maxEvents} events / ${config.maxEventChars} chars, " +
+                "${config.maxDeliveryReceipts} receipts / ${config.maxDeliveryReceiptChars} chars; " +
+                "ledgerEvicted=${eventEvictions.dropped} events / ${receiptEvictions.dropped} receipts"
+        )
+        appendLine(
+            "transcripts=${transcripts.values.sumOf { it.size }} messages retained; " +
+                "transcriptBudget=${config.maxTranscriptMessagesPerNode} msgs / ${config.maxTranscriptCharsPerNode} chars per node; " +
+                "transcriptEvicted=${transcriptEvictions.values.sumOf { it.messages }} messages across ${transcriptEvictions.size} node(s)"
+        )
     }
 
     private fun appendNode(out: StringBuilder, nodeId: String, indent: Int) {
@@ -1601,9 +3189,27 @@ class RuntimeSessionTree(
         appendLine("depth=${node.depth}")
         appendLine("status=${node.status}")
         appendLine("model=${node.model.model}")
+        // A truncated node must never read as a short but complete one: the
+        // marker goes above the retained lines so it cannot be missed by a
+        // reader that stops at the end of the transcript.
+        transcriptEvictions[node.id]?.let { eviction ->
+            appendLine("transcript-truncated: oldest ${eviction.messages} message(s) / ${eviction.chars} char(s) evicted by the retention budget")
+        }
         transcripts[node.id].orEmpty().forEach { message ->
             appendLine("[${message.createdAtMillis}] ${message.role}: ${message.content}")
             if (message.metadata.isNotBlank()) appendLine("metadata: ${message.metadata}")
+        }
+        // A node whose events were partly evicted must not read as a node that
+        // simply had few events; the marker goes above the lines so a reader
+        // that stops at the end cannot miss it.
+        // A node whose events were partly evicted must not read as a node that
+        // simply had few events. The count is *this node's*, not the tree's: the
+        // tree-wide ledger can drop one node's events while leaving a sibling's
+        // untouched, so a tree-wide test would mark a node that lost nothing and
+        // tell a reader nothing useful about the node in hand.
+        val droppedHere = eventDropsByNode[node.id] ?: 0
+        if (droppedHere > 0) {
+            appendLine("ledger-truncated: oldest $droppedHere event(s) of this node evicted by the tree's retention budget")
         }
         events.filter { it.nodeId == node.id }.forEach { appendLine("event ${it.timestampMillis} ${it.kind}: ${it.payload}") }
         inbox.filter { it.toNodeId == node.id || it.fromNodeId == node.id }.forEach {
@@ -1613,6 +3219,15 @@ class RuntimeSessionTree(
 
 
     private fun RuntimeNodeStatus.isActive() = this == RuntimeNodeStatus.STARTING || this == RuntimeNodeStatus.RUNNING || this == RuntimeNodeStatus.WAITING_CHILDREN
+
+    /**
+     * What one transcript message costs against [RuntimeTreeConfig.maxTranscriptCharsPerNode].
+     *
+     * Both fields are counted because both are retained in memory and both are
+     * written to the tree JSON: a budget that ignored `metadata` would keep the
+     * growing thing it is supposed to be bounding.
+     */
+    private fun RuntimeTranscriptMessage.retainedChars(): Int = content.length + metadata.length
     private fun RuntimeNodeStatus.isLeaseActive() = isActive() || this == RuntimeNodeStatus.STOP_REQUESTED
     private fun RuntimeNodeStatus.isTerminal() = this == RuntimeNodeStatus.STOP_REQUESTED || this == RuntimeNodeStatus.SUCCEEDED || this == RuntimeNodeStatus.FAILED || this == RuntimeNodeStatus.ABORTED || this == RuntimeNodeStatus.ABNORMAL_INTERRUPTION
 }

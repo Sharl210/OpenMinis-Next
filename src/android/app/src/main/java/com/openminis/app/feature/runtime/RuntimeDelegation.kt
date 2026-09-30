@@ -8,6 +8,16 @@ data class RuntimeDelegationRequest(
     val model: String? = null,
     val note: String = "",
     val capabilities: Set<String> = RuntimeModelSnapshot.DEFAULT_CAPABILITIES,
+    /**
+     * Which of the dispatcher's own messages to offer the receiver, from
+     * `--share=all` or `--share=0,7,9`. Null means nothing was shared, which is
+     * the default and the previous behaviour.
+     *
+     * This is a request, not the context: it names a selection, and the
+     * transcript never travels through it. See [RuntimeContextAttachments] for
+     * why the reference form is the requirement and not an optimisation.
+     */
+    val contextShare: RuntimeContextShareRequest? = null,
 )
 
 /**
@@ -17,11 +27,14 @@ data class RuntimeDelegationRequest(
  *   /subagent inspect the runtime tree
  *   /team --model=claude-sonnet --note="review this" inspect the runtime tree
  *   /team --capabilities=text_input,reasoning summarize this
+ *   /subagent --share=all carry on from where I left off
+ *   /subagent --share=0,7,9 review the decisions and the failure
  */
 object RuntimeDelegationParser {
     private const val TEAM = "/team"
     private const val SUBAGENT = "/subagent"
     private const val DELEGATE = "/delegate"
+    private const val SHARE_ALL = "all"
 
     fun isCommand(input: String): Boolean {
         val normalized = input.trim().replaceFirst('／', '/')
@@ -62,6 +75,11 @@ object RuntimeDelegationParser {
             ?.toSet()
             ?.ifEmpty { RuntimeModelSnapshot.DEFAULT_CAPABILITIES }
             ?: RuntimeModelSnapshot.DEFAULT_CAPABILITIES
+        // A malformed --share is a rejected command, not a silent "share
+        // nothing": the dispatcher asked for something specific, and quietly
+        // dropping it would deliver a child that cannot see what it was
+        // promised. The composer then shows the usage line instead.
+        val share = options["share"]?.let { raw -> parseShare(raw) ?: return null }
         return RuntimeDelegationRequest(
             prompt = prompt,
             mode = if (command == TEAM) DelegationMode.TEAM else DelegationMode.TRADITIONAL,
@@ -69,7 +87,24 @@ object RuntimeDelegationParser {
             model = options["model"]?.trim()?.ifBlank { null },
             note = options["note"]?.trim().orEmpty(),
             capabilities = capabilities,
+            contextShare = share,
         )
+    }
+
+    /**
+     * `all` (case-insensitive) or a comma-separated list of zero-based message
+     * indices. Anything else — including an empty list or a negative index — is
+     * null, which [parse] turns into a rejected command.
+     */
+    private fun parseShare(raw: String): RuntimeContextShareRequest? {
+        val value = raw.trim()
+        if (value.isEmpty()) return null
+        if (value.equals(SHARE_ALL, ignoreCase = true)) return RuntimeContextShareRequest.All
+        val indices = value.split(',').map { it.trim() }
+        if (indices.isEmpty() || indices.any { it.isEmpty() }) return null
+        val parsed = indices.map { it.toIntOrNull() ?: return null }
+        if (parsed.any { it < 0 }) return null
+        return RuntimeContextShareRequest.Selected(parsed.distinct().sorted())
     }
 
     /** Small quote-aware tokenizer; this is not intended to be a shell parser. */

@@ -67,9 +67,10 @@ data class ToolBatchOutcome<T, R>(
  */
 object ToolCallBatchScheduler {
     suspend fun <T, R> execute(
-        items: List<ToolBatchItem<T>>,
+        batch: List<ToolBatchItem<T>>,
         operation: suspend (T) -> ToolBatchExecution<R>,
     ): List<ToolBatchOutcome<T, R>> = coroutineScope {
+        val items = resolveDependencyReferences(batch)
         if (items.isEmpty()) return@coroutineScope emptyList()
 
         val outcomes = arrayOfNulls<ToolBatchOutcome<T, R>>(items.size)
@@ -178,6 +179,52 @@ object ToolCallBatchScheduler {
 
         outcomes.mapIndexed { index, result ->
             result ?: outcome(items[index], ToolBatchStatus.BLOCKED, "Tool call was not scheduled")
+        }
+    }
+
+    /**
+     * Expands batch-POSITION references in each item's `dependsOn` into the call
+     * ids they name.
+     *
+     * A model can reference a sibling call by the id it produced itself on
+     * Anthropic and OpenAI Chat Completions. On two backends it cannot: Gemini
+     * synthesizes the id client-side (`GeminiProvider.kt:175`,
+     * `"gemini_${System.nanoTime()}"`) and the Responses API welds the provider's
+     * own ids together (`OpenAIProvider.kt:3325`, `"<call_id>|<item_id>"`), so
+     * neither value is knowable to the model — an id-only `depends_on` there is
+     * unrunnable, no matter how well the schema describes it. The model always
+     * knows the order in which it emitted the calls, so a bare integer names one:
+     * `"1"` is the first call of this batch, `"2"` the second, and so on. Every
+     * one of the four backends hands its calls to this scheduler in that same
+     * emission order (Anthropic at `content_block_stop`, Gemini in `parts` order,
+     * OpenAI Chat Completions in first-delta order, Responses at
+     * `response.output_item.done`).
+     *
+     * Exact ids win: a reference that already matches a call id in this batch is
+     * never reinterpreted as a position. A reference that is neither a known id
+     * nor an in-range position is kept verbatim, so the caller's existing
+     * "Unknown dependency tool call id" branch still fails it — an invalid
+     * dependency must never degrade into "no dependency", because silently
+     * dropping a requested ordering turns it into a race instead of an error.
+     */
+    private fun <T> resolveDependencyReferences(
+        items: List<ToolBatchItem<T>>,
+    ): List<ToolBatchItem<T>> {
+        val ids = items.map { it.id }
+        val knownIds = ids.toSet()
+        if (items.all { item -> item.dependsOn.all { it in knownIds } }) return items
+        return items.map { item ->
+            if (item.dependsOn.all { it in knownIds }) return@map item
+            val expanded = linkedSetOf<String>()
+            for (reference in item.dependsOn) {
+                if (reference in knownIds) {
+                    expanded += reference
+                    continue
+                }
+                val position = reference.trim().toIntOrNull()
+                expanded += position?.takeIf { it in 1..ids.size }?.let { ids[it - 1] } ?: reference
+            }
+            item.copy(dependsOn = expanded)
         }
     }
 

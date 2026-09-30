@@ -4,6 +4,7 @@ import java.io.File
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import org.junit.Assert.assertArrayEquals
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -24,6 +25,8 @@ class RuntimeTreeStoreTest {
         }
         assertFalse(failing.update { createRoot("new-root", RuntimeModelSnapshot("p", "m")) })
         assertArrayEquals(oldBytes, file.readBytes())
+        assertTrue(failing.snapshot().topology().nodes.any { it.id == "root" })
+        assertTrue(failing.snapshot().topology().nodes.none { it.id == "new-root" })
 
         val recovered = RuntimeTreeStore.openForTest(file) { source, target ->
             Files.move(source.toPath(), target.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
@@ -47,5 +50,26 @@ class RuntimeTreeStoreTest {
             Files.move(source.toPath(), target.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
         }
         assertTrue(recovered.snapshot().topology().nodes.any { it.id == "second" })
+    }
+
+    @Test
+    fun `runtime config and revision survive store reopen`() {
+        val dir = Files.createTempDirectory("runtime-tree-config").toFile()
+        val file = File(dir, "session-tree.json")
+        val replace: (File, File) -> Unit = { source, target ->
+            Files.move(source.toPath(), target.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+        }
+        val store = RuntimeTreeStore.openForTest(file, replaceFile = replace)
+        assertTrue(store.update {
+            createRoot("root", RuntimeModelSnapshot("p", "m"))
+            updateConfig(maxDepth = 1, maxParallelSubagents = 9, leaseMillis = 90_000L)
+        })
+        val expectedRevision = store.snapshot().configurationRevision()
+
+        val reopened = RuntimeTreeStore.openForTest(file, replaceFile = replace).snapshot()
+        assertEquals(1, reopened.config.maxDepth)
+        assertEquals(9, reopened.config.maxParallelSubagents)
+        assertEquals(90_000L, reopened.config.leaseMillis)
+        assertEquals(expectedRevision, reopened.configurationRevision())
     }
 }

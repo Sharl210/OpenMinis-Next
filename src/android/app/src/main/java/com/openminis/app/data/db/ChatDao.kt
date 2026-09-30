@@ -34,6 +34,18 @@ data class SessionMetaRow(
  * pattern as [SessionMetaRow] — keyword count varies per call, so the
  * WHERE clause is built dynamically and bound with positional args.
  */
+data class SessionTokenUsageRow(
+    @ColumnInfo(name = "session_id") val sessionId: String,
+    @ColumnInfo(name = "token_usage") val tokenUsage: String,
+)
+
+/** [T-android-topology-first-message] See `firstMessagesForSessions`. */
+data class SessionFirstMessageRow(
+    @ColumnInfo(name = "sessionId") val sessionId: String,
+    @ColumnInfo(name = "role") val role: String,
+    @ColumnInfo(name = "partsJson") val partsJson: String,
+)
+
 data class MessageSearchRow(
     @ColumnInfo(name = "session_id") val sessionId: String,
     val id: String,
@@ -95,6 +107,17 @@ interface ChatDao {
 
     @Query("SELECT COUNT(*) FROM sessions WHERE id IN (:ids)")
     suspend fun countSessions(ids: List<String>): Int
+
+    /**
+     * The subset of [ids] that still has a row.
+     *
+     * [deleteSessionSubtree] aborts the whole batch when a single id is unknown,
+     * and a subtree resolved from the runtime tree can contain nodes for
+     * sessions that never reached the database — so callers intersect with what
+     * actually exists before asking for the atomic delete.
+     */
+    @Query("SELECT id FROM sessions WHERE id IN (:ids)")
+    suspend fun existingSessionIds(ids: List<String>): List<String>
 
     @Query("DELETE FROM sessions WHERE id IN (:ids)")
     suspend fun deleteSessions(ids: List<String>): Int
@@ -255,10 +278,10 @@ interface ChatDao {
     suspend fun nextSortOrder(sessionId: String): Int
 
     @Query("DELETE FROM messages WHERE session_id = :sessionId")
-    suspend fun deleteMessages(sessionId: String)
+    suspend fun deleteMessages(sessionId: String): Int
 
     @Query("DELETE FROM messages WHERE session_id = :sessionId AND sort_order >= :keepCount")
-    suspend fun deleteMessagesAfter(sessionId: String, keepCount: Int)
+    suspend fun deleteMessagesAfter(sessionId: String, keepCount: Int): Int
 
     @Query("SELECT COUNT(*) FROM messages")
     suspend fun totalMessageCount(): Int
@@ -266,12 +289,47 @@ interface ChatDao {
     @Query("SELECT COUNT(*) FROM messages WHERE session_id IN (:ids)")
     suspend fun countMessagesForSessions(ids: List<String>): Int
 
+    /**
+     * [T-android-topology-first-message] The FIRST message of each of [sessionIds],
+     * as the topology graph's node body.
+     *
+     * The requirement is explicit that a node shows the opening line of the
+     * conversation it stands for — "就是这个节点所对应的对话内容的**第一条消息**"
+     * (request.md:37) — not a title, a model name, or the latest reply. The graph
+     * previously had no first-message data at all and fell back to a session title
+     * or the model id, so the box the user reads was showing something the
+     * requirement never asked for.
+     *
+     * `MIN(sort_order)` rather than `created_at` because `sort_order` is the
+     * authoritative display order (see [loadMessages]) and is assigned from a
+     * monotonic counter, so it cannot tie.
+     *
+     * `parts_json` is returned rather than pre-extracted text: only the caller
+     * holds the part-decoding helper, and duplicating that decoding in SQL would
+     * be a second definition of "what the message says".
+     */
+    @Query(
+        """
+        SELECT m.session_id AS sessionId, m.role AS role, m.parts_json AS partsJson
+        FROM messages m
+        WHERE m.session_id IN (:sessionIds)
+          AND m.sort_order = (SELECT MIN(sort_order) FROM messages WHERE session_id = m.session_id)
+        """,
+    )
+    suspend fun firstMessagesForSessions(sessionIds: List<String>): List<SessionFirstMessageRow>
+
     @Query("SELECT COUNT(*) FROM compact_markers WHERE session_id IN (:ids)")
     suspend fun countCompactMarkersForSessions(ids: List<String>): Int
 
 
     @Query("SELECT token_usage FROM messages WHERE session_id = :sessionId AND token_usage IS NOT NULL")
     suspend fun tokenUsages(sessionId: String): List<String>
+
+    @Query("SELECT session_id, token_usage FROM messages WHERE session_id IN (:sessionIds) AND token_usage IS NOT NULL")
+    fun observeTokenUsagesForSessions(sessionIds: List<String>): Flow<List<SessionTokenUsageRow>>
+
+    @Query("SELECT session_id, token_usage FROM messages WHERE session_id IN (:sessionIds) AND token_usage IS NOT NULL")
+    suspend fun tokenUsagesForSessions(sessionIds: List<String>): List<SessionTokenUsageRow>
 
     /**
      * Fetch all token usage records joined with session model_id for aggregation.
@@ -368,7 +426,7 @@ interface ChatDao {
     // but the kept assistant row itself needs its parts trimmed to before the
     // target tool_use — that's an UPDATE of an existing row, not a delete.
     @Query("UPDATE messages SET parts_json = :partsJson, updated_at = :updatedAt WHERE id = :id")
-    suspend fun updateMessageParts(id: String, partsJson: String, updatedAt: Long = System.currentTimeMillis())
+    suspend fun updateMessageParts(id: String, partsJson: String, updatedAt: Long = System.currentTimeMillis()): Int
 
     /** Replace one persisted human-user row without deleting later rows. */
     @Query("UPDATE messages SET parts_json = :partsJson, updated_at = :updatedAt WHERE id = :id AND role = 'user'")
@@ -404,10 +462,6 @@ interface ChatDao {
         )
     """)
     suspend fun updateLastAssistantError(sessionId: String, errorInfo: String?)
-
-    // Pinned sessions first, then by updated_at
-    @Query("SELECT * FROM sessions ORDER BY CASE WHEN pinned_at IS NOT NULL THEN 0 ELSE 1 END, pinned_at DESC, updated_at DESC")
-    fun observeSessionsSorted(): Flow<List<ChatSessionEntity>>
 
     // Compact markers — session-scoped archival summaries. "Append-only": rows
     // are never updated, only inserted and (on session delete) cascade-removed.

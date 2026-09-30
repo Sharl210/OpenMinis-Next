@@ -1,9 +1,11 @@
 package com.openminis.app.backup
 
 import com.openminis.app.backup.remote.RcloneBackendCatalog
+import com.openminis.app.backup.remote.RcloneRemoteStore
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -78,5 +80,52 @@ class RcloneBackendCatalogFieldsTest {
             assertEquals("$type should have one secret field", 1, secrets.size)
         }
         assertEquals("secret_access_key", fields("s3").first { it.isSecret }.key)
+    }
+
+    /**
+     * CONNECTIVITY: "which field is the secret" has exactly ONE answer, and the
+     * code that acts on it reads that answer instead of restating it.
+     *
+     * The failure this exists because of: the catalog declared the secret field
+     * per backend, while the two places that actually move a secret into the
+     * encrypted store carried their own inline copy of the same table
+     * (`if (backend == "s3") "secret_access_key" else "pass"`). Every assertion
+     * above walks `fields(...)` and stops there, so the copies could drift —
+     * and the `: "pass"` guess would send an S3 secret to the wrong rclone
+     * parameter, or a renamed secret field would be persisted in plaintext.
+     *
+     * [RcloneBackendCatalog.secretField] and [RcloneRemoteStore.secretKeyFor]
+     * are the two production lookups; this asserts both agree with the declared
+     * field for every backend, so a change on one side alone turns this red.
+     * The s3 name is spelled out rather than derived: it is a product fact
+     * (rclone's own parameter name), not a restatement of the lookup.
+     */
+    @Test
+    fun `the catalog is the only place that decides which field is the secret`() {
+        assertEquals("s3's secret is rclone's own parameter name", "secret_access_key", RcloneBackendCatalog.secretField("s3"))
+        for (type in listOf("smb", "webdav", "sftp", "s3", "ftp")) {
+            val declared = fields(type).single { it.isSecret }.key
+            assertEquals(
+                "secretField must name the field the form marks secret ($type)",
+                declared,
+                RcloneBackendCatalog.secretField(type),
+            )
+            assertEquals(
+                "the store must encrypt the field the form marks secret ($type)",
+                declared,
+                RcloneRemoteStore.secretKeyFor(type),
+            )
+        }
+    }
+
+    /**
+     * The fallback path, pinned on purpose: a backend string that is not in the
+     * catalog (a remote restored from another platform) must still get a key
+     * name, so its secret reaches the encrypted store instead of being dropped.
+     */
+    @Test
+    fun `an unknown backend still gets a usable secret key name`() {
+        assertNull(RcloneBackendCatalog.secretField("b2"))
+        assertEquals("pass", RcloneRemoteStore.secretKeyFor("b2"))
     }
 }

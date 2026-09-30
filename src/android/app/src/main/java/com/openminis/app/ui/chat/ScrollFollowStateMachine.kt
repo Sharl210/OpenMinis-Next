@@ -45,6 +45,16 @@ sealed interface ScrollFollowEvent {
 
     /** The collapsed conversation was reopened and should re-anchor at the end. */
     data object CollapseReopen : ScrollFollowEvent
+
+    /**
+     * The view's own position is parked at the end — however it got there.
+     *
+     * Deliberately separate from [UserDragStopped]: that one is sampled at
+     * finger-up, so a fling that lands on the end *after* the finger left would
+     * never re-arm following. The position is the authority for "back at the
+     * end", not the moment the gesture ended.
+     */
+    data object AtBottomReached : ScrollFollowEvent
 }
 
 /**
@@ -94,6 +104,7 @@ class ScrollFollowStateMachine(
         ScrollFollowEvent.Initial,
         is ScrollFollowEvent.ExplicitFollow,
         ScrollFollowEvent.CollapseReopen,
+        ScrollFollowEvent.AtBottomReached,
         -> ScrollFollowState.FOLLOWING
 
         ScrollFollowEvent.ExplicitPause -> ScrollFollowState.PAUSED_BY_USER
@@ -124,6 +135,7 @@ class ScrollFollowStateMachine(
         ScrollFollowEvent.ExplicitPause -> false
         is ScrollFollowEvent.ExplicitFollow,
         ScrollFollowEvent.CollapseReopen,
+        ScrollFollowEvent.AtBottomReached,
         -> true
     }
 }

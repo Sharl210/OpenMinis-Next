@@ -57,35 +57,45 @@ data class ContextPolicy(
          *   - `64K–128K` → offload + compact; headroom 10k for compact.
          *   - `≥128K`  → generous offload + compact; headroom 20k.
          */
-        fun forContextWindow(contextWindow: Int): ContextPolicy = when {
-            contextWindow < 32_000 -> ContextPolicy(
-                offloadThreshold = 0,
-                offloadTarget = 0,
-                compactThreshold = 0,
-                exhaustedOnly = true,
-                manualCompactAllowed = false,
-            )
-            contextWindow < 64_000 -> ContextPolicy(
-                offloadThreshold = contextWindow - 10_000,
-                offloadTarget = contextWindow - 15_000,
-                compactThreshold = 0,
-                exhaustedOnly = true,
-                manualCompactAllowed = true,
-            )
-            contextWindow < 128_000 -> ContextPolicy(
-                offloadThreshold = contextWindow - 20_000,
-                offloadTarget = contextWindow - 30_000,
-                compactThreshold = contextWindow - 10_000,
-                exhaustedOnly = false,
-                manualCompactAllowed = true,
-            )
-            else -> ContextPolicy(
-                offloadThreshold = contextWindow - 40_000,
-                offloadTarget = contextWindow - 60_000,
-                compactThreshold = contextWindow - 20_000,
-                exhaustedOnly = false,
-                manualCompactAllowed = true,
-            )
+        fun forContextWindow(
+            contextWindow: Int,
+            compactHeadroomTokens: Int? = null,
+        ): ContextPolicy {
+            val base = when {
+                contextWindow < 32_000 -> ContextPolicy(
+                    offloadThreshold = 0,
+                    offloadTarget = 0,
+                    compactThreshold = 0,
+                    exhaustedOnly = true,
+                    manualCompactAllowed = false,
+                )
+                contextWindow < 64_000 -> ContextPolicy(
+                    offloadThreshold = contextWindow - 10_000,
+                    offloadTarget = contextWindow - 15_000,
+                    compactThreshold = 0,
+                    exhaustedOnly = true,
+                    manualCompactAllowed = true,
+                )
+                contextWindow < 128_000 -> ContextPolicy(
+                    offloadThreshold = contextWindow - 20_000,
+                    offloadTarget = contextWindow - 30_000,
+                    compactThreshold = contextWindow - 10_000,
+                    exhaustedOnly = false,
+                    manualCompactAllowed = true,
+                )
+                else -> ContextPolicy(
+                    offloadThreshold = contextWindow - 40_000,
+                    offloadTarget = contextWindow - 60_000,
+                    compactThreshold = contextWindow - 20_000,
+                    exhaustedOnly = false,
+                    manualCompactAllowed = true,
+                )
+            }
+            if (base.compactThreshold == 0 || compactHeadroomTokens == null || compactHeadroomTokens <= 0) {
+                return base
+            }
+            val headroom = compactHeadroomTokens.coerceIn(4_000, (contextWindow / 4).coerceAtLeast(4_000))
+            return base.copy(compactThreshold = (contextWindow - headroom).coerceAtLeast(1))
         }
     }
 }

@@ -1,0 +1,27 @@
+<!doctype html>
+<!--
+  Hand-written approximation of the server-rendered bing.com/search layout.
+  NOT a captured page: it pins the parser's contract offline, including the `ck/a?…&u=a1<base64url>`
+  tracking-link form. See the adapter report for the honesty caveat about live markup.
+-->
+<html lang="zh-CN"><head><meta charset="utf-8"><title>kotlin - 搜索</title></head>
+<body>
+<ol id="b_results">
+  <li class="b_algo">
+    <h2><a href="https://jetbrains.com/idea/" h="ID=SERP,5123.1">IntelliJ IDEA &amp; Kotlin IDE</a></h2>
+    <div class="b_caption"><p class="b_lineclamp4 b_algoSlug">完整的 IDE 体验，内置 Kotlin 支持。</p></div>
+  </li>
+  <li class="b_algo b_algoBorder">
+    <h2><a href="https://www.bing.com/ck/a?!&amp;&amp;p=5f21a1b&amp;u=a1aHR0cHM6Ly93d3cuZXhhbXBsZS5vcmcva290bGluLWd1aWRl&amp;ntb=1">Kotlin 指南 - Example</a></h2>
+    <div class="b_caption"><p class="b_lineclamp2">用一个例子讲清 Kotlin 基础语法。</p></div>
+  </li>
+  <li class="b_algo">
+    <h2><a href="/search?q=kotlin+related&amp;form=QBRE">相关搜索</a></h2>
+    <div class="b_caption"><p>导航项，不应被当作结果。</p></div>
+  </li>
+  <li class="b_algo">
+    <h2><a href="https://example.net/docs?lang=zh">中文文档 - Example.net</a></h2>
+    <div class="b_caption"><p class="b_lineclamp4">中文版 API 文档。</p></div>
+  </li>
+</ol>
+</body></html>

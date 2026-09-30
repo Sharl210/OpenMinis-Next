@@ -19,6 +19,13 @@ data class BrowserActionInput(
     val userAgent: UserAgentProfile? = null,
     val maxDepth: Int? = null,
     val tabId: Int? = null,
+    /**
+     * Stable page identity (restore_tab). Deliberately NOT folded into
+     * [itemId]: that field means "history/bookmark entry", and overloading one
+     * field with two meanings is how the page-id and tab-id concepts drifted
+     * apart in the first place.
+     */
+    val pageId: String? = null,
     /** Viewport width override (set_viewport action). */
     val viewportWidth: Int? = null,
     /** Viewport height override (set_viewport action). */
@@ -70,6 +77,7 @@ data class BrowserActionInput(
                     userAgent = obj.optString("user_agent").ifEmpty { null }?.let { UserAgentProfile.fromString(it) },
                     maxDepth = if (obj.has("max_depth")) obj.optInt("max_depth") else null,
                     tabId = if (obj.has("tab_id")) obj.optInt("tab_id") else null,
+                    pageId = obj.optString("page_id").ifEmpty { null },
                     viewportWidth = if (obj.has("viewport_width")) obj.optInt("viewport_width") else null,
                     viewportHeight = if (obj.has("viewport_height")) obj.optInt("viewport_height") else null,
                     reset = obj.optBoolean("reset", false),

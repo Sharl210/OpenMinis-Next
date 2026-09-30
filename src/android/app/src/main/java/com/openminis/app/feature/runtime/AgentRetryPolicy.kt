@@ -90,3 +90,64 @@ class AgentRetryPolicy(
         return result
     }
 }
+
+/**
+ * The retry LOOP that every user-governed model call site runs its request
+ * through, so "how many times do we retry" has exactly one answer: the user's
+ * automatic-retry setting, carried by [policy].
+ *
+ * [T-android-retry-governs-title-and-compaction] Before this existed, only the
+ * agent main loop went through [AgentRetryPolicy]; session-title generation
+ * used a hardcoded budget of 3 and context compaction used its own recursion
+ * depth, so moving the retry slider in Settings changed nothing for either of
+ * them. Callers now build the policy/runner from the single settings mapping
+ * (`agentRetryPolicyFromSettings` / `agentRetryRunnerFromSettings`) and let
+ * this loop own the decision.
+ *
+ * [maxAttempts] mirrors the policy's own value (-1 always, 0 disabled, N>0
+ * retries) so a call site can log or reason about the budget without reaching
+ * back into the policy. [sleep] is injectable so tests do not wait out the
+ * backoff, and [onRetry] lets a call site surface progress.
+ *
+ * The loop is deliberately NOT responsible for degrading the REQUEST: it only
+ * re-issues the same one. A failure whose remedy is a smaller request must be
+ * handed up by [run]'s `failureOf` returning null (see compaction's halving
+ * layer) — repeating an identical oversized request can never succeed, and
+ * under `-1` (always) it would spin on it until the caller's own deadline.
+ */
+class AgentRetryRunner(
+    private val policy: AgentRetryPolicy,
+    val maxAttempts: Int,
+    private val sleep: suspend (Long) -> Unit = { kotlinx.coroutines.delay(it) },
+    private val onRetry: (attempt: Int, delayMillis: Long, failure: RuntimeFailure) -> Unit =
+        { _, _, _ -> },
+) {
+
+    /** Whether the policy considers [failure] worth repeating exactly as-is. */
+    fun isRetryable(failure: RuntimeFailure): Boolean = policy.isRetryable(failure)
+
+    /**
+     * Runs [block], re-attempting per [policy]. [failureOf] maps a thrown error
+     * to the [RuntimeFailure] the policy judges, or returns null to declare
+     * "this loop must not handle this one" and rethrow it immediately (the seam
+     * a caller uses to hand a failure to a different recovery layer).
+     * Cancellation is never retried and always propagates.
+     */
+    suspend fun <T> run(failureOf: (Throwable) -> RuntimeFailure?, block: suspend () -> T): T {
+        var attempt = 1
+        while (true) {
+            try {
+                return block()
+            } catch (cancellation: kotlinx.coroutines.CancellationException) {
+                throw cancellation
+            } catch (error: Exception) {
+                val failure = failureOf(error) ?: throw error
+                val decision = policy.decide(attempt, failure)
+                if (!decision.shouldRetry) throw error
+                onRetry(attempt, decision.delayMillis, failure)
+                if (decision.delayMillis > 0L) sleep(decision.delayMillis)
+                attempt = decision.nextAttempt ?: (attempt + 1)
+            }
+        }
+    }
+}

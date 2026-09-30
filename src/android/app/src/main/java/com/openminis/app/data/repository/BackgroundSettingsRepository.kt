@@ -22,7 +22,13 @@ class BackgroundSettingsRepository(context: Context) {
         context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
     private val _taskNotificationsEnabled =
-        MutableStateFlow(prefs.getBoolean(KEY_TASK_NOTIFICATIONS, DEFAULT_TASK_NOTIFICATIONS))
+        MutableStateFlow(
+            if (prefs.contains("background_notifications_enabled")) {
+                prefs.getBoolean("background_notifications_enabled", DEFAULT_TASK_NOTIFICATIONS)
+            } else {
+                prefs.getBoolean(KEY_TASK_NOTIFICATIONS, DEFAULT_TASK_NOTIFICATIONS)
+            }
+        )
 
     /**
      * Live state of the toggle. Compose surfaces collect this so flipping
@@ -84,10 +90,51 @@ class BackgroundSettingsRepository(context: Context) {
         prefs.edit().putInt(KEY_BG_OVERLAY_X, x).putInt(KEY_BG_OVERLAY_Y, y).apply()
     }
 
+    /**
+     * [T-android-config-prefs-mismatch-background] Out-of-band writers — most
+     * importantly `minis-config set background.notifications`, which writes the
+     * SharedPreferences file directly — never call the setters above. The
+     * StateFlows were seeded once at construction, so such a write would be
+     * accepted (`ok: true`) while every consumer kept reading the cached value
+     * until the process restarted: `BackgroundTaskNotifier` and
+     * `ConfigConfirmNotifier` gate on `taskNotificationsEnabled.value`, and the
+     * Settings switch collects it.
+     *
+     * That is the second half of the same defect: binding the right key makes
+     * the STORED value correct, and this listener makes it take effect live.
+     *
+     * Scoped to the task-notification key this fix targets.
+     * `backgroundOverlayEnabled` / `dynamicIslandEnabled` have the identical
+     * out-of-band gap; they are a separate decision and are deliberately left
+     * alone here. The listener is held in a field on purpose — the platform
+     * stores listeners weakly.
+     */
+    private val prefsListener = object : SharedPreferences.OnSharedPreferenceChangeListener {
+        override fun onSharedPreferenceChanged(
+            sharedPreferences: SharedPreferences?,
+            key: String?,
+        ) {
+            if (key == KEY_TASK_NOTIFICATIONS) {
+                _taskNotificationsEnabled.value =
+                    prefs.getBoolean(KEY_TASK_NOTIFICATIONS, DEFAULT_TASK_NOTIFICATIONS)
+            }
+        }
+    }
+
+    init {
+        prefs.registerOnSharedPreferenceChangeListener(prefsListener)
+    }
+
     companion object {
-        private const val PREFS_NAME = "background_settings"
-        private const val KEY_TASK_NOTIFICATIONS = "taskNotificationsEnabled"
-        private const val DEFAULT_TASK_NOTIFICATIONS = true
+        // [T-android-config-prefs-mismatch-background] `internal`, not `private`:
+        // ConfigBuiltins' `background.notifications` field binds to THESE symbols
+        // (and the test asserts against them). Hand-typing the file name or the key
+        // there is exactly what made `minis-config set background.notifications
+        // false` a silent no-op — it wrote `background_notifications_enabled` into
+        // this same file while every reader below uses `taskNotificationsEnabled`.
+        internal const val PREFS_NAME = "background_settings"
+        internal const val KEY_TASK_NOTIFICATIONS = "taskNotificationsEnabled"
+        internal const val DEFAULT_TASK_NOTIFICATIONS = true
         private const val KEY_BG_OVERLAY_ENABLED = "backgroundOverlayEnabled"
         private const val KEY_BG_OVERLAY_X = "backgroundOverlayX"
         private const val KEY_BG_OVERLAY_Y = "backgroundOverlayY"

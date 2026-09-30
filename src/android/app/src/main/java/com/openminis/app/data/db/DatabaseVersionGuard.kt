@@ -50,7 +50,11 @@ object DatabaseVersionGuard {
      * agree, so they cannot drift apart silently — a stale copy here would
      * either disable the guard or trip it on every launch.
      */
-    const val CODE_DB_VERSION = 13
+    // [T-android-thinking-level-persist] Bumped with @Database(version = 14):
+    // leaving it at 13 would NOT fail silently — it would make the guard read a
+    // healthy v14 file as "from a newer build" and park every launch on the
+    // downgrade guidance screen (and DatabaseVersionGuardTest fails first).
+    const val CODE_DB_VERSION = 14
 
     /** Filename must match the one passed to `Room.databaseBuilder`. */
     private const val DB_NAME = "minis.db"
@@ -78,26 +82,6 @@ object DatabaseVersionGuard {
     }
 
     /**
-     * True when the on-disk database is newer than this build supports, i.e.
-     * the user has downgraded and Room may be unable to open it.
-     *
-     * Note this returns true even when a no-op downgrade migration WOULD have
-     * handled it. That is intentional for versions we cannot vouch for: see
-     * [isHandledDowngrade].
-     */
-    fun isFromNewerBuild(context: Context): Boolean {
-        val onDisk = readOnDiskVersion(context) ?: return false
-        val newer = onDisk > CODE_DB_VERSION
-        if (newer) {
-            AppLogger.warning(
-                TAG,
-                "database is from a newer build: onDisk=$onDisk code=$CODE_DB_VERSION",
-            )
-        }
-        return newer
-    }
-
-    /**
      * Whether a registered downgrade migration covers this jump, in which case
      * the app can open the database normally and the guidance screen is
      * unnecessary.
@@ -107,6 +91,12 @@ object DatabaseVersionGuard {
      * optimistically opened — being wrong in that direction costs the user a
      * screen they can dismiss by upgrading; being wrong the other way costs
      * them a crash.
+     *
+     * Note the raw fact "onDisk > CODE_DB_VERSION" is BROADER than the launch
+     * decision: for a handled downgrade it is true while [evaluate] still
+     * returns [Decision.PROCEED]. Gate the guidance screen on [evaluate], never
+     * on that comparison alone, or this handled case regresses to a guidance
+     * screen the user cannot dismiss.
      */
     fun isHandledDowngrade(onDiskVersion: Int): Boolean =
         onDiskVersion == 12 && CODE_DB_VERSION == 11

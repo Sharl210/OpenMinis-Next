@@ -535,7 +535,7 @@ private fun ColumnScope.ApiKeyConfigSection(
                     IconButton(onClick = { showApiKeyPlaintext = !showApiKeyPlaintext }) {
                         Icon(
                             if (showApiKeyPlaintext) Icons.Default.VisibilityOff else Icons.Default.Visibility,
-                            contentDescription = if (showApiKeyPlaintext) "Hide" else "Show",
+                            contentDescription = if (showApiKeyPlaintext) stringResource(R.string.common_hide) else stringResource(R.string.common_show),
                         )
                     }
                 },

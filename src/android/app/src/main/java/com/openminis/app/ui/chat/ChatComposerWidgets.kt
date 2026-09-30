@@ -359,7 +359,7 @@ internal fun AttachmentChip(
         ) {
             Icon(
                 Icons.Default.Close,
-                contentDescription = "Remove",
+                contentDescription = stringResource(R.string.common_remove),
                 tint = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f),
                 modifier = Modifier.size(13.dp),
             )
@@ -424,8 +424,9 @@ internal fun MicButton(
     ) {
         Icon(
             if (isVoiceActive) Icons.Default.Keyboard else Icons.Default.Mic,
-            contentDescription = if (isVoiceActive) "Switch to keyboard"
-            else if (isRecording) "Stop recording" else "Voice input",
+            contentDescription = if (isVoiceActive) stringResource(R.string.chat_composer_switch_to_keyboard)
+            else if (isRecording) stringResource(R.string.chat_composer_stop_recording)
+            else stringResource(R.string.chat_composer_voice_input),
             tint = tint,
             modifier = Modifier.size(20.dp),
         )
@@ -495,7 +496,7 @@ private fun ToolPreviewThumbnail(
                 val command = extractShellCommand(args, block)
                 Column(modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp)) {
                     Text(
-                        text = "$ $command",
+                        text = "$ ${shellCommandText(command)}",
                         fontSize = 7.sp,
                         lineHeight = 8.sp,
                         fontWeight = FontWeight.Bold,
@@ -567,8 +568,8 @@ private fun ToolPreviewThumbnail(
                 val rawName = if (path.contains("/")) path.substringAfterLast("/") else path
                 val header = when {
                     rawName.isNotEmpty() -> rawName
-                    block.toolName == "file_write" -> "Write file"
-                    else -> "Read file"
+                    block.toolName == "file_write" -> stringResource(R.string.chat_tool_write_file)
+                    else -> stringResource(R.string.chat_tool_read_file)
                 }
                 val displayText = if (block.toolName == "file_write") {
                     args.optString("content", "")
@@ -666,7 +667,7 @@ private fun ToolPreviewThumbnail(
                 if (bmp != null) {
                     Image(
                         bitmap = bmp.asImageBitmap(),
-                        contentDescription = "Read image",
+                        contentDescription = stringResource(R.string.chat_attachment_read_image),
                         contentScale = ContentScale.Crop,
                         modifier = Modifier.fillMaxSize(),
                     )
@@ -709,7 +710,7 @@ private fun ToolPreviewThumbnail(
                 if (bitmap != null) {
                     Image(
                         bitmap = bitmap.asImageBitmap(),
-                        contentDescription = "Browser screenshot",
+                        contentDescription = stringResource(R.string.common_browser_screenshot),
                         contentScale = ContentScale.Crop,
                         modifier = Modifier.fillMaxSize(),
                     )
@@ -890,7 +891,7 @@ internal fun FloatingToolStatusBar(
                 ) {
                     Icon(
                         Icons.Default.ChevronLeft,
-                        contentDescription = "Previous",
+                        contentDescription = stringResource(R.string.common_previous),
                         tint = if (currentIndex > 0) MaterialTheme.colorScheme.onSurface
                                else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.25f),
                         modifier = Modifier
@@ -910,7 +911,7 @@ internal fun FloatingToolStatusBar(
                     )
                     Icon(
                         Icons.Default.ChevronRight,
-                        contentDescription = "Next",
+                        contentDescription = stringResource(R.string.common_next),
                         tint = if (currentIndex < toolBlocks.lastIndex) MaterialTheme.colorScheme.onSurface
                                else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.25f),
                         modifier = Modifier

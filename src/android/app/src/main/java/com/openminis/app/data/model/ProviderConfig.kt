@@ -23,7 +23,7 @@ enum class ProviderType(val displayName: String) {
     // provider silently cost the user every provider in the package,
     // credentials included.
     //
-    // Declared but not offered: `addableProviderTypes` in AddProviderScreen is
+    // Declared but not offered: `providerDisplayOrder` in AddProviderScreen is
     // a curated list, so these never appear as something the user can create
     // here; they arrive only from an iOS package or a newer build.
 
@@ -57,9 +57,23 @@ enum class ProviderType(val displayName: String) {
 
     /**
      * [T-android-provider-type-parity] True for types this build can decode and
-     * display but cannot actually drive a request with. Callers that need a
-     * working provider must check this rather than assuming every enum case is
-     * usable.
+     * display but cannot actually drive a request with.
+     *
+     * THIS is the single source for that classification; every other place that
+     * has to know it is a call to this predicate, not a restated list. The
+     * enforcement point is ProviderFactory.create, which refuses a
+     * !isUsable instance before building anything (iOS throws FactoryError at
+     * the same place).
+     *
+     * What deliberately does NOT read this: the per-type `when` tables that map
+     * a type to a color/icon/base-URL/voice-provider (AddProviderScreen,
+     * ChatModelPickerSheet, ModelEntryPicker, ProviderRepository.refreshModels,
+     * the debug RPC surface, VoiceProviderFactory). Those are not copies of
+     * this judgement — they are exhaustive `when`s over the enum, so the
+     * compiler forces a new case to be answered in each of them, and their
+     * values differ per type (VoiceProviderFactory returns null for kimiCode,
+     * which IS usable, so its list is a different concept that happens to
+     * include these two).
      */
     val isUsable: Boolean
         get() = when (this) {
@@ -269,37 +283,65 @@ data class ProviderInstance(
      * pointing at a third-party OpenAI/Anthropic-compatible endpoint (custom
      * base URL set): local gateways, ollama, LM Studio, LiteLLM and many
      * relay deployments require no key, and forcing a dummy one is friction.
+     *
      * Deliberately NOT extended to official endpoints (no custom base URL —
      * an empty key against the official API is always a misconfiguration) or
-     * OAuth instances (their credential is the token). Mirrors iOS
-     * `ProviderInstance.allowsEmptyAPIKey`; Android has no `openAIResponses`
-     * type — the `useResponsesAPI` flag rides on `.openAI`, so the type gate
-     * is just {openAI, anthropic}.
+     * OAuth instances (their credential is the token): the load-bearing guard
+     * is `!customBaseURL.isNullOrBlank()`, so widening the TYPE gate can never
+     * reach an official host. Mirrors iOS `ProviderInstance.allowsEmptyAPIKey`.
+     *
+     * The type gate is {openAI, openAIResponses, anthropic}. `openAIResponses`
+     * belongs in it because it IS `.openAI` with the Responses endpoint forced
+     * on — iOS spells the same thing `forceResponsesAPI`, and this very class
+     * models it as `useResponsesAPI`. It was left out only because this
+     * property was written while the type did not exist here yet, and a KDoc
+     * claiming "Android has no `openAIResponses` type" outlived the type being
+     * added. The user-visible consequence was that an instance restored from
+     * an iOS package (which carries this type) was rejected as misconfigured
+     * for a configuration this app accepts under the equivalent
+     * `.openAI` + `useResponsesAPI` spelling.
      */
     val allowsEmptyAPIKey: Boolean
         get() = credentialType == ProviderCredential.apiKey &&
             !customBaseURL.isNullOrBlank() &&
-            (providerType == ProviderType.openAI || providerType == ProviderType.anthropic)
+            (providerType == ProviderType.openAI ||
+                providerType == ProviderType.openAIResponses ||
+                providerType == ProviderType.anthropic)
 
     /**
      * [T-android-image-endpoint-mode] Whether the "Image Generation" endpoint
      * picker is surfaced for this instance. Mirrors iOS
-     * `supportsImageEndpointSetting`. Android has no `openAIResponses` provider
-     * type — an OpenAI instance carries the `useResponsesAPI` flag instead, so
-     * the gate is just the three OpenAI-compatible types.
+     * `supportsImageEndpointSetting`.
+     *
+     * The gate is the OpenAI-compatible types {openAI, openAIResponses,
+     * openRouter, xAI}. `openAIResponses` is `.openAI` with the Responses
+     * endpoint forced on — the same provider, so it must not lose a UI
+     * capability its equivalent `.openAI` instance keeps; excluding it only
+     * ever meant "the type did not exist here when this was written".
      */
     val supportsImageEndpointSetting: Boolean
         get() = providerType == ProviderType.openAI ||
+            providerType == ProviderType.openAIResponses ||
             providerType == ProviderType.openRouter ||
             providerType == ProviderType.xAI
 
     /**
      * [T-android-azure-openai] Whether the Azure toggle applies to this
-     * instance — only OpenAI instances using an API key (Azure auths with an
-     * api-key header). Covers both Chat-Completions and Responses formats since
-     * Android models Responses as the `useResponsesAPI` flag on an openAI
-     * instance rather than a separate provider type. Mirrors iOS
-     * supportsAzureMode.
+     * instance — OpenAI instances using an API key (Azure auths with an
+     * api-key header). Covers both Chat-Completions and Responses formats:
+     * [ProviderInstance.useResponsesAPI] selects the format, not the provider.
+     * Mirrors iOS `supportsAzureMode`.
+     *
+     * KNOWN GAP, stated rather than implied: the gate is `.openAI` ONLY, so an
+     * instance restored from iOS carrying [ProviderType.openAIResponses] — the
+     * same provider with the Responses endpoint forced on — does not get the
+     * Azure toggle, although ProviderFactory drives it identically (`isAzure` /
+     * `azureBase` are passed on that branch too). Unlike [allowsEmptyAPIKey]
+     * and [supportsImageEndpointSetting], which were aligned with the type the
+     * moment the type existed, this one is left as-is pending a product
+     * decision: Azure's deployments-path routing on a Responses instance has
+     * not been exercised against a real endpoint. Do not "fix" it by copying
+     * the other two gates without that verification.
      */
     val supportsAzureMode: Boolean
         get() = providerType == ProviderType.openAI && credentialType == ProviderCredential.apiKey

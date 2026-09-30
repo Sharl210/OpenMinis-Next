@@ -94,7 +94,11 @@ class EmptyKeyRefreshTest {
     @Test
     fun `non OpenAI-compatible families are not covered`() {
         // Gemini and OpenRouter authenticate differently and have no
-        // keyless self-hosted story; the gate stays {openAI, anthropic}.
+        // keyless self-hosted story; the type gate stays
+        // {openAI, openAIResponses, anthropic}. The Responses spelling is in
+        // because it IS `.openAI` with the endpoint forced on — see
+        // ProviderInstanceGateParityTest, which pins the two spellings to the
+        // same verdict.
         for (type in listOf(ProviderType.gemini, ProviderType.openRouter)) {
             assertFalse(
                 "expected $type to require a key",
@@ -102,5 +106,20 @@ class EmptyKeyRefreshTest {
                     .allowsEmptyAPIKey,
             )
         }
+    }
+
+    /**
+     * The iOS-restore shape: an instance carrying the `openAIResponses` type
+     * against a self-hosted relay. Before the type gate was widened, this
+     * answered false while the equivalent `.openAI` + `useResponsesAPI=true`
+     * instance answered true, so "can I chat with my keyless local server"
+     * depended on which spelling the package happened to carry.
+     */
+    @Test
+    fun `an iOS-restored Responses instance against a keyless relay is valid`() {
+        assertTrue(
+            instance(ProviderType.openAIResponses, ProviderCredential.apiKey, "http://192.168.1.10:8080/v1")
+                .allowsEmptyAPIKey,
+        )
     }
 }

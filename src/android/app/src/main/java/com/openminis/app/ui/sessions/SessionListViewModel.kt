@@ -5,6 +5,8 @@ import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
+import com.openminis.app.R
+import com.openminis.app.data.SessionDeletionRetryStore
 import com.openminis.app.data.db.ChatSessionEntity
 import com.openminis.app.data.db.FolderEntity
 import com.openminis.app.data.model.LLMMessage
@@ -12,11 +14,19 @@ import com.openminis.app.data.model.ThinkingLevel
 import com.openminis.app.data.model.ActualModelRequestSnapshot
 import com.openminis.app.data.model.ModelRole
 import com.openminis.app.data.model.ModelRoleSelectionResolver
+import com.openminis.app.data.model.ModelEntry
+import com.openminis.app.data.model.ModelGroup
+import com.openminis.app.data.model.RoutingStrategy
 import com.openminis.app.data.repository.ChatRepository
 import com.openminis.app.data.repository.ProviderRepository
+import com.openminis.app.feature.runtime.AgentRetryRunner
+import com.openminis.app.feature.runtime.RuntimeSessionCoordinator
 import com.openminis.app.logging.AppLogger
+import com.openminis.app.provider.LLMProvider
 import com.openminis.app.provider.ProviderFactory
-import com.openminis.app.ui.chat.ChatViewModelStore
+import com.openminis.app.ui.chat.ChatViewModel
+import com.openminis.app.ui.settings.AgentBehaviorSettingsPrefs
+import com.openminis.app.ui.settings.agentRetryRunnerFromSettings
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -31,6 +41,168 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
+
+/**
+ * [R11-F1] The ladder of candidate models a title request may walk, in order.
+ *
+ * Priority: dedicated title sub-model (the configured title entry, else
+ * `defaultSubGroupId`'s first available member) > the session's own bound model
+ * > every other eligible model. Before this existed the sub-model was ignored
+ * here, so users who configured a cheap/fast title model still paid for the
+ * primary on the manual Regenerate path.
+ *
+ * [RoutingStrategy] is read here and nowhere else on this path. The walk used
+ * to cross provider and group boundaries freely (`allVisibleEntries()` is the
+ * whole app) and `continue` to the next provider on any failure — exactly the
+ * failover `RoutingStrategy.none` exists to forbid (`request.md:21`: 「用户选
+ * 的哪一个，他就是一直用哪一个，他不做任何的容灾处理」). The rule is
+ * positional: whichever member the walk has reached, it may not move PAST a
+ * member whose group is `none`. An entry in no group is unconstrained — no
+ * group, no promise.
+ *
+ * [subEntry] is resolved by
+ * [com.openminis.app.data.repository.ProviderRepository.resolveTitleSubEntry]
+ * because that needs the credential-aware group filter; everything else here is
+ * pure.
+ *
+ * Top-level (not a private member) so production code and the JVM tests call
+ * the SAME function.
+ */
+internal fun titleCandidateLadderIn(
+    entries: List<ModelEntry>,
+    groups: List<ModelGroup>,
+    sessionModelId: String?,
+    subEntry: ModelEntry?,
+): List<ModelEntry> {
+    // T334: filter out non-text-output models (tts/voiceclone/voicedesign/
+    // image/video/audio-only) and models whose id obviously names a non-chat
+    // capability — they either reject the chat/completions schema with HTTP 400
+    // or stream nothing useful, masking the real result with a misleading
+    // "Param Incorrect" tail error.
+    val titleEligible = entries.filter { entry ->
+        val outs = entry.model.outputModalities
+        val outputsText = outs == null || outs.isEmpty() || outs.contains("text")
+        val idLower = entry.model.id.lowercase()
+        val nonChatId = listOf(
+            "tts", "voiceclone", "voicedesign", "embedding", "embed-", "whisper", "image", "video",
+        ).any { idLower.contains(it) }
+        outputsText && !nonChatId
+    }
+    // The sub-entry must pass the same T334 modality filter; when no sub-group
+    // is configured / all members disabled it is null and we fall through to
+    // the existing primary-first ordering.
+    val sub = subEntry?.takeIf { candidate -> titleEligible.any { it == candidate } }
+    val primary = titleEligible.firstOrNull { it.model.id == sessionModelId }
+        ?.takeIf { it != sub }
+    val ladder = listOfNotNull(sub, primary) +
+        titleEligible.filter { it != sub && it != primary }
+    val pinnedAt = ladder.indexOfFirst { candidate ->
+        groups.firstOrNull { candidate.id in it.memberEntryIds }?.strategy == RoutingStrategy.none
+    }
+    return if (pinnedAt >= 0) ladder.take(pinnedAt + 1) else ladder
+}
+
+/** What one walk of a title ladder came to. */
+internal sealed class TitleLadderOutcome {
+    /** A model produced a usable title; the caller persists it. */
+    data class Written(
+        val entry: ModelEntry,
+        val title: String,
+        val category: String?,
+    ) : TitleLadderOutcome()
+
+    /**
+     * The wall clock fired and the walk stopped. Reachable only under an
+     * unbounded (`-1`) budget, which cannot exhaust itself; stopping the whole
+     * walk rather than restarting the clock per candidate is what keeps the
+     * deadline from being multiplied by the candidate count.
+     */
+    data class Deadline(val entry: ModelEntry) : TitleLadderOutcome()
+
+    /** Every candidate failed, or answered without a title. */
+    data class NoTitle(val lastErrorSimpleName: String?) : TitleLadderOutcome()
+}
+
+/**
+ * [R26①] One title dispatch: walk [ladder] in order and return the first usable
+ * title.
+ *
+ * `request.md:120` puts title generation under the user's automatic-retry
+ * setting and does not scope that to the *automatic* path — a title request the
+ * user triggers by hand is the same request. This path used to call
+ * `provider.sendMessage` exactly once, so the retry slider had no effect on it
+ * and a transient 503 lost the title outright. Each candidate now goes through
+ * the same composition as the auto-title path: [runnerFor] supplies the
+ * user's settings → runner mapping, and the dispatch is bounded by the same wall
+ * clock, which is the only thing that keeps an `always` (`-1`) budget finite.
+ *
+ * [runnerFor] is called once per candidate so each candidate gets its own
+ * budget; only the deadline ends the walk.
+ *
+ * Top-level (not a private member) so production code and the JVM tests call the
+ * SAME function.
+ */
+internal suspend fun dispatchTitleOverLadderIn(
+    ladder: List<ModelEntry>,
+    origin: String,
+    prompt: String,
+    systemPrompt: String,
+    runnerFor: (ModelEntry) -> AgentRetryRunner,
+    providerFor: suspend (ModelEntry) -> LLMProvider?,
+    parse: (String) -> Pair<String, String?>,
+    // Same ceiling the auto-title path applies, from the one definition of it.
+    timeoutMs: Long = ChatViewModel.TITLE_GEN_TIMEOUT_MS,
+    onInfo: (String) -> Unit = {},
+    onWarn: (String) -> Unit = {},
+): TitleLadderOutcome {
+    var lastError: Exception? = null
+    for (entry in ladder) {
+        val provider = providerFor(entry) ?: continue
+        onInfo("dispatch origin=$origin model=${entry.model.id}")
+        // T334: reasoning models burn the entire token budget on hidden
+        // thinking before emitting any content. With maxTokens=100 every
+        // reasoning candidate returned `finish_reason=length` with empty text,
+        // then the loop silently moved on. Give reasoning models a real budget
+        // (1024) so they can finish thinking and still emit the JSON title.
+        val titleMaxTokens = if (entry.model.supportsReasoning == true) 2048 else 100
+        val response = try {
+            ChatViewModel.generateTitleUnderDeadline(
+                provider = provider,
+                prompt = prompt,
+                systemPrompt = systemPrompt,
+                maxTokens = titleMaxTokens,
+                runner = runnerFor(entry),
+                timeoutMs = timeoutMs,
+                // Observable on purpose: a deadline that abandons the request
+                // silently is how a failed title becomes invisible.
+                onDeadline = { timeoutMs ->
+                    onWarn("outcome=deadline-exceeded after ${timeoutMs}ms model=${entry.model.id}")
+                },
+            )
+        } catch (cancellation: kotlinx.coroutines.CancellationException) {
+            // Never swallowed and never retried: a cancelled scope must stop the
+            // walk, not advance it to the next candidate.
+            throw cancellation
+        } catch (e: Exception) {
+            lastError = e
+            onWarn("candidate-failed model=${entry.model.id} ${e.javaClass.simpleName}: ${e.message}")
+            // Continue to the next candidate on rate-limit / provider error.
+            continue
+        }
+        if (response == null) return TitleLadderOutcome.Deadline(entry)
+        val (title, category) = parse(response.text)
+        if (title.isNotEmpty()) return TitleLadderOutcome.Written(entry, title, category)
+        // T334: this empty-result path used to be silent — only the *last*
+        // failing candidate's exception got reported, masking budget exhaustion
+        // on reasoning models. Surface it explicitly so logs show the real cause.
+        onWarn(
+            "empty model=${entry.model.id} stopReason=${response.stopReason} " +
+                "textLen=${response.text.length} maxTokens=$titleMaxTokens " +
+                "supportsReasoning=${entry.model.supportsReasoning}",
+        )
+    }
+    return TitleLadderOutcome.NoTitle(lastError?.javaClass?.simpleName)
+}
 
 @OptIn(FlowPreview::class)
 class SessionListViewModel(
@@ -386,26 +558,96 @@ class SessionListViewModel(
         isSelecting.value = false
     }
 
-    fun deleteSelected() {
-        val ids = selectedIds.value.toList()
-        viewModelScope.launch {
-            ids.forEach {
-                chatRepository.deleteSession(it)
-                ChatViewModelStore.release(it)
-                // [T-android-session-paused-badge] Drop badges for the
-                // deleted session so persisted PAUSED entries don't leak
-                // forever in SharedPreferences.
-                com.openminis.app.service.SessionBadgeStore.clear(it)
+    /**
+     * Delete the conversations in [rootIds] **and every sub-agent conversation
+     * derived from them**.
+     *
+     * A sub-agent session exists only because an ancestor conversation spawned
+     * it, so removing the ancestor alone left orphan rows behind in this very
+     * list: the chat table has no parent column (`ChatSessionEntity` carries no
+     * parent id), and the only place the link exists is the runtime tree. The
+     * delete set is therefore resolved from one topology snapshot (see
+     * [resolveSessionSubtreeDeletionPlan]) and the runtime nodes go away in the
+     * same pass, so the tree never keeps a node pointing at a conversation that
+     * no longer exists.
+     *
+     * All three entry points — single ([deleteSession]), selection
+     * ([deleteSelected]) and group ([deleteFolderWithSessions]) — funnel through
+     * here, so a future entry point cannot quietly delete only one row.
+     */
+    private suspend fun deleteSessionSubtrees(rootIds: Collection<String>) {
+        val requested = rootIds.map { it.trim() }.filter { it.isNotEmpty() }.distinct()
+        if (requested.isEmpty()) return
+        // File/Room work: keep it off the main thread (the retry ledger, the media
+        // tree and the runtime tree are all file-backed).
+        withContext(Dispatchers.IO) {
+            val retryStore = SessionDeletionRetryStore.open(context)
+            // Ids an earlier attempt left unfinished are worked on again here.
+            // They have to be roots of *this* resolution, not just entries in the
+            // ledger: their chat rows may already be gone, so only re-reading the
+            // live topology can still find the descendants that were missed.
+            val roots = (requested + retryStore.ids()).distinct()
+            val topology = runCatching { RuntimeSessionCoordinator.open(context).topologySnapshot().nodes }
+            if (topology.isFailure) {
+                // Without the runtime tree the descendant conversations are
+                // unknowable — and deleting the conversations themselves at that
+                // point would strand their sub-agents as orphans with nothing left
+                // to name them, which is the defect this exists to fix. So the
+                // delete does not run at all: nothing is removed, no row is
+                // dropped, and the user can simply try again. Never a silent
+                // partial delete.
+                AppLogger.warning(
+                    TAG,
+                    "subtree delete aborted: runtime topology unreadable " +
+                        "(${topology.exceptionOrNull()?.message}); nothing was deleted",
+                )
+                return@withContext
+            }
+            val nodes = topology.getOrDefault(emptyList())
+            if (nodes.isEmpty() && runtimeTreeFileHasContent(context)) {
+                // The tree file holds data but the coordinator reported no nodes:
+                // the read degraded (a malformed tree is swallowed by the store).
+                // Deleting the conversations then would remove the only rows that
+                // name their sub-agents, turning recoverable orphans into
+                // unreachable ones. Say so instead of pretending the delete was
+                // recursive; the delete itself still runs, because a corrupt
+                // runtime tree is a separate failure the user must not be blocked
+                // by (and the roots being deletable is what they asked for).
+                AppLogger.warning(
+                    TAG,
+                    "subtree delete: runtime topology reported no nodes although the tree file is " +
+                        "non-empty; sub-agent conversations of ${roots.size} conversation(s) could " +
+                        "not be resolved and may survive as orphans",
+                )
+            }
+            val plan = runCatching {
+                resolveSessionSubtreeDeletionPlan(chatRepository, nodes, roots)
+            }.getOrElse { error ->
+                AppLogger.warning(TAG, "subtree delete: delete set unresolved: ${error.message}")
+                return@withContext
+            }
+            val outcome = sessionSubtreeDeletionPipeline(
+                context = context,
+                chatRepository = chatRepository,
+                retryStore = retryStore,
+            ).run(plan)
+            if (!outcome.success) {
+                Log.w(TAG, "Subtree cleanup incomplete: ${outcome.outstanding.filterValues { it.isNotEmpty() }}")
             }
         }
+    }
+
+    fun deleteSelected() {
+        val ids = selectedIds.value.toList()
         clearSelection()
+        viewModelScope.launch {
+            deleteSessionSubtrees(ids)
+        }
     }
 
     fun deleteSession(id: String) {
         viewModelScope.launch {
-            chatRepository.deleteSession(id)
-            ChatViewModelStore.release(id)
-            com.openminis.app.service.SessionBadgeStore.clear(id)
+            deleteSessionSubtrees(listOf(id))
         }
     }
 
@@ -717,11 +959,7 @@ class SessionListViewModel(
     fun deleteFolderWithSessions(folderId: String) {
         viewModelScope.launch {
             val memberIds = chatRepository.sessionIdsInFolder(folderId)
-            for (id in memberIds) {
-                chatRepository.deleteSession(id)
-                ChatViewModelStore.release(id)
-                com.openminis.app.service.SessionBadgeStore.clear(id)
-            }
+            deleteSessionSubtrees(memberIds)
             chatRepository.dissolveFolder(folderId)
             // Just drop the dead id — do NOT use expandOnly here. The folder no
             // longer exists, so there is nothing to expand; re-deriving the set
@@ -831,9 +1069,23 @@ class SessionListViewModel(
                 // turn) the last user + last assistant, each truncated to 200
                 // chars — so a regenerated title reflects a mid/late topic shift
                 // rather than only the opener.
-                val userMessages = messages.filter { it.role == "user" }
-                // Keep the untruncated first user message for the fallback path.
-                firstUserRaw = userMessages.firstOrNull()?.let { extractText(it.partsJson) }
+                // [T-android-human-turn-count-parity] Select the first HUMAN turn
+                // that carries usable text, not "the first row with role=user".
+                //
+                // The old `firstOrNull { role == "user" }` could pick a synthetic
+                // row — a tool injection or the `<system-reminder>` resume entry,
+                // both written with the API's `user` role — and title the session
+                // after harness plumbing. It also gave up when that row's text
+                // was blank: an *image-only* opening turn extracted to "" and this
+                // function returned false, so the session stayed "New Chat" even
+                // though later turns had plenty to name it after. Use the shared
+                // rule behind `provenance`/`hasHumanTurnContent` instead.
+                val humanTurns = messages.filter { isHumanTurnEntity(it) }
+                val nonEmptyText = humanTurns
+                    .map { it to extractText(it.partsJson) }
+                    .filter { (_, text) -> text.isNotBlank() }
+                // Keep the untruncated first such message for the fallback path.
+                firstUserRaw = nonEmptyText.firstOrNull()?.second
                 val userText = firstUserRaw?.take(200) ?: return false
                 // First/last assistant *text* message — skip tool-only messages
                 // whose extracted text is blank so the summary carries real prose.
@@ -841,8 +1093,8 @@ class SessionListViewModel(
                     .map { extractText(it.partsJson) }
                     .filter { it.isNotBlank() }
                 val firstAssistantText = assistantTexts.firstOrNull()?.take(200) ?: ""
-                val hasMultipleUserTurns = userMessages.size > 1
-                val lastUserText = if (hasMultipleUserTurns) userMessages.lastOrNull()?.let { extractText(it.partsJson) }?.take(200) ?: "" else ""
+                val hasMultipleUserTurns = nonEmptyText.size > 1
+                val lastUserText = if (hasMultipleUserTurns) nonEmptyText.lastOrNull()?.second?.take(200) ?: "" else ""
                 val lastAssistantText = if (hasMultipleUserTurns) assistantTexts.lastOrNull()?.take(200) ?: "" else ""
 
                 val prompt = buildString {
@@ -857,145 +1109,99 @@ class SessionListViewModel(
                     append(com.openminis.app.ui.chat.titleLanguageDirective())
                 }
 
-                // Build candidate list: session's model first, then all others.
-                // T334: filter out non-text-output models (tts/voiceclone/voicedesign/image/video/audio-only)
-                // and models whose id obviously names a non-chat capability — they either reject the
-                // chat/completions schema with HTTP 400 or stream nothing useful, masking the real result
-                // with a misleading "Param Incorrect" tail error.
-                val allEntries = providerRepository.allVisibleEntries()
-                val titleEligible = allEntries.filter { entry ->
-                    val outs = entry.model.outputModalities
-                    val outputsText = outs == null || outs.isEmpty() || outs.contains("text")
-                    val idLower = entry.model.id.lowercase()
-                    val nonChatId = listOf("tts", "voiceclone", "voicedesign", "embedding", "embed-", "whisper", "image", "video")
-                        .any { idLower.contains(it) }
-                    outputsText && !nonChatId
-                }
                 // [T-android-regenerate-title-submodel] Priority: dedicated
                 // title sub-model (defaultSubGroupId's first enabled member) >
                 // session's bound primary model > every other eligible model.
                 // Aligns the manual Regenerate path with the auto-title path
-                // (ChatViewModel.resolveTitleProvider) and iOS resolveSubEntry —
-                // previously the sub-model was ignored here, so users who
-                // configured a cheap/fast title model still paid for the primary.
-                // The sub-entry must pass the same T334 modality filter; when no
-                // sub-group is configured / all members disabled it's null and we
-                // fall through to the existing primary-first ordering.
-                val explicitTitle = ModelRoleSelectionResolver.explicitTitleEntry(providerRepository.config.value)
-                val subEntry = (explicitTitle ?: providerRepository.resolveTitleSubEntry())
-                    ?.takeIf { sub -> titleEligible.any { it == sub } }
-                val primary = titleEligible.firstOrNull { it.model.id == session.modelId }
-                    ?.takeIf { it != subEntry }
-                val candidates = (listOfNotNull(subEntry, primary) +
-                    titleEligible.filter { it != subEntry && it != primary })
+                // (ChatViewModel.resolveTitleProvider) and iOS resolveSubEntry.
+                // The ordering, the T334 modality filter and the [R11-F1]
+                // RoutingStrategy gate live in titleCandidateLadderIn, so the
+                // tests call the same function production calls.
+                val config = providerRepository.config.value
+                val subEntry = ModelRoleSelectionResolver.explicitTitleEntry(config)
+                    ?: providerRepository.resolveTitleSubEntry()
+                val candidates = titleCandidateLadderIn(
+                    entries = providerRepository.allVisibleEntries(),
+                    groups = config.modelGroups,
+                    sessionModelId = session.modelId,
+                    subEntry = subEntry,
+                )
 
-                var lastError: Exception? = null
-                for (entry in candidates) {
-                    val instance = providerRepository.instance(entry.providerInstanceId) ?: continue
-                    // [T-android-keyless-provider-selection] usableApiKey —
-                    // see the note in runGroupSuggestion above.
-                    var apiKey = providerRepository.usableApiKey(instance) ?: continue
-
-                    // Refresh OAuth token if needed
-                    if (instance.credentialType == com.openminis.app.data.model.ProviderCredential.oauth) {
-                        try {
-                            val manager = com.openminis.app.auth.OAuthManager.forInstance(context, instance)
-                            val freshToken = manager?.validAccessToken()
-                            if (freshToken != null && freshToken != apiKey) {
-                                providerRepository.saveApiKey(instance.id, freshToken)
-                                apiKey = freshToken
-                            }
-                        } catch (e: Exception) {
-                            Log.w(TAG, "OAuth refresh failed: ${e.message}")
-                        }
-                    }
-
-                    val provider = try {
-                        ProviderFactory.create(instance, apiKey, entry.model, context)
-                    } catch (e: Exception) {
-                        Log.w(TAG, "Provider creation failed for ${entry.model.displayName}: ${e.message}")
-                        continue
-                    }
-
-                    AppLogger.info(
-                        "TitleGen",
-                        "dispatch origin=$origin session=${id.take(8)} model=${entry.model.id}",
-                    )
-
-                    try {
-                        // T334: reasoning models burn the entire token budget on hidden thinking
-                        // before emitting any content. With maxTokens=100 every reasoning candidate
-                        // returned `finish_reason=length` with empty text, then the loop silently
-                        // moved on. Give reasoning models a real budget (1024) so they can finish
-                        // thinking and still emit the JSON title.
-                        val titleMaxTokens = if (entry.model.supportsReasoning == true) 2048 else 100
-                        // [T-android-titlegen-reasoning] Explicitly disable
-                        // thinking (thinkingLevel = OFF), matching iOS
-                        // callSubModelForTitle and the auto-title path. The
-                        // provider's injectThinkingParams honors OFF (e.g.
-                        // DeepSeek V4 → {"thinking":{"type":"disabled"}}), so a
-                        // reasoning model doesn't spend the budget on hidden
-                        // thinking; the T334 maxTokens bump above stays as a
-                        // safety net for models where OFF is a no-op (Qwen3).
-                        val response = provider.sendMessage(
-                            messages = listOf(LLMMessage(role = LLMMessage.Role.USER, content = prompt)),
-                            // [T-android-titlegen-systemprompt-unify] Shared with
-                            // the auto path via TITLE_GEN_SYSTEM_PROMPT (iOS-aligned
-                            // wording). Passed bare — AnthropicProvider handles the
-                            // OAuth Claude Code prefix at the provider layer.
-                            systemPrompt = providerRepository.titlePrompt
-                                ?.takeIf { it.isNotBlank() }
-                                ?: com.openminis.app.ui.chat.TITLE_GEN_SYSTEM_PROMPT,
-                            maxTokens = titleMaxTokens,
-                            // [T-android-titlegen-temperature] null (not 0.3) so
-                            // buildRequestBody omits the field — the gpt-5.x
-                            // family only accepts temperature=1 and 400s on any
-                            // other value, which would silently skip that
-                            // candidate. Aligns with the auto-title path and iOS
-                            // AIChatViewModel.swift:11244.
-                            temperature = null,
-                            thinkingLevel = ThinkingLevel.OFF,
-                        )
-                        val (title, category) = parseTitleResponse(response.text)
-                        if (title.isNotEmpty()) {
-                            val providerType = providerRepository.instance(entry.providerInstanceId)?.providerType?.name
-                            if (providerType != null) {
-                                chatRepository.updateSessionTitleAndCategoryWithModelSnapshot(
-                                    id, title, category, entry.id, entry.model.id,
-                                    entry.model.displayName, providerType, System.currentTimeMillis(),
+                // [R26①] Title generation is governed by the user's
+                // automatic-retry setting on every entry point, this manual one
+                // included — request.md:120 does not scope it to the automatic
+                // path. Same settings → runner mapping as the agent loop and the
+                // auto-title path; a fresh runner per candidate so each gets the
+                // user's full budget, and the shared wall clock so `-1` (always)
+                // stays finite.
+                val titleRetrySettings = AgentBehaviorSettingsPrefs(context).load()
+                val outcome = dispatchTitleOverLadderIn(
+                    ladder = candidates,
+                    origin = origin,
+                    prompt = prompt,
+                    // [T-android-titlegen-systemprompt-unify] ONE selector, shared
+                    // with the auto path
+                    // (ChatViewModel.generateSessionTitleIfNeeded), so an edited
+                    // prompt (request.md:246) reaches both instead of only the one
+                    // whose copy was updated. Passed bare — AnthropicProvider
+                    // handles the OAuth Claude Code prefix at the provider layer.
+                    systemPrompt = com.openminis.app.ui.chat
+                        .effectiveTitleSystemPrompt(providerRepository.titlePrompt),
+                    runnerFor = {
+                        agentRetryRunnerFromSettings(
+                            titleRetrySettings,
+                            onRetry = { attempt, delayMillis, failure ->
+                                AppLogger.info(
+                                    "TitleGen",
+                                    "retry ${attempt + 1} after ${delayMillis}ms " +
+                                        "(user setting: autoRetry=${titleRetrySettings.autoRetryEnabled}, " +
+                                        "maxRetryAttempts=${titleRetrySettings.maxRetryAttempts}; " +
+                                        "${failure.code})",
                                 )
-                            } else {
-                                chatRepository.updateSessionTitleAndCategory(id, title, category)
-                            }
-                            AppLogger.info(
-                                "TitleGen",
-                                "outcome=set origin=$origin session=${id.take(8)} " +
-                                    "model=${entry.model.id} elapsedMs=${System.currentTimeMillis() - startedAt}",
-                            )
-                            return true
-                        }
-                        // T334: previously this empty-result path was silent — only the *last*
-                        // failing candidate's exception got reported, masking budget exhaustion
-                        // on reasoning models. Surface it explicitly so logs show the real cause.
-                        Log.w(
-                            TAG,
-                            "Title regen empty from ${entry.model.displayName}: " +
-                                "stopReason=${response.stopReason} textLen=${response.text.length} " +
-                                "maxTokens=$titleMaxTokens supportsReasoning=${entry.model.supportsReasoning}",
+                            },
                         )
-                    } catch (e: Exception) {
-                        lastError = e
-                        Log.w(TAG, "Title regen via ${entry.model.displayName} failed: ${e.message}")
-                        // Continue to next candidate on rate-limit / provider error
-                        continue
+                    },
+                    providerFor = { entry -> titleProviderFor(entry) },
+                    parse = { parseTitleResponse(it) },
+                    onInfo = { AppLogger.info("TitleGen", "$it session=${id.take(8)}") },
+                    onWarn = { Log.w(TAG, "Title regen session=${id.take(8)} $it") },
+                )
+                when (outcome) {
+                    is TitleLadderOutcome.Written -> {
+                        val entry = outcome.entry
+                        val providerType = providerRepository.instance(entry.providerInstanceId)?.providerType?.name
+                        // [R55②] The write itself lives in `writeLadderTitle` (same
+                        // package), so the model this row is credited to is EXECUTED
+                        // by a JVM test against a real `ChatRepository` instead of
+                        // being read out of this file's text.
+                        writeLadderTitle(
+                            chatRepository = chatRepository,
+                            sessionId = id,
+                            entry = entry,
+                            title = outcome.title,
+                            category = outcome.category,
+                            providerType = providerType,
+                        )
+                        AppLogger.info(
+                            "TitleGen",
+                            "outcome=set origin=$origin session=${id.take(8)} " +
+                                "model=${entry.model.id} elapsedMs=${System.currentTimeMillis() - startedAt}",
+                        )
+                        return true
                     }
+                    is TitleLadderOutcome.Deadline -> AppLogger.warning(
+                        "TitleGen",
+                        "outcome=deadline origin=$origin session=${id.take(8)} " +
+                            "model=${outcome.entry.model.id} " +
+                            "elapsedMs=${System.currentTimeMillis() - startedAt}",
+                    )
+                    is TitleLadderOutcome.NoTitle -> AppLogger.warning(
+                        "TitleGen",
+                        "outcome=no-title origin=$origin session=${id.take(8)} " +
+                            "reason=all-candidates-exhausted lastError=${outcome.lastErrorSimpleName} " +
+                            "elapsedMs=${System.currentTimeMillis() - startedAt}",
+                    )
                 }
-            AppLogger.warning(
-                "TitleGen",
-                "outcome=no-title origin=$origin session=${id.take(8)} " +
-                    "reason=all-candidates-exhausted lastError=${lastError?.javaClass?.simpleName} " +
-                    "elapsedMs=${System.currentTimeMillis() - startedAt}",
-            )
         } catch (e: Exception) {
             AppLogger.warning(
                 "TitleGen",
@@ -1008,6 +1214,48 @@ class SessionListViewModel(
         // session must never be left permanently untitled just because the LLM
         // was unreachable.
         return applyFallbackTitle(id, firstUserRaw, origin)
+    }
+
+    /**
+     * Resolve a usable provider for one ladder entry, or null when the
+     * candidate must be skipped.
+     *
+     * Moved out of the ladder body verbatim so that
+     * [dispatchTitleOverLadderIn] can stay free of Android/Context and be
+     * driven by a JVM test; the OAuth refresh and [ProviderFactory] wiring are
+     * the only parts that genuinely need the app context.
+     *
+     * [T-android-keyless-provider-selection] `usableApiKey` — see the note in
+     * `runGroupSuggestion` above.
+     */
+    private suspend fun titleProviderFor(entry: ModelEntry): LLMProvider? {
+        val instance = providerRepository.instance(entry.providerInstanceId) ?: return null
+        var apiKey = providerRepository.usableApiKey(instance) ?: return null
+
+        // Refresh OAuth token if needed
+        if (instance.credentialType == com.openminis.app.data.model.ProviderCredential.oauth) {
+            try {
+                val manager = com.openminis.app.auth.OAuthManager.forInstance(context, instance)
+                val freshToken = manager?.validAccessToken()
+                if (freshToken != null && freshToken != apiKey) {
+                    providerRepository.saveApiKey(instance.id, freshToken)
+                    apiKey = freshToken
+                }
+            } catch (cancellation: kotlinx.coroutines.CancellationException) {
+                throw cancellation
+            } catch (e: Exception) {
+                Log.w(TAG, "OAuth refresh failed: ${e.message}")
+            }
+        }
+
+        return try {
+            ProviderFactory.create(instance, apiKey, entry.model, context)
+        } catch (cancellation: kotlinx.coroutines.CancellationException) {
+            throw cancellation
+        } catch (e: Exception) {
+            Log.w(TAG, "Provider creation failed for ${entry.model.displayName}: ${e.message}")
+            null
+        }
     }
 
     /**
@@ -1036,18 +1284,15 @@ class SessionListViewModel(
             )
             return false
         }
-        val entry = ModelRoleSelectionResolver.explicitTitleEntry(providerRepository.config.value)
-            ?: providerRepository.resolveTitleSubEntry()
-            ?: providerRepository.config.value.modelEntries.firstOrNull { it.model.id == chatRepository.getSession(id)?.modelId }
-        val providerType = entry?.let { providerRepository.instance(it.providerInstanceId)?.providerType?.name }
-        if (entry != null && providerType != null) {
-            chatRepository.updateSessionTitleAndCategoryWithModelSnapshot(
-                id, cleaned, null, entry.id, entry.model.id, entry.model.displayName,
-                providerType, System.currentTimeMillis(),
-            )
-        } else {
-            chatRepository.updateSessionTitle(id, cleaned)
-        }
+        // NO model attribution here, on purpose. `cleaned` comes from
+        // `fallbackTitleFrom(firstUserRaw)` — the title is the user's own words,
+        // truncated. This function is reached precisely BECAUSE every candidate
+        // provider was skipped (no instance, no usable key, or provider creation
+        // threw), so no model ran at all: writing `entry.id` / `entry.model.id`
+        // into the session row named a model that never produced anything. Same
+        // defect class as the guard inside `ChatViewModel.titleSnapshot`, on the
+        // one other write path that had no guard.
+        chatRepository.updateSessionTitle(id, cleaned)
         // Length only — never the prompt text itself.
         AppLogger.info(
             "TitleGen",
@@ -1080,8 +1325,21 @@ class SessionListViewModel(
         return if (cleaned.length > 30) cleaned.take(30).trimEnd() + "…" else cleaned
     }
 
-    private fun extractText(partsJson: String): String {
-        return try {
+    /**
+     * [T-android-human-turn-count-parity] Is this DB row a human turn?
+     *
+     * Delegates to the one shared rule ([MessagePartsCodec.hasHumanTurnContent]),
+     * the same one the UI uses through `ChatMessage.countsAsHumanTurn()`. Title
+     * generation has to agree with the transcript and with the retry/delete
+     * cut-offs about what a human turn is; when those drifted, synthetic rows
+     * (tool results, `<system-reminder>` resume entries) were treated as the
+     * user's opening message.
+     */
+    private fun isHumanTurnEntity(entity: com.openminis.app.data.db.MessageEntity): Boolean =
+        entity.role == "user" &&
+            com.openminis.app.data.model.MessagePartsCodec.hasHumanTurnContent(entity.partsJson)
+
+    private fun extractText(partsJson: String): String {        return try {
             val arr = org.json.JSONArray(partsJson)
             (0 until arr.length()).mapNotNull { i ->
                 val obj = arr.getJSONObject(i)
@@ -1137,7 +1395,10 @@ class SessionListViewModel(
             val messages = chatRepository.loadMessages(id)
             val newSession = chatRepository.createSession(
                 modelId = session.modelId,
-                title = "${session.title ?: "Chat"} (Copy)",
+                title = context.getString(
+                    R.string.session_copy_title,
+                    session.title ?: context.getString(R.string.session_untitled_title),
+                ),
             )
             for (msg in messages) {
                 chatRepository.appendMessage(

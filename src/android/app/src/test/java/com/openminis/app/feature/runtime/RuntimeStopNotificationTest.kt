@@ -109,7 +109,13 @@ class RuntimeStopNotificationTest {
         tree.createChild("root", "child", RuntimeModelSnapshot("p", "child")).getOrThrow(); tree.start("child")
         assertTrue(tree.abort("root", abnormal = true, reason = "parent failed")); assertEquals(null, tree.claimNextNotification("root"))
         assertTrue(tree.abort("child", abnormal = false))
-        assertEquals("child_abnormal_stop", tree.claimNextNotification("root")?.taskIntent?.let { org.json.JSONObject(it).getString("kind") })
+        // [T-android-stop-request-kind] `abnormal = false` IS the deliberate-stop
+        // verdict (ABORTED, not ABNORMAL_INTERRUPTION) — it is what `abort` is called
+        // with on the requested-stop and subtree-purge paths. The kind therefore says
+        // "on request" rather than "abnormal", which is the point of the distinction:
+        // the two cases used to share one kind because a deliberate stop and a crash
+        // both report `completedNormally = false`.
+        assertEquals("child_stopped_by_request", tree.claimNextNotification("root")?.taskIntent?.let { org.json.JSONObject(it).getString("kind") })
         assertEquals(false, tree.complete("root")); assertEquals(null, tree.claimNextNotification("root"))
     }
 }

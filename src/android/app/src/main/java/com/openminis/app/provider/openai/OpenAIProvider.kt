@@ -1299,7 +1299,24 @@ class OpenAIProvider private constructor(
                     if (inlineError != null) {
                         val code = inlineError.optInt("code", 0)
                         val msg = inlineError.optString("message", "Unknown SSE error")
-                        val err = mapHttpError(code, event.toString())
+                        // [T-android-DIAG-248] An SSE-level error has no HTTP
+                        // response of its own: the HTTP layer already returned 2xx,
+                        // and `code` above comes out of the event's JSON, not off a
+                        // status line. So `statusCode` stays null and
+                        // `responseHeaders` stays empty on purpose — filling in
+                        // `response.code` (a 200) would report success as the
+                        // failure code, which is worse than reporting nothing.
+                        // The error body, however, IS in hand, so report it: without
+                        // it the parent receives an abnormal-stop notice with no
+                        // text at all to triage.
+                        val err = mapHttpError(
+                            code,
+                            event.toString(),
+                            com.openminis.app.data.model.LLMRequestDiagnostics(
+                                errorResponse = event.toString(),
+                                debugInfo = "OpenAI SSE inline error code=$code",
+                            ),
+                        )
                         throw err
                     }
                     val choices = event.optJSONArray("choices")
@@ -1719,7 +1736,24 @@ class OpenAIProvider private constructor(
                     "OpenAIProvider",
                     "[ModelUseRoute] images/generations HTTP $statusCode body=${responseBody.take(300)}",
                 )
-                throw mapHttpError(statusCode, responseBody)
+                // [T-android-DIAG-248] Carry the diagnostics this route already
+                // holds. A bare `mapHttpError(code, body)` made an abnormal-stop
+                // report from a failed image generation reach the parent with no
+                // status code, no error body and no response headers, while the
+                // chat and the other providers reported all three.
+                // `headers` is a final immutable field and `Response.close()`
+                // only closes the body, so reading it after the close above is sound.
+                throw mapHttpError(
+                    statusCode,
+                    responseBody,
+                    com.openminis.app.data.model.LLMRequestDiagnostics(
+                        statusCode = statusCode,
+                        responseHeaders = response.headers.names().associateWith { response.headers[it] ?: "" },
+                        errorResponse = responseBody,
+                        requestBody = bodyStr,
+                        debugInfo = "OpenAI images/generations HTTP $statusCode",
+                    ),
+                )
             }
 
             val json = try {
@@ -1843,7 +1877,22 @@ class OpenAIProvider private constructor(
                     "OpenAIProvider",
                     "[ModelUseRoute] images/edits HTTP $statusCode body=${responseBody.take(300)}",
                 )
-                throw mapHttpError(statusCode, responseBody)
+                // [T-android-DIAG-248] Same gap as images/generations above, same
+                // fix. `requestBody` is deliberately omitted here: this route
+                // sends multipart/form-data (with the reference images inline)
+                // and never materialises it as a string, so there is nothing
+                // honest to put in it — `providerFailureStopReport` then falls
+                // back to the child's prompt, as it does for any non-HTTP stop.
+                throw mapHttpError(
+                    statusCode,
+                    responseBody,
+                    com.openminis.app.data.model.LLMRequestDiagnostics(
+                        statusCode = statusCode,
+                        responseHeaders = response.headers.names().associateWith { response.headers[it] ?: "" },
+                        errorResponse = responseBody,
+                        debugInfo = "OpenAI images/edits HTTP $statusCode",
+                    ),
+                )
             }
 
             val json = try {

@@ -40,6 +40,9 @@ import com.openminis.app.ui.settings.AddCustomModelScreen
 import com.openminis.app.ui.settings.AgentBehaviorSettingsScreen
 import com.openminis.app.ui.settings.AgentBehaviorSettingsPrefs
 import com.openminis.app.ui.settings.AgentBehaviorSettings
+import com.openminis.app.ui.settings.WorkStepDisplay
+import com.openminis.app.ui.settings.DefaultSendStrategy
+import com.openminis.app.feature.runtime.RuntimeSessionCoordinator
 import com.openminis.app.feature.runtime.RoundInjectionSettings
 import com.openminis.app.feature.runtime.RoundInjectionSettingsPrefs
 import com.openminis.app.ui.settings.RoundInjectionSettingsScreen
@@ -85,6 +88,7 @@ import com.openminis.app.sandbox.RootfsManager
 import com.openminis.app.sandbox.TerminalSession
 import com.openminis.app.ui.terminal.TerminalScreen
 import com.openminis.app.ui.onboarding.OnboardingModelSelectionScreen
+import com.openminis.app.R
 
 // T342: Material 3 motion easing curves. Compose-Material3 (1.3.x) ships
 // `MotionScheme` only in 1.4-alpha; mirror the spec values directly so we
@@ -616,6 +620,70 @@ fun AppNavigation(
             )
         }
 
+        composable(Routes.AGENT_BEHAVIOR) {
+            val context = LocalContext.current
+            val prefs = remember { AgentBehaviorSettingsPrefs(context) }
+            var settings by remember { mutableStateOf(prefs.load()) }
+            fun update(next: AgentBehaviorSettings) {
+                if (prefs.save(next)) {
+                    settings = next
+                } else {
+                    android.widget.Toast.makeText(
+                        context,
+                        context.getString(R.string.agent_behavior_save_failed),
+                        android.widget.Toast.LENGTH_SHORT,
+                    ).show()
+                }
+            }
+            fun updateRuntimeLimits(next: AgentBehaviorSettings) {
+                val coordinator = RuntimeSessionCoordinator.open(context)
+                val previous = settings
+                if (!coordinator.applyAgentBehaviorSettings(next.recursionDepth, next.parallelAgentLimit)) {
+                    android.widget.Toast.makeText(
+                        context,
+                        context.getString(R.string.agent_behavior_runtime_save_failed),
+                        android.widget.Toast.LENGTH_SHORT,
+                    ).show()
+                    return
+                }
+                if (prefs.save(next)) {
+                    settings = next
+                    return
+                }
+                val rolledBack = coordinator.applyAgentBehaviorSettings(
+                    previous.recursionDepth,
+                    previous.parallelAgentLimit,
+                )
+                android.widget.Toast.makeText(
+                    context,
+                    if (rolledBack) context.getString(R.string.agent_behavior_save_rolled_back)
+                    else context.getString(R.string.agent_behavior_save_failed_both),
+                    android.widget.Toast.LENGTH_LONG,
+                ).show()
+            }
+            AgentBehaviorSettingsScreen(
+                onBack = { navController.safePopBackStack() },
+                workStepDisplay = settings.workStepDisplay,
+                onWorkStepDisplayChange = { update(settings.copy(workStepDisplay = it)) },
+                recursionDepth = settings.recursionDepth,
+                onRecursionDepthChange = { updateRuntimeLimits(settings.copy(recursionDepth = it)) },
+                parallelAgentLimit = settings.parallelAgentLimit,
+                onParallelAgentLimitChange = { updateRuntimeLimits(settings.copy(parallelAgentLimit = it)) },
+                defaultSendStrategy = settings.defaultSendStrategy,
+                onDefaultSendStrategyChange = { update(settings.copy(defaultSendStrategy = it)) },
+                compactThresholdTokens = settings.compactThresholdTokens,
+                onCompactThresholdTokensChange = { update(settings.copy(compactThresholdTokens = it)) },
+                autoRetryEnabled = settings.autoRetryEnabled,
+                onAutoRetryEnabledChange = { update(settings.copy(autoRetryEnabled = it)) },
+                maxRetryAttempts = settings.maxRetryAttempts,
+                onMaxRetryAttemptsChange = { update(settings.copy(maxRetryAttempts = it)) },
+                webSearchMaxResults = settings.webSearchMaxResults,
+                onWebSearchMaxResultsChange = { update(settings.copy(webSearchMaxResults = it)) },
+                webRequestTimeoutMs = settings.webRequestTimeoutMs,
+                onWebRequestTimeoutMsChange = { update(settings.copy(webRequestTimeoutMs = it)) },
+            )
+        }
+
         composable(Routes.ROUND_INJECTION) {
             val context = LocalContext.current
             val prefs = remember { RoundInjectionSettingsPrefs(context) }
@@ -855,7 +923,7 @@ fun AppNavigation(
                         // add time, so this is a defensive fallback.
                         android.widget.Toast.makeText(
                             context,
-                            "Mount path unavailable",
+                            context.getString(R.string.nav_mount_path_unavailable),
                             android.widget.Toast.LENGTH_SHORT,
                         ).show()
                     }
@@ -1063,7 +1131,7 @@ fun AppNavigation(
                     // the opaque /data/user/0/.../minis-sessions/<sid>/... host path.
                     FilePreviewHolder.fileBrowserViewModel = FileBrowserViewModel(
                         rootPath = java.io.File(rootPath),
-                        rootLabel = "Session Files",
+                        rootLabel = context.getString(R.string.nav_session_files),
                         displayLinuxPrefix = "/var/minis",
                     )
                     navController.safeNavigate(Routes.FILE_BROWSER)

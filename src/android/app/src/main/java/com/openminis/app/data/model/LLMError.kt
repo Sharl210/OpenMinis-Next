@@ -19,17 +19,13 @@ sealed class LLMError(message: String, cause: Throwable? = null, val diagnostics
     class Cancelled : LLMError("Request was cancelled")
     class Unknown(cause: Throwable?, diagnostics: LLMRequestDiagnostics? = null) : LLMError("Unknown error: ${cause?.message}", cause, diagnostics)
 
-    val isNetworkError: Boolean get() = this is NetworkError
-    val isRetryable: Boolean get() = this is NetworkError || this is TransientError
-    val isFallbackable: Boolean get() = this is RateLimited || this is InvalidApiKey || this is ProviderError
-    val fallbackReason: String get() = when (this) {
-        is RateLimited -> "Rate limited"
-        is InvalidApiKey -> "Invalid API key"
-        is ProviderError -> "Provider error"
-        is TransientError -> "Transient error"
-        is NetworkError -> "Network error"
-        is DecodingError -> "Decoding error"
-        is Cancelled -> "Cancelled"
-        is Unknown -> "Unknown error"
-    }
+    // Retry / fallback predicates deliberately do NOT live here. They look like
+    // one question but are two, with different answers, and both are decided at
+    // the call site where the full context exists (status code, provider detail,
+    // and the user's strategy):
+    //   - "would repeating the SAME request plausibly succeed?" →
+    //     ChatViewModel.runtimeFailureFor
+    //   - "should this request fall back to another model?" →
+    //     the fallback loop's shouldFallback, which is also gated by the user's
+    //     FallbackStrategy (where `none` is a hard no-fallback switch).
 }

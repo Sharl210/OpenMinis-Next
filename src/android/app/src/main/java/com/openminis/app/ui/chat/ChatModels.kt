@@ -167,6 +167,19 @@ data class ChatMessage(
     // Explicit UI provenance is independent from the API role. Rows written by
     // older builds have no marker and therefore remain UNKNOWN.
     val provenance: MessageProvenance = MessageProvenance.UNKNOWN,
+    // [T-android-r37-system-row] Verbatim injected text of a row the app
+    // synthesised on the API's `user` role (see [isAppSystemRow]), carried for
+    // DISPLAY ONLY.
+    //
+    // `content` deliberately stays stripped, and that is load-bearing: a
+    // reminder-only row persists no human text, and `content` is what
+    // [countsAsHumanTurn], title generation and the retry / delete / rewind
+    // anchors read. Putting the raw `<system-reminder>` there would make
+    // harness plumbing count as a human turn and shift every cut-off by one.
+    // The raw text rides here instead, so the neutral system row can show the
+    // injection verbatim behind a tap while the model-facing bytes, the DB row
+    // and the turn counting all stay exactly as they are.
+    val injectedSystemText: String? = null,
     // Every DB row id this UI message represents — usually a single id,
     // but consecutive assistant turns get merged in `loadSessionMessages`
     // and the merged bubble carries every source row's id here. Phase
@@ -255,6 +268,137 @@ data class ChatMessage(
 internal fun ChatMessage.isManualHumanUser(): Boolean =
     role == "user" && provenance == MessageProvenance.MANUAL_USER
 
+/**
+ * [T-android-r37-system-row] Does this row belong to the app layer's SYSTEM
+ * class while riding the API's `user` role?
+ *
+ * R37 splits the transcript into three classes — system / assistant / human —
+ * and this is the class test for the first one on the data side. The wire
+ * protocol has only two roles, so the app synthesises some rows on the USER
+ * side: the `<system-reminder>` re-entries written by `resume()` and by the
+ * delegated-child abnormal-end report (TOOL_INJECTION), and — defensively —
+ * anything stamped SYSTEM_CARD. None of them is the human's own words or the
+ * assistant's reply, so the transcript must draw them as a neutral system row
+ * and never as a user bubble.
+ *
+ * Deliberately an ALLOW-LIST of system provenances, never
+ * `provenance != MANUAL_USER`: every row written before provenance existed
+ * carries UNKNOWN and those rows ARE the human's own text, so a negative test
+ * would silently move every legacy human turn into the system class.
+ *
+ * Display only. The row still IS a `user` role message, is still persisted
+ * unchanged and is still sent to the provider verbatim.
+ */
+internal fun ChatMessage.isAppSystemRow(): Boolean =
+    role == "user" && provenance in APP_SYSTEM_PROVENANCES
+
+/**
+ * [T-android-r37-system-row] The provenances that mean "the app wrote this row
+ * and no human turn happened" for DISPLAY classification.
+ *
+ * One set, two readers: [isAppSystemRow] (which sees a whole ChatMessage) and the
+ * DB→UI mapping in ChatViewModel (which only has `role` + provenance in hand).
+ * Keeping them on one value is what stops the transcript filter and the row
+ * builder from disagreeing about which rows are system rows.
+ */
+internal val APP_SYSTEM_PROVENANCES = setOf(
+    MessageProvenance.TOOL_INJECTION,
+    MessageProvenance.SYSTEM_CARD,
+)
+
+/**
+ * [T-android-r37-system-row] Will this message be drawn as the human's bubble?
+ *
+ * Used by [buildFlatChatItems] to decide the "back-to-back user sends" gap: the
+ * gap exists because two consecutive BUBBLES have no assistant header between
+ * them, so a neutral system row in between means there is nothing to separate
+ * and the extra top padding must not be added.
+ */
+internal fun ChatMessage.rendersAsUserBubble(): Boolean =
+    role == "user" && !isAppSystemRow()
+
+/**
+ * [T-android-r37-system-row] Verbatim TEXT parts of a persisted row, read
+ * straight out of its `parts_json` — no stripping, no rewriting.
+ *
+ * The neutral system row shows the injected text exactly as the model received
+ * it (that identity is the point of the row: it is a view onto a wire message,
+ * not a paraphrase), while the transcript's own `content` for that row stays
+ * stripped for turn counting. Returns null when the row carries no non-blank
+ * text part — a `toolResult`-only row has nothing to display and is still
+ * dropped upstream.
+ *
+ * Pure, so the DB→UI extraction is testable without Room; malformed JSON answers
+ * null (the caller then falls back to the ordinary drop rule) rather than
+ * throwing.
+ */
+internal fun verbatimTextPartsOf(partsJson: String): String? {
+    val array = runCatching { org.json.JSONArray(partsJson) }.getOrNull() ?: return null
+    val joined = StringBuilder()
+    for (index in 0 until array.length()) {
+        val part = array.optJSONObject(index) ?: continue
+        if (part.optString("type") != "text") continue
+        val value = part.optString("value", "")
+        if (value.isBlank()) continue
+        if (joined.isNotEmpty()) joined.append('\n')
+        joined.append(value)
+    }
+    return joined.toString().takeIf { it.isNotBlank() }
+}
+
+/**
+ * [T-android-compact-boundary-dbid-resolution] Does this rendered bubble stand
+ * for the given persisted DB row?
+ *
+ * A bubble is NOT one-to-one with a DB row in two directions:
+ *  - consecutive assistant rows MERGE into one bubble, whose `id` is only the
+ *    LAST row's id — every earlier folded row lives on in `sourceDbIds`. The
+ *    compact anchor is frequently one of those folded rows, so testing `id`
+ *    alone misses it.
+ *  - system rows (dividers, notices) have synthetic ids that match no DB row.
+ *
+ * Every consumer of a marker's `lastCompactedMessageId` / `firstKeptMessageId`
+ * must ask the question through this one function; the compact-all graying pass
+ * used to test `id` alone and, when the anchor was a folded row, never found its
+ * cutoff and grayed the ENTIRE transcript — including the tail that was still
+ * live in the model's context.
+ */
+internal fun bubbleRepresentsDbId(
+    bubbleId: String,
+    sourceDbIds: List<String>,
+    dbId: String,
+): Boolean = bubbleId == dbId || dbId in sourceDbIds
+
+/** UI-side projection of [bubbleRepresentsDbId] for a rendered bubble. */
+internal fun ChatMessage.representsDbId(dbId: String): Boolean =
+    bubbleRepresentsDbId(id, sourceDbIds, dbId)
+
+/**
+ * [T-android-human-turn-count-parity] The pure half of the "which human turn is
+ * this?" rule used by the retry / delete / edit cut-offs.
+ *
+ * It MUST agree with [MessagePartsCodec.hasHumanTurnContent]: an index counted
+ * over the UI list is paired with a `sort_order` found by counting DB rows, so
+ * any disagreement makes the cut-off miss and silently skips
+ * `deleteMessagesAfter` (that is the bug this pairs with).
+ *
+ * `attachmentCount` is the number of attachments on the bubble (images plus
+ * files). It stands in for the persisted `mediaRef` part, and it is a plain
+ * count rather than a `Uri` list so the rule stays testable without Android.
+ *
+ * Deliberately NOT provenance-based: rows written before the marker existed
+ * have no provenance at all, so a marker test would drop every legacy turn.
+ */
+internal fun isHumanTurnShape(role: String, text: String, attachmentCount: Int): Boolean =
+    role == "user" && (text.isNotBlank() || attachmentCount > 0)
+
+/**
+ * UI-side projection of [isHumanTurnShape] for a rendered bubble. Keep the two
+ * in step — `HumanTurnCountParityTest` pins the cases that matter.
+ */
+internal fun ChatMessage.countsAsHumanTurn(): Boolean =
+    isHumanTurnShape(role, content, imageUris.size + attachmentNames.size)
+
 /** A user prompt queued while the agent loop is still running. Mirrors iOS QueuedPrompt. */
 data class QueuedPrompt(
     val id: String,
@@ -306,6 +450,18 @@ data class SlashCommand(
      * actual discovery/call happens model-side via minis-mcp-cli.
      */
     val isMcp: Boolean = false,
+    /**
+     * [T-android-slash-goal-fork] Exact text tapping this row puts in the
+     * composer, or null when the row EXECUTES instead.
+     *
+     * Separates two questions that [isSkill] used to answer at once: where a row
+     * CAME FROM, and what tapping it DOES. `/goal` and `/fork` need the
+     * fill behaviour ("/goal " then the user types the objective) while being
+     * built-in commands rather than skills — so reusing [isSkill] for them would
+     * have dragged them into the skill group in the picker and mislabelled their
+     * origin. One field, one meaning.
+     */
+    val fillText: String? = null,
 )
 
 data class AssistantBlock(

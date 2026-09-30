@@ -276,7 +276,7 @@ import com.openminis.app.ui.theme.ChatColors
 import com.openminis.app.ui.components.MinisTextButton
 
 @Composable
-internal fun AssistantHeader() {
+internal fun AssistantHeader(snapshot: AssistantHeaderSnapshot? = null) {
     // [T-soul-md] Identity header = icon + SOUL.md-driven `name`.
     //
     // [T-android-soul-custom-icon] The icon is now the user-settable
@@ -288,8 +288,17 @@ internal fun AssistantHeader() {
     // two surfaces were written separately and the chat one silently failed
     // to pick up image icons; sharing the renderer makes that class of
     // divergence impossible rather than merely unlikely.
+    //
+    // [T-android-assistant-attribution] When this message carries a model
+    // identity, the header names the MODEL that produced it (provider · model)
+    // plus the thinking level actually used, instead of the fixed Soul name.
+    // Fallback stays the Soul name so legacy rows — and every message written
+    // before attribution existed — render exactly as before. See
+    // AssistantAttribution.kt for the requirement and the pure helpers.
     val soulMeta by com.openminis.app.agent.SoulStore.cachedMetadata.collectAsState()
-    val displayName = soulMeta.name.ifBlank { com.openminis.app.agent.SoulMetadata.DEFAULT.name }
+    val soulName = soulMeta.name.ifBlank { com.openminis.app.agent.SoulMetadata.DEFAULT.name }
+    val attribution = formatAssistantAttribution(snapshot)
+    val displayName = attribution ?: soulName
     Row(
         verticalAlignment = Alignment.CenterVertically,
         modifier = Modifier
@@ -318,6 +327,17 @@ internal fun AssistantHeader() {
             fontWeight = FontWeight.SemiBold,
             color = MaterialTheme.colorScheme.onSurface,
         )
+        // [T-android-assistant-attribution] The level that produced THIS reply,
+        // in the same capsule the chat title uses. Static (onClick = null): on a
+        // past message this is a record, not a control — tapping it must not
+        // silently retarget the current session's thinking level. Only shown
+        // alongside a real attribution; on a legacy row the header is the plain
+        // Soul name and a stray badge would imply knowledge we don't have.
+        val historicalLevel = snapshot?.thinkingLevel
+        if (attribution != null && historicalLevel != null) {
+            Spacer(modifier = Modifier.width(4.dp))
+            ThinkingLevelBadge(level = historicalLevel)
+        }
     }
 }
 
@@ -328,7 +348,7 @@ internal fun AssistantMessageView(message: ChatMessage, onRetry: (() -> Unit)? =
             .fillMaxWidth()
             .padding(vertical = 2.dp),
     ) {
-        AssistantHeader()
+        AssistantHeader(message.assistantHeaderSnapshot)
 
         // Render blocks in original order — text, thinking, and tool calls interleaved
         // exactly as they arrived in the stream (each assistant turn may contain multiple
@@ -653,11 +673,15 @@ internal fun ToolCallPill(
     // iOS: always shows tool-type icon, only changes color based on status
     val displayIcon = toolIcon
 
-    // Duration text (iOS: "0.4s" format)
+    // Duration text. Delegates to [formatToolDuration] instead of re-deriving the
+    // format here: the inline pill and the tool detail sheet's bottom bar show the
+    // same duration for the same tool call, and two copies of the rule had already
+    // drifted (this one used a 10s decimal cutoff and had no minutes branch, so an
+    // hour-long call rendered "3600s" where iOS renders "60m 0s").
+    // Matches iOS `AssistantBlockView.durationText`: <1s -> "0.4s", <60s -> "45s",
+    // else "2m 10s".
     val durationText = if (block.durationMs > 0 && !isRunning) {
-        val seconds = block.durationMs / 1000.0
-        if (seconds < 10) String.format("%.1fs", seconds)
-        else String.format("%.0fs", seconds)
+        formatToolDuration(block.durationMs)
     } else null
 
     // T125: drop the spinner that used to replace the tool icon while
@@ -933,7 +957,7 @@ internal fun ThinkingBlock(block: AssistantBlock, isStreaming: Boolean, isLast: 
                 Spacer(modifier = Modifier.width(6.dp))
             }
             Text(
-                text = "Deep Thinking",
+                text = stringResource(R.string.appearance_section_deep_thinking),
                 fontSize = 13.sp,
                 fontWeight = FontWeight.SemiBold,
                 color = thinkingBlue,
@@ -962,7 +986,11 @@ internal fun ThinkingBlock(block: AssistantBlock, isStreaming: Boolean, isLast: 
             } else {
                 Icon(
                     imageVector = if (expanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
-                    contentDescription = if (expanded) "Collapse" else "Expand",
+                    contentDescription = if (expanded) {
+                        stringResource(R.string.common_collapse)
+                    } else {
+                        stringResource(R.string.common_expand)
+                    },
                     tint = thinkingBlue.copy(alpha = 0.5f),
                     modifier = Modifier.size(14.dp),
                 )
@@ -1014,13 +1042,29 @@ internal fun ThinkingBlock(block: AssistantBlock, isStreaming: Boolean, isLast: 
                         }
                     }
             }
+            // [T-android-panel-parked-at-end] The resume half of the panel's
+            // follow contract. The drag observer below only samples at finger-up,
+            // so a flick that parks the panel at its own end after the finger
+            // left used to leave it paused mid-panel while the reasoning kept
+            // growing. The position decides: parked at the end + not scrolling
+            // (drag, fling or programmatic) ⇒ follow again.
+            ObserveFollowResume(
+                key = scrollState,
+                atEnd = { scrollState.isParkedAtEnd() },
+                scrollInProgress = { scrollState.isScrollInProgress },
+                onParkedAtEnd = {
+                    // State only — the view is already at the end, and scrolling
+                    // here would flip isScrollInProgress back on and re-fire this.
+                    dispatchFollow(ScrollFollowEvent.AtBottomReached)
+                },
+            )
             Column(
                 modifier = Modifier
                     .padding(top = 6.dp)
                     .heightIn(max = 300.dp)
                     .observeVerticalDrag(
                         key = block.id,
-                        atBottom = { scrollState.maxValue - scrollState.value <= 4 },
+                        atBottom = { scrollState.isParkedAtEnd() },
                         onStopped = { atBottom ->
                             dispatchFollow(ScrollFollowEvent.UserDragStopped(atBottom))
                         },
@@ -1084,7 +1128,7 @@ private fun ThinkingFullContentDialog(content: String, onDismiss: () -> Unit) {
                         .padding(horizontal = 12.dp, vertical = 8.dp),
                 ) {
                     Text(
-                        text = "Deep Thinking",
+                        text = stringResource(R.string.appearance_section_deep_thinking),
                         fontSize = 15.sp,
                         fontWeight = FontWeight.SemiBold,
                         color = Color(0xFF007AFF),

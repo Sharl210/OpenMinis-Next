@@ -5,6 +5,7 @@ import java.nio.charset.StandardCharsets
 import java.util.zip.ZipInputStream
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -112,4 +113,60 @@ class SessionTreeRuntimeTest {
             .getJSONObject("capabilitySnapshot").getLong("configRevision"))
         assertEquals(3, inbox.getJSONObject(1).getJSONObject("capabilitySnapshot").getInt("maxDepth"))
     }
+    @Test
+    fun `config update with mode change and no root is atomic`() {
+        val tree = RuntimeSessionTree()
+        val before = tree.config.copy()
+        val revision = tree.configurationRevision()
+
+        assertFalse(tree.updateConfig(maxDepth = 7, maxParallelSubagents = 9, leaseMillis = 99_000L, mode = DelegationMode.TEAM))
+        assertEquals(before, tree.config)
+        assertEquals(revision, tree.configurationRevision())
+    }
+    @Test
+    fun `lowering runtime limits preserves existing nodes and events`() {
+        val tree = RuntimeSessionTree(clock = { 7_000L })
+        val root = tree.createRoot("root", model)
+        val child = tree.createChild(root.id, "child", model).getOrThrow()
+        tree.start(root.id)
+        tree.start(child.id)
+        val nodesBefore = tree.topology().nodes.map { it.id }.toSet()
+        val eventCountBefore = JSONObject(tree.toJson()).getJSONArray("events").length()
+
+        assertTrue(tree.updateConfig(maxDepth = 0, maxParallelSubagents = 1))
+        assertEquals(nodesBefore, tree.topology().nodes.map { it.id }.toSet())
+        assertEquals(eventCountBefore, JSONObject(tree.toJson()).getJSONArray("events").length())
+        assertNotNull(tree.node("child"))
+    }
+
+    @Test
+    fun `max parallel limit is enforced when creating active children`() {
+        val tree = RuntimeSessionTree(RuntimeTreeConfig(maxDepth = 2, maxParallelSubagents = 1))
+        val root = tree.createRoot("root", model)
+        assertTrue(tree.createChild(root.id, "child-1", model).isSuccess)
+        assertTrue(tree.start("child-1"))
+        assertFalse(tree.createChild(root.id, "child-2", model).isSuccess)
+    }
+    @Test
+    fun `restore config with missing fields preserves constructor defaults`() {
+        val tree = RuntimeSessionTree(RuntimeTreeConfig(maxDepth = 1, maxParallelSubagents = 7, leaseMillis = 45_000L))
+        val json = JSONObject(tree.toJson())
+        json.put("config", JSONObject().put("mode", DelegationMode.TEAM.name))
+
+        assertTrue(tree.restoreJson(json.toString()))
+        assertEquals(1, tree.config.maxDepth)
+        assertEquals(7, tree.config.maxParallelSubagents)
+        assertEquals(45_000L, tree.config.leaseMillis)
+        assertEquals(DelegationMode.TEAM, tree.config.mode)
+    }
+
+    @Test
+    fun `restore rejects invalid persisted config bounds`() {
+        val tree = RuntimeSessionTree()
+        val json = JSONObject(tree.toJson())
+        json.getJSONObject("config").put("maxParallelSubagents", 0)
+
+        assertFalse(tree.restoreJson(json.toString()))
+    }
 }
+

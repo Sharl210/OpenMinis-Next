@@ -7,12 +7,41 @@ import org.junit.Test
 
 class QueuedPromptLifecycleUiTest {
     @Test
-    fun `queue and steer delivery are projected unchanged`() {
-        val queue = QueuedPrompt("q", "queued", delivery = QueuedPromptDelivery.QUEUE)
-        val steer = QueuedPrompt("s", "steered", delivery = QueuedPromptDelivery.STEER)
+    fun `withdrawable verdict is derived from the ledger at every transition`() {
+        val ledger = ledger()
 
-        assertEquals(QueuedPromptDelivery.QUEUE, QueuedPromptUiPolicy.deliveryForMessage(queue))
-        assertEquals(QueuedPromptDelivery.STEER, QueuedPromptUiPolicy.deliveryForMessage(steer))
+        assertTrue(QueuedPromptUiPolicy.isWithdrawable(ledger, "queue"))
+
+        // The model took it: the bubble must stop offering 撤回 / 撤回并编辑 here,
+        // because the ledger will refuse the tap from this instant on.
+        assertTrue(ledger.claim("queue"))
+        assertFalse(QueuedPromptUiPolicy.isWithdrawable(ledger, "queue"))
+        assertFalse(QueuedPromptUiPolicy.canWithdraw(ledger.state("queue")!!))
+
+        // A failed execution rolls the claim back, so the affordances return.
+        assertTrue(ledger.rollbackClaim("queue"))
+        assertTrue(QueuedPromptUiPolicy.isWithdrawable(ledger, "queue"))
+
+        assertTrue(ledger.claim("queue"))
+        assertTrue(ledger.consume("queue"))
+        assertFalse(QueuedPromptUiPolicy.isWithdrawable(ledger, "queue"))
+    }
+
+    @Test
+    fun `withdrawable verdict is false for a missing prompt id`() {
+        val ledger = ledger()
+
+        assertFalse(QueuedPromptUiPolicy.isWithdrawable(ledger, null))
+        assertFalse(QueuedPromptUiPolicy.isWithdrawable(ledger, "never-registered"))
+    }
+
+    @Test
+    fun `a refused withdraw maps to the visible ALREADY_STARTED notice`() {
+        assertEquals(QueuedWithdrawOutcome.WITHDRAWN, QueuedPromptUiPolicy.withdrawOutcome(accepted = true))
+        assertEquals(
+            QueuedWithdrawOutcome.ALREADY_STARTED,
+            QueuedPromptUiPolicy.withdrawOutcome(accepted = false),
+        )
     }
 
     @Test
@@ -53,11 +82,11 @@ class QueuedPromptLifecycleUiTest {
     }
 
     @Test
-    fun `retry remains available for sent messages and hidden for queued or streaming`() {
-        assertTrue(QueuedPromptUiPolicy.canRetry(isQueued = false, isStreaming = false))
-        assertFalse(QueuedPromptUiPolicy.canRetry(isQueued = true, isStreaming = false))
-        assertFalse(QueuedPromptUiPolicy.canRetry(isQueued = false, isStreaming = true))
-        assertFalse(QueuedPromptUiPolicy.canRetry(isQueued = true, isStreaming = true))
+    fun `bubble actions remain available for sent messages and hidden for queued or streaming`() {
+        assertTrue(QueuedPromptUiPolicy.canActOnSentMessage(isQueued = false, isStreaming = false))
+        assertFalse(QueuedPromptUiPolicy.canActOnSentMessage(isQueued = true, isStreaming = false))
+        assertFalse(QueuedPromptUiPolicy.canActOnSentMessage(isQueued = false, isStreaming = true))
+        assertFalse(QueuedPromptUiPolicy.canActOnSentMessage(isQueued = true, isStreaming = true))
     }
 
     private fun ledger(): QueuedPromptLedger = QueuedPromptLedger().apply {

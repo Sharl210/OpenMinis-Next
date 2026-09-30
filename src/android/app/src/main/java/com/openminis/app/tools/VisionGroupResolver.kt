@@ -54,13 +54,23 @@ object VisionGroupResolver {
 
     /**
      * True when the user has a usable Vision Group configured — the pointer
-     * resolves to a group with at least one image-capable, credentialed member.
-     * This widens the `read_image` tool gate, so it must be strict: a dangling
+     * resolves to a group with at least one image-capable, enabled member. This
+     * widens the `read_image` tool gate, so it must be strict: a dangling
      * pointer or an all-disabled group must read as "not configured", otherwise a
      * non-vision model gets a tool that can only ever fail.
+     *
+     * SINGLE SOURCE: this delegates to
+     * [ProviderRepository.hasVisionGroupConfigured] rather than restating the
+     * verdict as `candidates(...).isNotEmpty()`. Both bottom out in
+     * `ProviderRepository.resolveVisionCandidates` (the repository used to carry
+     * a second, weaker copy of this rule — "a group is bound and still exists" —
+     * which would have answered `true` for a group that can serve nothing).
+     * [context] is unused here and has been all along: the gate is a pure config
+     * question, and the parameter is kept so the two call sites in the chat
+     * layer do not have to change.
      */
     fun isConfigured(repo: ProviderRepository, context: Context?): Boolean =
-        candidates(repo, context).isNotEmpty()
+        repo.hasVisionGroupConfigured()
 
     /**
      * Every usable image-capable member of the configured Vision Group, in the

@@ -37,6 +37,8 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.DialogProperties
+import androidx.compose.ui.res.stringResource
+import com.openminis.app.R
 import com.openminis.app.config.ConfigRisk
 import com.openminis.app.config.confirm.ConfigConfirmationGate
 import com.openminis.app.config.confirm.PendingConfigChange
@@ -123,7 +125,7 @@ private fun ConfigConfirmDialog(change: PendingConfigChange) {
         },
         dismissButton = {
             MinisTextButton(onClick = { ConfigConfirmationGate.userReject() }) {
-                Text("Cancel")
+                Text(stringResource(R.string.cancel))
             }
         },
     )

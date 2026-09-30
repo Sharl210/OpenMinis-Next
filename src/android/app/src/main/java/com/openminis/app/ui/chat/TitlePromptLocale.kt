@@ -16,8 +16,62 @@ import java.util.Locale
 internal const val TITLE_GEN_SYSTEM_PROMPT: String =
     "You generate concise titles for conversations. You MUST respond with a single valid JSON object: {\"title\": \"...\", \"category\": \"...\"}. No other text."
 
-internal const val COMPACTION_DEFAULT_SYSTEM_PROMPT: String =
-    "You are a context compaction engine. Preserve identifiers, decisions, errors, constraints, and completed work. Write a concise past-tense summary for the next turn."
+/**
+ * The prompt a compaction request carries when the user has not edited one.
+ *
+ * Single definition on purpose. This text used to exist TWICE — the Settings
+ * editor showed a one-line placeholder while the runtime actually sent the long
+ * structured prompt below — so the "reset to default" button and the editor's
+ * displayed default described a prompt the model never saw. `request.md:246`
+ * makes the compaction prompt user-editable, which makes the displayed default
+ * part of the contract: what the editor shows and what the model receives must
+ * be the same string.
+ *
+ * A `val` rather than a `const val` because the literal needs `trimIndent()`.
+ */
+internal val COMPACTION_DEFAULT_SYSTEM_PROMPT: String = """
+    You are a context compaction engine. Your summary will REPLACE the original messages in the conversation context window. The agent will read your summary as past context, then proceed based on the user's NEXT message — your summary is background, not a standing work order. Write the summary in the same language the user used in the conversation.
+
+    MUST PRESERVE (never omit or shorten):
+    - All file paths, directory names, URLs, UUIDs, and identifiers — copy verbatim
+    - Commands executed and their outcomes (success/failure/output)
+    - What was requested and what was done (record as past events, not as ongoing goals)
+    - Key decisions made and their rationale
+    - Errors encountered and how they were resolved
+    - Important constraints, rules, or user preferences mentioned
+    - Any tool calls and their results that affect current state
+
+    STRUCTURE:
+    1. Start with a one-line description of what the conversation was about (use past tense — "User asked X, agent did Y", NOT "Goal: X").
+    2. Then a concise narrative of what happened, preserving technical details.
+    3. End with a "What had been done so far" section listing completed work — NOT a "todo" or "pending" list. Do not invent ongoing objectives or carry-over tasks from old turns; if the user wants to continue, they will say so in their next message.
+
+    PRIORITIZE recent context over older history — recent decisions and recent file/path references are most useful for continuity.
+
+    Do NOT translate or alter code snippets, file paths, identifiers, or error messages. Be concise but never lose information the agent needs.
+""".trimIndent()
+
+/**
+ * The system prompt a title request actually carries.
+ *
+ * `request.md:246` makes the prompt itself user-editable:
+ *   「标题生成和压缩模型。他们不仅仅只是支持模型的选择，还要去支持对应的提示词的编辑」
+ *
+ * The choice lives in one function rather than inline at each call site for the
+ * same reason the default constant is shared: the auto path
+ * ([com.openminis.app.ui.chat.ChatViewModel.generateSessionTitleIfNeeded]) and
+ * the manual Regenerate path
+ * ([com.openminis.app.ui.sessions.SessionListViewModel.regenerateTitle]) must
+ * not drift. A blank edit means "unset", not "send nothing" — an empty system
+ * prompt would silently drop the JSON-shape instruction the title parser
+ * depends on.
+ */
+internal fun effectiveTitleSystemPrompt(edited: String?): String =
+    edited?.takeIf { it.isNotBlank() } ?: TITLE_GEN_SYSTEM_PROMPT
+
+/** The compaction counterpart of [effectiveTitleSystemPrompt]. */
+internal fun effectiveCompactionSystemPrompt(edited: String?): String =
+    edited?.takeIf { it.isNotBlank() } ?: COMPACTION_DEFAULT_SYSTEM_PROMPT
 
 /**
  * Build the bilingual language directive appended to the title-generation

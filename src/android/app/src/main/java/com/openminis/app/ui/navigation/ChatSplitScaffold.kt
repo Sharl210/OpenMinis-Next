@@ -288,6 +288,7 @@ fun ChatSplitScaffold(
         sessionId: String,
         onBack: () -> Unit,
         onNewChatInPane: () -> Unit,
+        onForkedSessionInPane: (String) -> Unit,
         onMoveToInPane: (String) -> Unit,
         /**
          * [T-android-tablet-sidebar-collapse] Show/hide the session list, or
@@ -595,6 +596,15 @@ fun ChatSplitScaffold(
                         // screen over both panes on a tablet — the phone
                         // behaviour, in the one layout that exists to avoid it.
                         openNewDraft,
+                        { forkedId ->
+                            selectedSessionId = forkedId
+                            scope.launch {
+                                navigator.navigateTo(
+                                    ListDetailPaneScaffoldRole.Detail,
+                                    forkedId,
+                                )
+                            }
+                        },
                         { targetId ->
                             selectedSessionId = targetId
                             scope.launch {
@@ -870,7 +880,7 @@ fun ChatSplitScaffoldRoute(
                 draftPlaceholderId = draftPlaceholderId,
             )
         },
-        detailPane = { sessionId, onBackInPane, onNewChatInPane, onMoveToInPane,
+        detailPane = { sessionId, onBackInPane, onNewChatInPane, onForkedSessionInPane, onMoveToInPane,
             onToggleSidebar, sidebarCollapsed ->
             com.openminis.app.ui.chat.ChatScreen(
                 // The pane navigator's contentKey IS the session id, so a
@@ -900,6 +910,7 @@ fun ChatSplitScaffoldRoute(
                 // highlighting a row (no persisted id matches a draft) — the
                 // two-pane equivalent of the old popUpTo(SESSION_LIST) push.
                 onNewChat = onNewChatInPane,
+                onForkSession = onForkedSessionInPane,
                 // Everything below leaves the list/detail pair entirely and so
                 // stays on the OUTER NavHost as a full-screen push.
                 onOpenTerminal = {

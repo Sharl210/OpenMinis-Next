@@ -7,6 +7,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import org.junit.After
+import org.junit.Assume
 import org.junit.Assert.*
 import org.junit.Before
 import org.junit.Test
@@ -87,10 +88,17 @@ class ExecutionCoordinatorInstrumentedTest {
 
         ExecutionCoordinator.execute("session-mounts", "echo test")
 
-        // Should have session-level + global bind mounts
+        // Should have session-level + global bind mounts.
         // Session: attachments, offloads, workspace, browser (4)
-        // Global: memory, skills (2)
-        assertEquals(6, PRootKernel.bindMounts.size)
+        // Global: memory, skills, shared, mcp-servers (4)
+        //
+        // [T-sandbox-mount-count] This asserted 6 with a comment listing only
+        // "memory, skills (2)" as global. `shared` and `mcp-servers` were added
+        // later (see the T-android-mcp-bind-mount note in ExecutionCoordinator),
+        // so both the number and its explanation went stale. The test did not
+        // catch it because its guard used to exit the body as PASSED — see the
+        // correction note on the skip helper. 8 is the verified count.
+        assertEquals(8, PRootKernel.bindMounts.size)
 
         // Verify session-level mounts
         assertTrue(PRootKernel.bindMounts.containsKey("/var/minis/attachments"))
@@ -333,11 +341,32 @@ class ExecutionCoordinatorInstrumentedTest {
         }
     }
 
+    /**
+     * [T-android-assume-not-return] Mark the test SKIPPED when the sandbox
+     * assets are absent — do not merely print and continue.
+     *
+     * A bare `return` here returned from THIS HELPER, not from the caller. Every
+     * test that called it therefore kept running and blew up with
+     * "PRootKernel must be booted before executing commands" — 20 tests in this
+     * class and 16 in ExecutionCoordinatorInstrumentedTest failed for a missing
+     * optional asset, which is noise that hides genuine failures in the same
+     * run. (Correction: `return@runBlocking` inside the test body was previously
+     * believed to be an adequate skip — it is NOT. It exits the lambda, so JUnit
+     * records the test as PASSED, and 13 tests across that sibling and
+     * PRootKernelInstrumentedTest reported green while asserting nothing.) `assumeTrue` throws
+     * AssumptionViolatedException, which JUnit reports as SKIPPED with a
+     * reason, so an absent asset is visible as "not run" rather than "broken".
+     *
+     * The assets are architecture-specific (the prepare script ships aarch64
+     * rootfs + proot), so an x86_64 emulator can never satisfy this — skipping
+     * is the correct outcome there, not a red suite.
+     */
     private fun skipIfNoBoot() {
-        if (!PRootKernel.isBooted) {
-            println("SKIP: PRoot not booted (assets not available)")
-            return
-        }
+        Assume.assumeTrue(
+            "sandbox assets unavailable (alpine-minirootfs.tar.gz / proot-aarch64 not in assets, " +
+                "or PRoot not booted on this ABI)",
+            PRootKernel.isBooted,
+        )
     }
 
     private fun resetKernel() {

@@ -94,7 +94,11 @@ class RcloneDestinationsViewModel(app: Application) : AndroidViewModel(app) {
                         RcloneBackendCatalog.backend(backend)?.fields
                             ?.firstOrNull { it.key == key }?.isSecret != true
                     }
-                    val secretKeyName = if (backend == "s3") "secret_access_key" else "pass"
+                    // [single source] Which field holds the secret is owned by
+                    // RcloneBackendCatalog.secretField (through the store) — see
+                    // RcloneRemoteStore.secretKeyFor. An inline "s3 vs the rest"
+                    // guess here is a second copy of that table.
+                    val secretKeyName = RcloneRemoteStore.secretKeyFor(backend)
                     val secret = values[secretKeyName]
                     // The candidate's certificate choice has to be live for THIS
                     // connection test, not just persisted at save time —
@@ -193,7 +197,7 @@ class RcloneDestinationsViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             try {
                 withContext(Dispatchers.IO) {
-                    val secretKeyName = if (b.remote.backend == "s3") "secret_access_key" else "pass"
+                    val secretKeyName = RcloneRemoteStore.secretKeyFor(b.remote.backend)
                     // The secret was passed to registerEphemeral; re-read it from
                     // the live rclone config is not possible, so we require the
                     // caller to have kept it — instead we persist non-secret

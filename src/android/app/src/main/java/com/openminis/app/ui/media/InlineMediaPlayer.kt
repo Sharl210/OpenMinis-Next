@@ -65,6 +65,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import androidx.compose.ui.res.stringResource
+import com.openminis.app.R
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import java.io.File
@@ -168,7 +170,7 @@ fun InlineAudioPlayer(
                     ) {
                         Icon(
                             if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
-                            contentDescription = if (isPlaying) "Pause" else "Play",
+                            contentDescription = if (isPlaying) stringResource(R.string.common_pause) else stringResource(R.string.common_play),
                             tint = MaterialTheme.colorScheme.onPrimary,
                             modifier = Modifier.size(20.dp),
                         )
@@ -209,7 +211,7 @@ fun InlineAudioPlayer(
                         ) {
                             Icon(
                                 Icons.Default.Stop,
-                                contentDescription = "Stop",
+                                contentDescription = stringResource(R.string.common_stop),
                                 tint = MaterialTheme.colorScheme.onSurfaceVariant,
                                 modifier = Modifier.size(18.dp),
                             )
@@ -494,7 +496,7 @@ private fun FullscreenVideoContent(file: File, onDismiss: () -> Unit) {
             ) {
                 CircleControlButton(
                     icon = Icons.Default.Close,
-                    contentDescription = "Close",
+                    contentDescription = stringResource(R.string.common_close),
                     onClick = {
                         try { videoView?.pause() } catch (_: Throwable) {}
                         onDismiss()
@@ -510,7 +512,7 @@ private fun FullscreenVideoContent(file: File, onDismiss: () -> Unit) {
                 )
                 CircleControlButton(
                     icon = Icons.Default.Share,
-                    contentDescription = "Share",
+                    contentDescription = stringResource(R.string.common_share),
                     onClick = { shareMediaFile(context, file, "video/*") },
                 )
             }
@@ -550,7 +552,7 @@ private fun FullscreenVideoContent(file: File, onDismiss: () -> Unit) {
                 ) {
                     Icon(
                         imageVector = if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
-                        contentDescription = if (isPlaying) "Pause" else "Play",
+                        contentDescription = if (isPlaying) stringResource(R.string.common_pause) else stringResource(R.string.common_play),
                         tint = Color.White,
                     )
                 }

@@ -261,7 +261,13 @@ internal fun LargeContentGuard(
         // Only for large bodies — small ones never hang and the churn isn't worth
         // it. messageId is the first segment of stableKey after its type prefix.
         if (content.length >= com.openminis.app.diagnostics.CONTENT_DIAG_MIN_CHARS) {
-            val msgId = remember(stableKey) { stableKey.substringAfter(':').substringBefore(':') }
+            // `substringBefore('#')` drops the dedupe suffix ChatFlatItems adds
+            // when a message would otherwise produce a duplicate row key
+            // ("<id>#2"), so the diagnostic names the real message instead of a
+            // key that matches nothing.
+            val msgId = remember(stableKey) {
+                stableKey.substringAfter(':').substringBefore(':').substringBefore('#')
+            }
             androidx.compose.runtime.DisposableEffect(stableKey, content.length) {
                 com.openminis.app.diagnostics.ContentDiag.setCurrentRender(
                     sessionId = "",

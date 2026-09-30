@@ -3,6 +3,7 @@ package com.openminis.app.debug
 import android.content.Context
 import androidx.lifecycle.ViewModelProvider
 import com.openminis.app.MinisApp
+import com.openminis.app.data.model.MessagePartsCodec
 import com.openminis.app.data.model.ThinkingLevel
 import com.openminis.app.ui.chat.ChatViewModel
 import com.openminis.app.ui.chat.ChatViewModelStore
@@ -257,14 +258,26 @@ internal object HeadlessChatRunner {
         val vm = viewModel(context, sessionId)
         val targetMsgId = messageId ?: run {
             val msgs = app.chatRepository.dao.loadMessages(sessionId)
-            msgs.lastOrNull { it.role == "user" }?.id
-                ?: throw RPCException(-32602, "Session has no user messages")
+            // [T-android-human-turn-count-parity] Pick the last HUMAN turn, not
+            // the last row that happens to carry the API's `user` role. Tool
+            // results and the `<system-reminder>` resume entry are persisted with
+            // that role, so "last role==user" could select harness plumbing; the
+            // RPC then answered "Retrying" while `ChatViewModel.retryFromMessage`
+            // rejected it and nothing happened — a silent lie to the caller.
+            msgs.lastOrNull {
+                it.role == "user" && MessagePartsCodec.hasHumanTurnContent(it.partsJson)
+            }?.id
+                ?: throw RPCException(-32602, "Session has no human user messages")
         }
-        // Validate it points at a user message.
+        // Validate it points at a human user message — the SAME rule
+        // `retryFromMessage` applies, so the RPC can never promise a retry the
+        // ViewModel will refuse.
         val all = app.chatRepository.dao.loadMessages(sessionId)
         val target = all.firstOrNull { it.id == targetMsgId }
             ?: throw RPCException(-32602, "Message not found in session")
-        if (target.role != "user") throw RPCException(-32602, "Target is not a user message")
+        if (target.role != "user" || !MessagePartsCodec.hasHumanTurnContent(target.partsJson)) {
+            throw RPCException(-32602, "Target is not a human user message")
+        }
         val deletedCount = all.size - all.indexOf(target) - 1
 
         // Same readiness gate as prompt() — retryFromMessage hits the same

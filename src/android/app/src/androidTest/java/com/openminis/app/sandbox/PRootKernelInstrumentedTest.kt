@@ -10,6 +10,7 @@ import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 import java.io.File
+import org.junit.Assume
 
 /**
  * On-device tests for PRootKernel.
@@ -45,10 +46,7 @@ class PRootKernelInstrumentedTest {
 
     @Test
     fun bootSetsIsBootedTrue() = runBlocking {
-        if (!canBoot()) {
-            println("SKIP: assets not available for boot")
-            return@runBlocking
-        }
+        Assume.assumeTrue("PRoot sandbox assets unavailable in this build", canBoot())
 
         PRootKernel.boot(context)
         assertTrue(PRootKernel.isBooted)
@@ -56,10 +54,7 @@ class PRootKernelInstrumentedTest {
 
     @Test
     fun bootIsIdempotent() = runBlocking {
-        if (!canBoot()) {
-            println("SKIP: assets not available for boot")
-            return@runBlocking
-        }
+        Assume.assumeTrue("PRoot sandbox assets unavailable in this build", canBoot())
 
         PRootKernel.boot(context)
         PRootKernel.boot(context) // Should not throw
@@ -101,16 +96,23 @@ class PRootKernelInstrumentedTest {
 
     @Test
     fun buildProotCommandIncludesBasicFlags() = runBlocking {
-        if (!canBoot()) {
-            println("SKIP: assets not available for boot")
-            return@runBlocking
-        }
+        Assume.assumeTrue("PRoot sandbox assets unavailable in this build", canBoot())
         PRootKernel.boot(context)
 
         val cmd = PRootKernel.buildProotCommand("echo hello")
 
         // Should contain proot binary path
-        assertTrue("Should start with proot binary", cmd[0].endsWith("proot-aarch64"))
+        // [T-sandbox-proot-binary-name] The binary is packaged as a native
+        // library (`RootfsManager.prootBinary = nativeLibraryDir/libproot.so`)
+        // because that is the only place Android lets an app put an executable;
+        // `PROOT_ASSET = "proot-aarch64"` is the name of the DOWNLOAD source
+        // asset, not the installed path. Asserting the asset name here could
+        // never hold, and went unnoticed because the guard used to exit as
+        // PASSED instead of SKIPPED.
+        assertTrue(
+            "proot binary path was ${cmd[0]}",
+            cmd[0].endsWith("libproot.so"),
+        )
 
         // Should have -0 flag (fake root)
         assertTrue("Should contain -0 flag", cmd.contains("-0"))
@@ -139,10 +141,7 @@ class PRootKernelInstrumentedTest {
 
     @Test
     fun buildProotCommandIncludesBindMounts() = runBlocking {
-        if (!canBoot()) {
-            println("SKIP: assets not available for boot")
-            return@runBlocking
-        }
+        Assume.assumeTrue("PRoot sandbox assets unavailable in this build", canBoot())
         PRootKernel.boot(context)
 
         PRootKernel.addBindMount("/var/minis/workspace", "/data/user/0/com.openminis.app/workspace")
@@ -156,10 +155,7 @@ class PRootKernelInstrumentedTest {
 
     @Test
     fun buildProotCommandWithMultipleBindMounts() = runBlocking {
-        if (!canBoot()) {
-            println("SKIP: assets not available for boot")
-            return@runBlocking
-        }
+        Assume.assumeTrue("PRoot sandbox assets unavailable in this build", canBoot())
         PRootKernel.boot(context)
 
         PRootKernel.addBindMount("/mnt/a", "/host/a")
@@ -225,10 +221,7 @@ class PRootKernelInstrumentedTest {
 
     @Test
     fun resolveHostPathFallsBackToRootfs() = runBlocking {
-        if (!canBoot()) {
-            println("SKIP: assets not available for boot")
-            return@runBlocking
-        }
+        Assume.assumeTrue("PRoot sandbox assets unavailable in this build", canBoot())
         PRootKernel.boot(context)
 
         // No bind mounts → should resolve relative to rootfsDir

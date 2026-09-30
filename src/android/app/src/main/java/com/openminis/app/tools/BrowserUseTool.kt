@@ -3,6 +3,7 @@ package com.openminis.app.tools
 import com.openminis.app.browser.BrowserAction
 import org.json.JSONArray
 import org.json.JSONObject
+import com.openminis.app.browser.BrowserTabPool
 
 /**
  * Tool schema definition for browser_use, mirroring the iOS agent tool registration.
@@ -12,7 +13,9 @@ object BrowserUseTool {
 
     const val NAME = "browser_use"
 
-    val description = """Control web browser with up to 10 tabs, including history and bookmarks. Actions: navigate to URL, take screenshot, click elements, type text, get page text, scroll, get page info, execute JavaScript, find elements by selector, hover, get readable content, set user agent, get page backbone, fetch resources, manage tabs, read/delete history, add/remove/list bookmarks, and open saved bookmarks.""".trimIndent()
+    // [T-browser-capacity-20] Reads the pool's real ceiling so the model can
+    // never be told a stale tab limit.
+    val description = """Control web browser with up to ${BrowserTabPool.MAX_TABS} tabs, including history and bookmarks. Actions: navigate to URL, take screenshot, click elements, type text, get page text, scroll, get page info, execute JavaScript, find elements by selector, hover, get readable content, set user agent, get page backbone, fetch resources, manage tabs, list downloads, read/delete history, add/remove/list bookmarks, toggle the bookmark star (toggle_bookmark) or read it (is_bookmarked), and open saved bookmarks.""".trimIndent()
 
     /**
      * Build the JSON tool definition for the Anthropic / OpenAI / Gemini API.

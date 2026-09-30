@@ -28,6 +28,8 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -39,13 +41,13 @@ import kotlin.math.roundToInt
 
 /** 工作步骤进度的展示粒度。 */
 enum class WorkStepDisplay(
-    val title: String,
-    val description: String,
+    val titleRes: Int,
+    val descriptionRes: Int,
 ) {
-    HIDDEN("关闭", "不显示工作步骤更新。"),
-    SUMMARY("摘要", "显示阶段变化和简短进度摘要。"),
-    CURRENT_STEP("当前步骤", "显示正在执行的步骤及最新状态。"),
-    DETAILED("详细", "显示每个步骤，并在可用时显示执行结果。");
+    HIDDEN(R.string.agent_behavior_work_step_hidden, R.string.agent_behavior_work_step_hidden_description),
+    SUMMARY(R.string.agent_behavior_work_step_summary, R.string.agent_behavior_work_step_summary_description),
+    CURRENT_STEP(R.string.agent_behavior_work_step_current, R.string.agent_behavior_work_step_current_description),
+    DETAILED(R.string.agent_behavior_work_step_detailed, R.string.agent_behavior_work_step_detailed_description);
 
     companion object {
         fun fromStored(value: String?): WorkStepDisplay =
@@ -55,11 +57,11 @@ enum class WorkStepDisplay(
 
 /** Agent 准备发送消息或动作时的默认策略。 */
 enum class DefaultSendStrategy(
-    val title: String,
-    val description: String,
+    val titleRes: Int,
+    val descriptionRes: Int,
 ) {
-    QUEUE("Queue（排队）", "排到下一个回合发送，不打断当前工作。"),
-    STEER("Steer（引导）", "将内容作为当前 Agent 下一步的引导发送。");
+    QUEUE(R.string.agent_behavior_send_queue, R.string.agent_behavior_send_queue_description),
+    STEER(R.string.agent_behavior_send_steer, R.string.agent_behavior_send_steer_description);
 
     companion object {
         fun fromStored(value: String?): DefaultSendStrategy =
@@ -89,18 +91,22 @@ fun AgentBehaviorSettingsScreen(
     onAutoRetryEnabledChange: (Boolean) -> Unit,
     maxRetryAttempts: Int,
     onMaxRetryAttemptsChange: (Int) -> Unit,
+    webSearchMaxResults: Int,
+    onWebSearchMaxResultsChange: (Int) -> Unit,
+    webRequestTimeoutMs: Long,
+    onWebRequestTimeoutMsChange: (Long) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Scaffold(
         modifier = modifier,
         topBar = {
             TopAppBar(
-                title = { Text("Agent 行为") },
+                title = { Text(stringResource(R.string.agent_behavior_title)) },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(
                             imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                            contentDescription = "返回",
+                            contentDescription = stringResource(R.string.agent_behavior_back),
                         )
                     }
                 },
@@ -116,14 +122,14 @@ fun AgentBehaviorSettingsScreen(
             verticalArrangement = Arrangement.spacedBy(20.dp),
         ) {
             SettingsChoiceSection(
-                title = "工作步骤展示",
-                description = "选择 Agent 工作时显示多少进度信息。",
+                title = stringResource(R.string.agent_behavior_work_step_title),
+                description = stringResource(R.string.agent_behavior_work_step_section_description),
             ) {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     WorkStepDisplay.entries.forEach { option ->
                         ChoiceRow(
-                            title = option.title,
-                            description = option.description,
+                title = option.titleRes.let { stringResource(it) },
+                            description = option.descriptionRes.let { stringResource(it) },
                             selected = workStepDisplay == option,
                             onClick = { onWorkStepDisplayChange(option) },
                         )
@@ -132,17 +138,17 @@ fun AgentBehaviorSettingsScreen(
             }
 
             SettingsChoiceSection(
-                title = "递归深度",
-                description = "限制子 Agent 继续委派的层数，默认值为 2。",
+                title = stringResource(R.string.agent_behavior_recursion_depth_title),
+                description = stringResource(R.string.agent_behavior_recursion_depth_description),
             ) {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     listOf(
-                        0 to "深度 0：不委派，任务留在当前 Agent。",
-                        1 to "深度 1：当前 Agent 可以直接委派子 Agent。",
-                        2 to "深度 2：子 Agent 还可以再委派一层。",
+                        0 to stringResource(R.string.agent_behavior_depth_zero),
+                        1 to stringResource(R.string.agent_behavior_depth_one),
+                        2 to stringResource(R.string.agent_behavior_depth_two),
                     ).forEach { (depth, description) ->
                         ChoiceRow(
-                            title = "深度 $depth",
+                            title = stringResource(R.string.agent_behavior_depth_value, depth),
                             description = description,
                             selected = recursionDepth == depth,
                             onClick = { onRecursionDepthChange(depth) },
@@ -152,34 +158,38 @@ fun AgentBehaviorSettingsScreen(
             }
 
             SettingsChoiceSection(
-                title = "并行 Agent 上限",
-                description = "同时运行的子 Agent 数量，默认值为 5。",
+                title = stringResource(R.string.agent_behavior_parallel_title),
+                description = stringResource(R.string.agent_behavior_parallel_description),
             ) {
-                val displayedLimit = parallelAgentLimit.coerceIn(
+                val pendingParallelLimit = remember(parallelAgentLimit) {
+                    mutableIntStateOf(parallelAgentLimit)
+                }
+                val displayedLimit = pendingParallelLimit.intValue.coerceIn(
                     AgentBehaviorSettingsPrefs.MIN_PARALLEL_AGENTS,
                     AgentBehaviorSettingsPrefs.MAX_PARALLEL_AGENTS,
                 )
                 ValueSliderRow(
-                    title = "同时运行的子 Agent",
+                    title = stringResource(R.string.agent_behavior_parallel_value),
                     valueLabel = displayedLimit.toString(),
                     value = displayedLimit.toFloat(),
                     valueRange = AgentBehaviorSettingsPrefs.MIN_PARALLEL_AGENTS.toFloat()..
                         AgentBehaviorSettingsPrefs.MAX_PARALLEL_AGENTS.toFloat(),
                     steps = AgentBehaviorSettingsPrefs.MAX_PARALLEL_AGENTS -
                         AgentBehaviorSettingsPrefs.MIN_PARALLEL_AGENTS - 1,
-                    onValueChange = { onParallelAgentLimitChange(it.roundToInt()) },
+                    onValueChange = { pendingParallelLimit.intValue = it.roundToInt() },
+                    onValueChangeFinished = { onParallelAgentLimitChange(displayedLimit) },
                 )
             }
 
             SettingsChoiceSection(
-                title = "默认发送策略",
-                description = "消息或动作准备好发送时采用的默认方式。",
+                title = stringResource(R.string.agent_behavior_send_strategy_title),
+                description = stringResource(R.string.agent_behavior_send_strategy_description),
             ) {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     DefaultSendStrategy.entries.forEach { option ->
                         ChoiceRow(
-                            title = option.title,
-                            description = option.description,
+                title = option.titleRes.let { stringResource(it) },
+                            description = option.descriptionRes.let { stringResource(it) },
                             selected = defaultSendStrategy == option,
                             onClick = { onDefaultSendStrategyChange(option) },
                         )
@@ -188,16 +198,41 @@ fun AgentBehaviorSettingsScreen(
             }
 
             SettingsChoiceSection(
-                title = "全局压缩阈值",
-                description = "上下文达到该 Token 数时允许自动压缩；设为 0 表示关闭。",
+                // [T-android-compact-headroom-wording] This control sets a RESERVE
+                // (headroom), not an absolute threshold, and the label has to say
+                // so.
+                //
+                // It used to read "全局压缩阈值 / 上下文达到该 Token 数时允许自动
+                // 压缩" with the slider marked "150 tokens". Three things were
+                // wrong at once: the number is in THOUSANDS (150 means 150_000,
+                // see the `times(1_000)` at both call sites), the quantity is the
+                // space RESERVED at the end of the window rather than the point
+                // compaction fires, and because it is a reserve, a LARGER value
+                // compacts EARLIER — the opposite of what "threshold" tells a
+                // reader. A user following the old text set the slider up to
+                // delay compaction and got the reverse.
+                //
+                // The reserve model is also the one that works: 150_000 as an
+                // absolute threshold would exceed a 128K window entirely, while
+                // as a reserve it degrades sensibly via the clamp in
+                // `ContextPolicy.forContextWindow`. So the wiring stays and the
+                // wording is corrected.
+                title = stringResource(R.string.agent_behavior_compact_title),
+                description = stringResource(R.string.agent_behavior_compact_description),
             ) {
                 val displayedThreshold = compactThresholdTokens.coerceIn(
                     AgentBehaviorSettingsPrefs.MIN_COMPACT_THRESHOLD_TOKENS,
                     AgentBehaviorSettingsPrefs.MAX_COMPACT_THRESHOLD_TOKENS,
                 )
                 ValueSliderRow(
-                    title = "触发阈值",
-                    valueLabel = if (displayedThreshold == 0) "关闭" else "$displayedThreshold tokens",
+                    title = stringResource(R.string.agent_behavior_compact_value),
+                    valueLabel = if (displayedThreshold == 0) {
+                        stringResource(R.string.agent_behavior_off)
+                    } else {
+                        // The stored value is thousands of tokens; show the real
+                        // figure so the label and the behaviour agree.
+                        stringResource(R.string.agent_behavior_compact_value_tokens, displayedThreshold)
+                    },
                     value = displayedThreshold.toFloat(),
                     valueRange = AgentBehaviorSettingsPrefs.MIN_COMPACT_THRESHOLD_TOKENS.toFloat()..
                         AgentBehaviorSettingsPrefs.MAX_COMPACT_THRESHOLD_TOKENS.toFloat(),
@@ -208,7 +243,44 @@ fun AgentBehaviorSettingsScreen(
             }
 
             SettingsChoiceSection(
-                title = "自动重试",
+                title = stringResource(R.string.agent_behavior_web_search),
+                description = stringResource(R.string.agent_behavior_web_search_description),
+            ) {
+                val displayedResults = webSearchMaxResults.coerceIn(
+                    AgentBehaviorSettingsPrefs.MIN_WEB_SEARCH_MAX_RESULTS,
+                    AgentBehaviorSettingsPrefs.MAX_WEB_SEARCH_MAX_RESULTS,
+                )
+                ValueSliderRow(
+                    title = stringResource(R.string.agent_behavior_web_search_max_results),
+                    valueLabel = stringResource(R.string.agent_behavior_web_search_max_results_value, displayedResults),
+                    value = displayedResults.toFloat(),
+                    valueRange = AgentBehaviorSettingsPrefs.MIN_WEB_SEARCH_MAX_RESULTS.toFloat()..
+                        AgentBehaviorSettingsPrefs.MAX_WEB_SEARCH_MAX_RESULTS.toFloat(),
+                    steps = AgentBehaviorSettingsPrefs.MAX_WEB_SEARCH_MAX_RESULTS -
+                        AgentBehaviorSettingsPrefs.MIN_WEB_SEARCH_MAX_RESULTS - 1,
+                    onValueChange = { onWebSearchMaxResultsChange(it.roundToInt()) },
+                )
+                val displayedTimeoutMs = webRequestTimeoutMs.coerceIn(
+                    AgentBehaviorSettingsPrefs.MIN_WEB_REQUEST_TIMEOUT_MS,
+                    AgentBehaviorSettingsPrefs.MAX_WEB_REQUEST_TIMEOUT_MS,
+                )
+                ValueSliderRow(
+                    title = stringResource(R.string.agent_behavior_web_request_timeout),
+                    valueLabel = stringResource(
+                        R.string.agent_behavior_web_request_timeout_value,
+                        displayedTimeoutMs / 1_000L,
+                    ),
+                    value = (displayedTimeoutMs / 1_000L).toFloat(),
+                    valueRange = (AgentBehaviorSettingsPrefs.MIN_WEB_REQUEST_TIMEOUT_MS / 1_000L).toFloat()..
+                        (AgentBehaviorSettingsPrefs.MAX_WEB_REQUEST_TIMEOUT_MS / 1_000L).toFloat(),
+                    steps = ((AgentBehaviorSettingsPrefs.MAX_WEB_REQUEST_TIMEOUT_MS -
+                        AgentBehaviorSettingsPrefs.MIN_WEB_REQUEST_TIMEOUT_MS) / 1_000L - 1).toInt(),
+                    onValueChange = { onWebRequestTimeoutMsChange(it.roundToInt() * 1_000L) },
+                )
+            }
+
+            SettingsChoiceSection(
+                title = stringResource(R.string.agent_behavior_auto_retry_title),
                 description = stringResource(R.string.agent_behavior_retry_description),
             ) {
                 ToggleRow(
@@ -338,6 +410,7 @@ private fun ValueSliderRow(
     steps: Int,
     onValueChange: (Float) -> Unit,
     enabled: Boolean = true,
+    onValueChangeFinished: (() -> Unit)? = null,
 ) {
     Row(
         modifier = Modifier.fillMaxWidth(),
@@ -354,6 +427,7 @@ private fun ValueSliderRow(
     Slider(
         value = value,
         onValueChange = onValueChange,
+        onValueChangeFinished = onValueChangeFinished,
         valueRange = valueRange,
         steps = steps,
         enabled = enabled,

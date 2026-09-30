@@ -242,14 +242,24 @@ class RcloneRemoteStore(private val context: Context) {
         private const val KEY_REMOTES = "remotes"
 
         /**
-         * Which parameter carries the secret, per backend. rclone names these
-         * differently and there is no generic "password" key, so the mapping
-         * is explicit rather than guessed.
+         * Which parameter carries the secret, per backend.
+         *
+         * The per-backend answer is NOT owned here: it is owned by
+         * [RcloneBackendCatalog.secretField] — the field the Add Server form
+         * marks `isSecret` — so the form and the store cannot drift apart.
+         * Before this delegation the "s3 vs everything else" mapping was
+         * written out three times (here + twice in RcloneDestinationsViewModel)
+         * and only this copy was reachable from a test.
+         *
+         * The `?: "pass"` fallback is for a backend that is NOT in the
+         * catalog: that can only be one restored from another platform, and
+         * every backend this app offers except s3 spells its password field
+         * `pass`. Dropping the fallback (i.e. returning null) would route such
+         * a remote's secret to the plaintext prefs instead of the encrypted
+         * store, which is a worse failure than a guessed key name.
          */
-        fun secretKeyFor(backend: String): String = when (backend) {
-            "s3" -> "secret_access_key"
-            else -> "pass"
-        }
+        fun secretKeyFor(backend: String): String =
+            RcloneBackendCatalog.secretField(backend) ?: "pass"
 
         /**
          * Whether this backend's secret is a PASSWORD rclone will de-obscure,

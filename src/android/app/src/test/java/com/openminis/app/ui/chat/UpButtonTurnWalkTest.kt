@@ -29,7 +29,7 @@ class UpButtonTurnWalkTest {
 
     /** Mirrors the id extraction in ChatScreen's scrollToPreviousUserTurn. */
     private fun keyMessageId(key: String?): String? =
-        key?.split(':')?.getOrNull(1)?.takeIf { it.isNotEmpty() }
+        key?.split(':')?.getOrNull(1)?.substringBefore('#')?.takeIf { it.isNotEmpty() }
 
     /** Mirrors the target-selection rule in ChatScreen's scrollToPreviousUserTurn. */
     private fun pickTarget(
@@ -219,5 +219,27 @@ class UpButtonTurnWalkTest {
     fun `a conversation with no user turns yields no target`() {
         val noUsers = listOf(Msg("a1", "assistant"), Msg("a2", "assistant"))
         assertNull(pickTarget(noUsers, topRowKey = "mdblock:a2", lastJumpedUserId = null))
+    }
+
+    /**
+     * [T-android-scrollbtn-turn-walk] A rendered row can carry a `#n` dedupe
+     * suffix: `ChatFlatItems.dedupe` falls back to `"<id>#$n"` when a message
+     * would otherwise produce a duplicate LazyColumn key. The id segment of the
+     * row key must therefore drop that suffix — the two anchor parsers already
+     * did, the up/down walk parsers did not.
+     *
+     * Without the drop, the top row resolved to NO message at all, so the walk
+     * fell back to `index 0` and anchored on the OLDEST loaded turn instead of
+     * the turn actually on screen — the same class of bug as the original
+     * "every tap lands on the first turn" report.
+     */
+    @Test
+    fun `deduped row keys resolve to the underlying message id`() {
+        assertEquals("u2", keyMessageId("user:u2#2"))
+        assertEquals("u2", keyMessageId("mdblock:u2#2:text_u2_0:1"))
+        assertEquals("u2", keyMessageId("user:u2"))
+        // End to end through the selection rule: the first tap must still land
+        // on the turn the viewport is showing, not on the oldest turn.
+        assertEquals("u3", pickTarget(convo, topRowKey = "user:u3#2", lastJumpedUserId = null))
     }
 }

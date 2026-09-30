@@ -1,6 +1,7 @@
 package com.openminis.app.provider
 
 import com.openminis.app.data.model.AgentContentPart
+import com.openminis.app.BuildConfig
 import com.openminis.app.data.model.LLMError
 import com.openminis.app.data.model.LLMMessage
 import com.openminis.app.data.model.LLMModel
@@ -13,6 +14,7 @@ import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import org.json.JSONObject
 import org.junit.After
+import org.junit.Assume.assumeTrue
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
@@ -613,6 +615,13 @@ class AnthropicProviderTest {
 
     @Test
     fun `OAuth request omits redact-thinking beta so thinking text is not blanked`() = runBlocking {
+        // Public builds intentionally fail fast when the private Claude Code
+        // identifier prompt is absent. This wire-level assertion is only
+        // meaningful in the private build that supplies that prompt.
+        assumeTrue(
+            "private Anthropic OAuth prompt is not configured",
+            BuildConfig.ANTHROPIC_OAUTH_IDENTIFIER_PROMPT.isNotEmpty(),
+        )
         // Mirrors iOS 958ee16c (T-anthropic-redact-thinking). The Claude-Code
         // mimicry beta set must NOT carry `redact-thinking-2026-02-12`; with it,
         // the server blanks thinking text (signature only) even though the model
@@ -635,7 +644,6 @@ class AnthropicProviderTest {
             "anthropic-beta must not contain redact-thinking; was: $beta",
             !beta.contains("redact-thinking"),
         )
-        // Sanity: the OAuth mimicry betas we DO expect are still present.
         assertTrue("oauth beta present", beta.contains("oauth-2025-04-20"))
     }
 }

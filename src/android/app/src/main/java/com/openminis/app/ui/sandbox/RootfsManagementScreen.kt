@@ -320,7 +320,7 @@ fun RootfsManagementScreen(
                     showResetDialog = false
                     viewModel.resetRootfs(context, keepUserData = false)
                 }) {
-                    Text("Reset", color = MaterialTheme.colorScheme.error)
+                    Text(stringResource(R.string.common_reset), color = MaterialTheme.colorScheme.error)
                 }
             },
             dismissButton = {

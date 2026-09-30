@@ -376,7 +376,11 @@ private fun MdText(
                         clipboardManager.setText(AnnotatedString(snippet))
                         haptics.performHapticFeedback(HapticFeedbackType.LongPress)
                         val preview = if (snippet.length > 40) snippet.take(37) + "…" else snippet
-                        Toast.makeText(context, "Copied: $preview", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(
+                            context,
+                            context.getString(R.string.md_inline_copied, preview),
+                            Toast.LENGTH_SHORT,
+                        ).show()
                     }
                 }
             }
@@ -1731,7 +1735,11 @@ private fun RenderBlock(block: MdBlock) {
                     )
                     Icon(
                         imageVector = if (copied) Icons.Default.Check else Icons.Default.ContentCopy,
-                        contentDescription = if (copied) "Copied" else "Copy code",
+                        contentDescription = if (copied) {
+                            stringResource(R.string.common_copied)
+                        } else {
+                            stringResource(R.string.common_copy_code)
+                        },
                         tint = if (copied) Color(0xFF34C759) else Color.White.copy(alpha = 0.4f),
                         modifier = Modifier
                             .size(16.dp)
@@ -1771,13 +1779,24 @@ private fun RenderBlock(block: MdBlock) {
                             if (transition.shouldFollow) vScroll.scrollTo(vScroll.maxValue)
                         }
                 }
+                // [T-android-panel-parked-at-end] Resume half of this scroller's
+                // follow contract — see [ObserveFollowResume]. Without it a flick
+                // that parks the block at its own end after finger-up leaves the
+                // follow paused, so a still-growing code block stays frozen at
+                // whatever offset the gesture happened to end on.
+                ObserveFollowResume(
+                    key = vScroll,
+                    atEnd = { vScroll.isParkedAtEnd() },
+                    scrollInProgress = { vScroll.isScrollInProgress },
+                    onParkedAtEnd = { dispatchFollow(ScrollFollowEvent.AtBottomReached) },
+                )
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
                         .heightIn(max = 400.dp)
                         .observeVerticalDrag(
                             key = vScroll,
-                            atBottom = { vScroll.maxValue - vScroll.value <= 4 },
+                            atBottom = { vScroll.isParkedAtEnd() },
                             onStopped = { atBottom ->
                                 dispatchFollow(ScrollFollowEvent.UserDragStopped(atBottom))
                             },
@@ -2142,7 +2161,7 @@ private fun RenderInlineMath(latex: String, fontSize: TextUnit) {
             )
             androidx.compose.foundation.Image(
                 bitmap = rendered.bitmap.asImageBitmap(),
-                contentDescription = "math: $latex",
+                contentDescription = stringResource(R.string.md_math_content_description, latex),
                 modifier = Modifier.size(naturalWidthDp * fit, naturalHeightDp * fit),
                 contentScale = androidx.compose.ui.layout.ContentScale.Fit,
             )
@@ -2212,7 +2231,7 @@ private fun RenderMathDisplay(latex: String) {
             val scale = if (naturalWidthDp > maxWidth) maxWidth / naturalWidthDp else 1f
             androidx.compose.foundation.Image(
                 bitmap = rendered.bitmap.asImageBitmap(),
-                contentDescription = "math: $latex",
+                contentDescription = stringResource(R.string.md_math_content_description, latex),
                 modifier = Modifier.size(naturalWidthDp * scale, naturalHeightDp * scale),
                 contentScale = androidx.compose.ui.layout.ContentScale.Fit,
             )
@@ -2262,7 +2281,7 @@ private fun BrokenImagePlaceholder(alt: String?) {
                 tint = palette.secondaryText,
             )
             Text(
-                text = alt?.takeIf { it.isNotBlank() } ?: "Image not available",
+                text = alt?.takeIf { it.isNotBlank() } ?: stringResource(R.string.md_image_unavailable),
                 fontSize = 12.sp,
                 color = palette.secondaryText,
                 textAlign = TextAlign.Center,
@@ -2445,7 +2464,7 @@ private fun RenderMdVideo(block: MdBlock.Video) {
             }
             Icon(
                 imageVector = Icons.Filled.PlayCircleFilled,
-                contentDescription = "Play video",
+                contentDescription = stringResource(R.string.common_play_video),
                 tint = Color.White.copy(alpha = 0.9f),
                 modifier = Modifier.size(56.dp),
             )
@@ -2568,7 +2587,11 @@ private fun RenderMdAudio(block: MdBlock.Audio) {
         }
         Icon(
             imageVector = if (isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
-            contentDescription = if (isPlaying) "Pause" else "Play",
+            contentDescription = if (isPlaying) {
+                stringResource(R.string.common_pause)
+            } else {
+                stringResource(R.string.common_play)
+            },
             tint = tint,
             modifier = Modifier.size(28.dp),
         )

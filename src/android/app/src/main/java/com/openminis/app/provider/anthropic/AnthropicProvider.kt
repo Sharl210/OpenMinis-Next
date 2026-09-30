@@ -103,7 +103,7 @@ class AnthropicProvider(
                 responseBody,
                 LLMRequestDiagnostics(
                     statusCode = response.code,
-                    responseHeaders = requestHeaders(request),
+                    responseHeaders = response.headers.names().associateWith { response.headers[it] ?: "" },
                     errorResponse = responseBody,
                     requestBody = body.toString(),
                     debugInfo = "Anthropic sendMessage HTTP ${response.code}",
@@ -181,7 +181,7 @@ class AnthropicProvider(
                 errorBody,
                 LLMRequestDiagnostics(
                     statusCode = response.code,
-                    responseHeaders = requestHeaders(request),
+                    responseHeaders = response.headers.names().associateWith { response.headers[it] ?: "" },
                     errorResponse = errorBody,
                     requestBody = bodyStr,
                     debugInfo = "Anthropic stream HTTP ${response.code}",
@@ -307,8 +307,8 @@ class AnthropicProvider(
      *   Returns null when the prompt is null/empty (iOS parity — no empty `system` field).
      */
     internal fun resolveSystemPrompt(userPrompt: String?): JSONArray? {
-        val claudeCodePrefix = com.openminis.app.auth.ClaudeOAuthManager.ANTHROPIC_OAUTH_IDENTIFIER_PROMPT
         if (isOAuth) {
+            val claudeCodePrefix = com.openminis.app.auth.ClaudeOAuthManager.ANTHROPIC_OAUTH_IDENTIFIER_PROMPT
             // Strip the prefix if the caller already prepended it; the tail is the real user prompt.
             val tail = when {
                 userPrompt == null -> ""

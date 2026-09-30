@@ -125,4 +125,53 @@ class ScrollFollowStateMachineTest {
         assertEquals(ScrollFollowState.PAUSED_BY_USER, paused.state)
         assertEquals(ScrollFollowState.FOLLOWING, following.state)
     }
+
+    @Test
+    fun `an arrival at the end resumes following`() {
+        val machine = ScrollFollowStateMachine()
+        machine.dispatch(ScrollFollowEvent.UserDragStopped(atBottom = false))
+
+        val transition = machine.dispatch(ScrollFollowEvent.AtBottomReached)
+
+        assertEquals(ScrollFollowState.FOLLOWING, transition.currentState)
+        assertEquals(ScrollFollowState.FOLLOWING, machine.state)
+        assertTrue(transition.shouldFollow)
+    }
+
+    /**
+     * 需求「只要触过一次底，它就又继续跟随更新」的判据是**位置**，不是手势停止那一刻的
+     * 采样：手指离开屏幕之后 fling 才把视图送到末尾（用户拿它当中途反悔后停住），
+     * 此时若只有手势路径能恢复，跟随就永远回不来。
+     */
+    @Test
+    fun `one arrival at the end re-arms follow for every later growth`() {
+        val machine = ScrollFollowStateMachine()
+        machine.dispatch(ScrollFollowEvent.UserDragStopped(atBottom = false))
+
+        // 还没到达末尾：内容继续增长也必须停住（需求 b）。
+        val growthWhileAway = machine.dispatch(ScrollFollowEvent.ContentChanged)
+        assertEquals(ScrollFollowState.PAUSED_BY_USER, growthWhileAway.currentState)
+        assertFalse(growthWhileAway.shouldFollow)
+
+        // 位置到达末尾：跟随回来（需求 c）。
+        machine.dispatch(ScrollFollowEvent.AtBottomReached)
+
+        // 之后每次增长都要重新锚到末尾（需求 a）。
+        val firstGrowth = machine.dispatch(ScrollFollowEvent.ContentChanged)
+        val secondGrowth = machine.dispatch(ScrollFollowEvent.LayoutChanged)
+        assertEquals(ScrollFollowState.FOLLOWING, firstGrowth.currentState)
+        assertTrue(firstGrowth.shouldFollow)
+        assertTrue(secondGrowth.shouldFollow)
+    }
+
+    @Test
+    fun `an arrival at the end never arms a pause`() {
+        val machine = ScrollFollowStateMachine()
+
+        val transition = machine.dispatch(ScrollFollowEvent.AtBottomReached)
+
+        assertEquals(ScrollFollowState.FOLLOWING, transition.currentState)
+        assertFalse(transition.stateChanged)
+        assertTrue(transition.shouldFollow)
+    }
 }

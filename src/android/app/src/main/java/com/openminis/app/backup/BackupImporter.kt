@@ -455,32 +455,7 @@ class BackupImporter(
                 return@readJsonl
             }
             val createdAt = m.millis("createdAt") ?: 0
-            dao.insertMessage(
-                MessageEntity(
-                    id = id,
-                    sessionId = sessionId,
-                    role = m.str("role") ?: "user",
-                    // Re-serialised from the parsed element, so any part type
-                    // this build doesn't model is preserved verbatim.
-                    partsJson = (m["parts"]?.toString()) ?: "[]",
-                    createdAt = createdAt,
-                    tokenUsage = m["tokenUsage"]?.takeIf { it.toString() != "null" }?.toString(),
-                    sortOrder = m.int("sortOrder") ?: 0,
-                    reasoningContent = m.str("reasoningContent"),
-                    streamInterruptCount = m.int("streamInterruptCount") ?: 0,
-                    updatedAt = createdAt,
-                    // errorInfo is device-local (§0.2) and is never restored.
-                    errorInfo = null,
-                    // [T-token-attribution-snapshot] Absent in packages written
-                    // before this existed (and in any category the other
-                    // platform hasn't updated yet) — null then, which is
-                    // exactly the "estimated" state the Usage page renders.
-                    modelId = m.str("modelId"),
-                    modelDisplayName = m.str("modelDisplayName"),
-                    providerType = m.str("providerType"),
-                    providerInstanceId = m.str("providerInstanceId"),
-                )
-            )
+            dao.insertMessage(messageEntityFromRecord(m, id, sessionId, createdAt))
             report.imported += 1
         }
 
@@ -998,6 +973,55 @@ class BackupImporter(
 
         /** Shared with the exporter: the two must never run at once. */
         private val activityLock = Mutex()
+
+        /**
+         * Build the message row a `messages.jsonl` record describes.
+         *
+         * Split out of the import loop (which needs a DAO, a report and a live
+         * package) so the READ half of "a restored message keeps its thinking
+         * level" is asserted against this real mapping from a JVM test rather
+         * than against a re-implementation of it — the failure mode the test is
+         * meant to catch is a field missing from exactly this argument list, and
+         * a copy in the test would share that omission instead of exposing it.
+         *
+         * Every field here is written by [BackupExporter.messageRecord]; keep the
+         * two in step.
+         */
+        internal fun messageEntityFromRecord(
+            m: JsonObject,
+            id: String,
+            sessionId: String,
+            createdAt: Long,
+        ): MessageEntity = MessageEntity(
+            id = id,
+            sessionId = sessionId,
+            role = m.str("role") ?: "user",
+            // Re-serialised from the parsed element, so any part type
+            // this build doesn't model is preserved verbatim.
+            partsJson = (m["parts"]?.toString()) ?: "[]",
+            createdAt = createdAt,
+            tokenUsage = m["tokenUsage"]?.takeIf { it.toString() != "null" }?.toString(),
+            sortOrder = m.int("sortOrder") ?: 0,
+            reasoningContent = m.str("reasoningContent"),
+            streamInterruptCount = m.int("streamInterruptCount") ?: 0,
+            updatedAt = createdAt,
+            // errorInfo is device-local (§0.2) and is never restored.
+            errorInfo = null,
+            // [T-token-attribution-snapshot] Absent in packages written
+            // before this existed (and in any category the other
+            // platform hasn't updated yet) — null then, which is
+            // exactly the "estimated" state the Usage page renders.
+            modelId = m.str("modelId"),
+            modelDisplayName = m.str("modelDisplayName"),
+            providerType = m.str("providerType"),
+            providerInstanceId = m.str("providerInstanceId"),
+            // [T-android-thinking-level-persist] Absent in packages written
+            // before the level was recorded (including every iOS package, which
+            // has no such field) — null then, meaning "not recorded". That is a
+            // different state from a recorded OFF, and the message header relies
+            // on the difference: OFF draws an "Off" capsule, null draws none.
+            thinkingLevel = m.str("thinkingLevel"),
+        )
 
         /** Sessions must land before the messages that reference them. */
         private val ORDER = listOf(

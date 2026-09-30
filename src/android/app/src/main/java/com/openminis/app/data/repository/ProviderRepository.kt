@@ -20,6 +20,7 @@ import com.openminis.app.data.model.LLMModel
 import com.openminis.app.data.model.ModelEntry
 import com.openminis.app.data.model.ModelOverrides
 import com.openminis.app.data.model.ModelGroup
+import com.openminis.app.data.model.ModelRoleSelectionResolver
 import com.openminis.app.data.model.ProviderConfig
 import com.openminis.app.data.model.ProviderCredential
 import com.openminis.app.data.model.ProviderInstance
@@ -937,6 +938,22 @@ class ProviderRepository(private val context: Context) {
     }
 
     /**
+     * The entry a conversation with no binding of its own starts on.
+     *
+     * Tier 1 is the user's explicit **Primary Agent Model** setting, which is
+     * what the Settings row promises and what the chat path used to ignore
+     * entirely (see [ModelRoleSelectionResolver.newChatDefaultEntry]). Tiers 2
+     * and 3 are the previous behaviour, unchanged.
+     */
+    fun newChatDefaultEntry(): ModelEntry? =
+        ModelRoleSelectionResolver.newChatDefaultEntry(
+            config = _config.value,
+            visibleEntries = allVisibleEntries(),
+            lastUsedEntryId = lastUsedEntryId,
+            newestTextEntry = newestProviderNewestTextEntry(),
+        )
+
+    /**
      * [T-newchat-default-model-fallback-android] Final-tier default for a new
      * chat: the newest text-output model from the newest-added enabled
      * provider. "Newest provider" = max [ProviderInstance.createdAt]; "newest
@@ -1632,12 +1649,27 @@ class ProviderRepository(private val context: Context) {
             saveConfig(config)
         }
 
-    /** True when a Vision Group is bound AND still exists. Gates read_image
-     *  tool exposure for main models that cannot natively see images. */
-    fun hasVisionGroupConfigured(): Boolean {
-        val gid = _config.value.visionGroupId ?: return false
-        return _config.value.modelGroups.any { it.id == gid }
-    }
+    /**
+     * True when the bound Vision Group can actually serve an image — the gate
+     * `read_image` exposure is decided by.
+     *
+     * SINGLE SOURCE: this returns the same verdict as
+     * [com.openminis.app.tools.VisionGroupResolver.isConfigured] because both
+     * read [resolveVisionCandidates]; there is no second implementation to drift.
+     *
+     * It used to answer a WEAKER question — "is a group bound and does that group
+     * still exist" — which is a strict SUPERSET of this one: a group whose
+     * members are all disabled, dangling or non-vision models answered true here
+     * while the real gate said no. A caller reaching for this name would have
+     * advertised `read_image` to a model that cannot read anything, i.e. a tool
+     * that can only ever fail with a failure the model cannot explain. That is
+     * the mirror image of the [T-vision-group-gate-too-strict] regression
+     * recorded in VisionGroupResolver (gate too strict → the tool silently
+     * disappeared *while it would have worked*), so the fix is not to pick a
+     * middle ground: the strict verdict is the only one that is safe in both
+     * directions, and it now has exactly one implementation.
+     */
+    fun hasVisionGroupConfigured(): Boolean = resolveVisionCandidates().isNotEmpty()
 
     /** Bound Vision group's display name, or null. */
     fun visionGroupName(): String? {
@@ -1656,27 +1688,12 @@ class ProviderRepository(private val context: Context) {
      */
     fun resolveVisionCandidates(loadBalanceSeed: Int = 0): List<Pair<ProviderInstance, ModelEntry>> {
         ensureConfigLoaded()
-        val config = _config.value
-
-        fun providerEntry(memberId: String): Pair<ProviderInstance, ModelEntry>? {
-            val entry = config.modelEntries.find { it.id == memberId } ?: return null
-            val inst = config.instances.find { it.id == entry.providerInstanceId } ?: return null
-            if (!inst.isEnabled || !entry.model.hasImageInput) return null
-            return inst to entry
-        }
-
-        val gid = config.visionGroupId ?: return emptyList()
-        val group = config.modelGroups.find { it.id == gid } ?: return emptyList()
-        var members = group.memberEntryIds.mapNotNull { providerEntry(it) }
-        if (group.strategy == RoutingStrategy.loadBalance && members.size > 1) {
-            val offset = kotlin.math.abs(loadBalanceSeed) % members.size
-            members = members.drop(offset) + members.take(offset)
-        }
-        val out = mutableListOf<Pair<ProviderInstance, ModelEntry>>()
-        for (m in members) {
-            if (out.none { it.second.id == m.second.id }) out.add(m)
-        }
-        return if (group.strategy == RoutingStrategy.none) out.take(1) else out
+        // The decision is pure and lives in [resolveVisionCandidatesIn] so it can
+        // be exercised directly: this class cannot be constructed off-device
+        // (Context + Room + encrypted prefs), and the previous test for this area
+        // therefore re-implemented the rule instead of calling it — a second copy
+        // that could drift without any test going red.
+        return resolveVisionCandidatesIn(_config.value, loadBalanceSeed)
     }
 
     // --- Thinking rules (custom) [T-android-thinking-rules-phase2] ---
@@ -3163,4 +3180,54 @@ class ProviderRepository(private val context: Context) {
         val bits = obj.optInt("modalityOverride", 0)
         return modalityListsFromBitfield(bits)
     }
+}
+
+/**
+ * Pure core of [ProviderRepository.resolveVisionCandidates].
+ *
+ * The Vision Group gate is too important to be testable only through a
+ * `ProviderRepository` instance: it decides whether `read_image` is advertised
+ * to a main model that cannot see anything, and the two field incidents in this
+ * area (the tool silently VANISHING when the gate was too strict, and a group
+ * that can serve nothing counting as configured when the gate was too loose)
+ * were both found by users, not by tests. Taking the config as a parameter makes
+ * the verdict callable from a plain JVM test.
+ *
+ * Rules, mirroring iOS `VisionGroupResolver`:
+ *   - no bound group, or a pointer to a group that no longer exists → no
+ *     candidates (a dangling pointer is "not configured", not "configure any");
+ *   - a member counts only if its entry exists, its provider instance exists,
+ *     that instance is enabled, and its model declares image input;
+ *   - members that fail those checks are skipped individually, so one dangling
+ *     reference cannot disqualify a good sibling;
+ *   - NO credential probe: "can this call succeed" is not "is this model
+ *     capable", and answering the first one here made `read_image` disappear
+ *     when a key was merely stored somewhere the probe could not see. Missing
+ *     credentials surface at request time, loudly, in VisionGroupResolver.
+ *   - `loadBalance` rotates the start by [loadBalanceSeed]; `none` keeps only the
+ *     first usable member; everything else keeps group order.
+ */
+internal fun resolveVisionCandidatesIn(
+    config: ProviderConfig,
+    loadBalanceSeed: Int = 0,
+): List<Pair<ProviderInstance, ModelEntry>> {
+    fun providerEntry(memberId: String): Pair<ProviderInstance, ModelEntry>? {
+        val entry = config.modelEntries.find { it.id == memberId } ?: return null
+        val inst = config.instances.find { it.id == entry.providerInstanceId } ?: return null
+        if (!inst.isEnabled || !entry.model.hasImageInput) return null
+        return inst to entry
+    }
+
+    val gid = config.visionGroupId ?: return emptyList()
+    val group = config.modelGroups.find { it.id == gid } ?: return emptyList()
+    var members = group.memberEntryIds.mapNotNull { providerEntry(it) }
+    if (group.strategy == RoutingStrategy.loadBalance && members.size > 1) {
+        val offset = kotlin.math.abs(loadBalanceSeed) % members.size
+        members = members.drop(offset) + members.take(offset)
+    }
+    val out = mutableListOf<Pair<ProviderInstance, ModelEntry>>()
+    for (m in members) {
+        if (out.none { it.second.id == m.second.id }) out.add(m)
+    }
+    return if (group.strategy == RoutingStrategy.none) out.take(1) else out
 }

@@ -61,4 +61,25 @@ data class MessageEntity(
     @ColumnInfo(name = "provider_type") val providerType: String? = null,
     /** Diagnostics / disambiguation only — the UI never resolves through it. */
     @ColumnInfo(name = "provider_instance_id") val providerInstanceId: String? = null,
+    // [T-android-thinking-level-persist] The thinking level this reply was
+    // ACTUALLY produced at, captured AT WRITE TIME — the same
+    // "snapshot, not a reference" rule as the four model columns above, and for
+    // the same reason: the session's level is one mutable setting
+    // (`ChatViewModel._thinkingLevel`), so reading it anywhere other than at
+    // write time re-labels history with a present-day value.
+    //
+    // Nothing used to write it down per message, so the message header had
+    // nothing of its own to show. Where the badge DID appear it came from the
+    // live in-memory bubble, and every row restored from disk was presented at
+    // the level the user happened to have selected when they opened the app.
+    //
+    // Stores `ThinkingLevel.name` (e.g. `"HIGH"`), the encoding
+    // `ThinkingLevel.decoded` reads back and the one kotlinx already writes for
+    // this enum — so a build that does not know a token a NEWER build wrote
+    // clamps instead of throwing.
+    //
+    // Nullable ON PURPOSE and it is load-bearing: rows written before this
+    // column existed read NULL, and NULL means "not recorded", never "OFF". The
+    // UI shows no level capsule for such a row rather than inventing one.
+    @ColumnInfo(name = "thinking_level") val thinkingLevel: String? = null,
 )

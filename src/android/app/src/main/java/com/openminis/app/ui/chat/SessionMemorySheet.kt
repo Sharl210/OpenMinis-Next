@@ -359,8 +359,24 @@ private fun MemoryToolRow(
     onClick: () -> Unit,
     showDivider: Boolean,
 ) {
-    val opLabel = if (record.isWrite) "memory_write" else "memory_get"
-    val opColor = MaterialTheme.colorScheme.primary
+    // [T-android-persistence-result-check] A FAILED write must not read as a
+    // completed one. The panel previously labelled it "memory_write" in the
+    // success colour with the content previewed beneath, so a write that never
+    // reached disk still looked recorded.
+    val failedSuffix = stringResource(R.string.memory_op_failed_suffix)
+    // Tool names stay as-is (they are model-facing identifiers); only the
+    // failure marker is localized copy.
+    val opLabel = when {
+        !record.succeeded && record.isWrite -> "memory_write " + failedSuffix
+        record.isWrite -> "memory_write"
+        !record.succeeded -> "memory_get " + failedSuffix
+        else -> "memory_get"
+    }
+    val opColor = if (record.succeeded) {
+        MaterialTheme.colorScheme.primary
+    } else {
+        MaterialTheme.colorScheme.error
+    }
 
     Column(modifier = Modifier.clickable(onClick = onClick)) {
         Row(
@@ -429,6 +445,8 @@ data class MemoryToolRecord(
     val output: String,
     val writtenContent: String? = null,
     val keywords: String? = null,
+    /** [T-android-persistence-result-check] False when the op reported failure. */
+    val succeeded: Boolean = true,
 )
 
 /**
@@ -463,7 +481,7 @@ private fun buildAutoInjectedItems(context: Context, memoryRepository: MemoryRep
         val lineCount = soulContent.lines().size
         items.add(AutoItem(
             name = "SOUL.md",
-            detail = "$lineCount lines (full)",
+            detail = context.getString(R.string.memory_lines_full, lineCount),
             fileName = "SOUL.md",
             content = soulContent,
         ))
@@ -482,7 +500,7 @@ private fun buildAutoInjectedItems(context: Context, memoryRepository: MemoryRep
         val lineCount = globalContent.lines().size
         items.add(AutoItem(
             name = "GLOBAL.md",
-            detail = "$lineCount lines (full)",
+            detail = context.getString(R.string.memory_lines_full, lineCount),
             fileName = "GLOBAL.md",
             content = globalContent,
         ))
@@ -507,7 +525,11 @@ private fun buildAutoInjectedItems(context: Context, memoryRepository: MemoryRep
         if (content.isNotBlank()) {
             val lineCount = content.lines().size
             val injected = minOf(lineCount, 200)
-            val detail = if (lineCount > 200) "$injected/$lineCount lines injected" else "$lineCount lines (full)"
+            val detail = if (lineCount > 200) {
+                context.getString(R.string.memory_lines_injected, injected, lineCount)
+            } else {
+                context.getString(R.string.memory_lines_full, lineCount)
+            }
             items.add(AutoItem(
                 name = "$label — $fileName",
                 detail = detail,

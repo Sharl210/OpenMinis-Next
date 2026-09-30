@@ -387,7 +387,14 @@ class BrowserUseManager(
                 val histUrl = url ?: ""
                 val histTitle = view.title ?: ""
                 if (histUrl.isNotEmpty() && histUrl != "about:blank") {
-                    BrowserHistoryStore.getInstance(view.context).record(histUrl, histTitle)
+                    // The entry is rolled back when it could not be written, so
+                    // report it here instead of letting the visit vanish at the
+                    // next launch with nobody having been told.
+                    val historyWrite = BrowserHistoryStore.getInstance(view.context)
+                        .record(histUrl, histTitle)
+                    if (historyWrite.failed) {
+                        Log.w(TAG, "Browsing history entry not persisted: ${historyWrite.error}")
+                    }
                 }
                 // T-webview-popup-d3c6e10f (Issue 1): after the pool WebView's
                 // setInitialScale settles, force a JS `resize` event so
@@ -725,6 +732,7 @@ class BrowserUseManager(
             )
             BrowserAction.WAIT_FOR_DOM_STABLE -> return waitForDomStable(input.timeoutMs)
                          BrowserAction.NEW_TAB, BrowserAction.CLOSE_TAB, BrowserAction.LIST_TABS,
+             BrowserAction.LIST_DOWNLOADS, BrowserAction.RESTORE_TAB,
              BrowserAction.GET_HISTORY,
              BrowserAction.LIST_BOOKMARKS, BrowserAction.GET_BOOKMARKS, BrowserAction.GET_FAVORITES,
              BrowserAction.ADD_BOOKMARK, BrowserAction.BOOKMARK, BrowserAction.ADD_FAVORITE,
@@ -733,7 +741,8 @@ class BrowserUseManager(
              BrowserAction.DELETE_HISTORY, BrowserAction.CLEAR_HISTORY,
              BrowserAction.DELETE_BOOKMARK, BrowserAction.CLEAR_BOOKMARKS,
              BrowserAction.DELETE_FAVORITE, BrowserAction.CLEAR_FAVORITES,
-             BrowserAction.OPEN_BOOKMARK, BrowserAction.OPEN_FAVORITE ->
+             BrowserAction.OPEN_BOOKMARK, BrowserAction.OPEN_FAVORITE,
+             BrowserAction.TOGGLE_BOOKMARK, BrowserAction.IS_BOOKMARKED ->
                  return BrowserActionResult.error("Library and tab management actions must be routed through BrowserTabPool")
 
 

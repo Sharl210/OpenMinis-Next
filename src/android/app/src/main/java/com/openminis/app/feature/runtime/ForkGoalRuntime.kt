@@ -30,10 +30,31 @@ sealed interface ForkGoalCommand {
     data class Goal(val objective: String) : ForkGoalCommand
 }
 
+/**
+ * [T-android-slash-goal-fork] The single definition of the slash words `/fork`
+ * and `/goal`.
+ *
+ * The parser and the command picker both need these strings, and they must
+ * agree: a word the parser accepts but the picker never lists is a command the
+ * user cannot discover, and a word the picker offers but the parser rejects is a
+ * tap that does nothing. They used to live only inside
+ * [ForkGoalCommandParser] as private constants, so the picker had to re-spell
+ * them by hand — precisely the two-copies-of-one-concept setup that has drifted
+ * apart repeatedly in this codebase. `SlashCommandCatalogTest` asserts the
+ * picker covers every word declared here.
+ */
+object SlashCommandWords {
+    const val FORK = "/fork"
+    const val GOAL = "/goal"
+
+    /** Every command word the parser accepts. The picker must offer all of them. */
+    val parserAccepted: List<String> = listOf(FORK, GOAL)
+}
+
 /** User-facing slash-command parser. It accepts both ASCII and full-width slash. */
 object ForkGoalCommandParser {
-    private const val FORK = "/fork"
-    private const val GOAL = "/goal"
+    private const val FORK = SlashCommandWords.FORK
+    private const val GOAL = SlashCommandWords.GOAL
 
     fun isCommand(input: String): Boolean = parse(input) != null
 
@@ -102,6 +123,16 @@ data class GoalRuntimeSnapshot(
     val continuationPrompt: String? = null,
     val continuationDelivered: Boolean = false,
     val continuationCount: Int = 0,
+    /**
+     * [T-android-goal-auto-continuation] Auto-continuations this goal has spent
+     * unattended, measured against
+     * [GoalAutoContinuationPolicy.MAX_AUTO_CONTINUATIONS]. Kept separate from
+     * [continuationCount] (which counts *stops*, including ones a human resumes
+     * by hand) so a user who keeps a goal going himself does not silently eat
+     * the budget meant to bound the unattended case. Persisted with the rest of
+     * the snapshot: a process death must not hand the loop a fresh budget.
+     */
+    val autoContinuationCount: Int = 0,
     val updatedAtMillis: Long = 0L,
 ) {
     companion object {
@@ -206,6 +237,29 @@ class ForkGoalRuntime(
         val prompt = snapshot.continuationPrompt ?: return null
         snapshot = snapshot.copy(continuationDelivered = true, updatedAtMillis = nowMillis)
         return prompt
+    }
+
+    /**
+     * [T-android-goal-auto-continuation] Spends one unit of the unattended
+     * auto-continuation budget.
+     *
+     * Purely additive, and deliberately so: no existing transition changes and
+     * the only way to consume a pending prompt is still
+     * [pollContinuationPrompt] followed by [resume]. All this does is record that
+     * an attempt was made, before the attempt runs, so a failure between here and
+     * the actual model call cannot make the budget repeatable.
+     */
+    fun noteAutoContinuation(nowMillis: Long = 0L): GoalTransition {
+        val previous = snapshot
+        if (snapshot.status != GoalStatus.NEEDS_CONTINUATION) {
+            return reject(previous, "goal has no pending continuation")
+        }
+        val current = snapshot.copy(
+            autoContinuationCount = snapshot.autoContinuationCount + 1,
+            updatedAtMillis = nowMillis,
+        )
+        snapshot = current
+        return GoalTransition(previous, current, accepted = true)
     }
 
     /** Starts the next run after the caller injected the pending continuation prompt. */

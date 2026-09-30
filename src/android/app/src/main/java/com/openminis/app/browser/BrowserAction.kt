@@ -44,7 +44,41 @@ enum class BrowserAction(val value: String) {
     DELETE_FAVORITE("delete_favorite"),
     CLEAR_FAVORITES("clear_favorites"),
     OPEN_BOOKMARK("open_bookmark"),
-    OPEN_FAVORITE("open_favorite");
+    OPEN_FAVORITE("open_favorite"),
+
+    /**
+     * [T-browser-star-parity] The toolbar star is a toggle: it saves the page
+     * when it is not saved and removes it when it is, and it reads back as a
+     * filled/outlined icon. Both operations already existed in
+     * `BrowserHistoryStore` and in the UI, but the agent could only emulate the
+     * star by listing bookmarks and deciding add-vs-remove itself, and could not
+     * ask "is this page bookmarked?" at all. Exposing the existing store calls
+     * makes the agent's model of the star identical to the button's.
+     */
+    TOGGLE_BOOKMARK("toggle_bookmark"),
+    IS_BOOKMARKED("is_bookmarked"),
+
+    /**
+     * [T-browser-download-handle] Lets the agent enumerate this session's
+     * downloads instead of only receiving a one-off chat line when one lands.
+     *
+     * The requirement asks the download centre to provide "Agent 可查询的句柄"
+     * — a queryable handle, not a notification. Without an action the registry
+     * was reachable only from the UI, so an agent that needed a file it had
+     * downloaded could not find out whether it finished, where it landed, or
+     * why it failed.
+     */
+    LIST_DOWNLOADS("list_downloads"),
+
+    /**
+     * [T-browser-sleeping-tabs-visible] Reopen a page that the idle evictor put
+     * to sleep, addressed by its stable page id.
+     *
+     * `list_tabs` reports slept pages as `Sleeping page <id>`; without this
+     * action that report would be a dead end — the agent (and the user) could
+     * see that a page existed but had no way to bring it back.
+     */
+    RESTORE_TAB("restore_tab");
 
     /**
      * [T-browser-readaction-follow-tab-and-yolo-android] True when this action

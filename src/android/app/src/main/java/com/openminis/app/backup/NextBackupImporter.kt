@@ -62,6 +62,25 @@ class NextBackupImporter(
                     val entry = zip.nextEntry ?: break
                     require(!entry.isDirectory) { "Directory entries are not allowed" }
                     entryCount++
+                    // [T-android-next-backup-entry-budget] The `+ 1` is the
+                    // manifest, and it is deliberate — NOT an off-by-one.
+                    //
+                    // `entryCount` counts every zip entry including
+                    // `manifest.json`, and the manifest is mandatory (see the
+                    // "Next package has no manifest.json" throw below). So this
+                    // permits at most `maxEntries` PAYLOAD files plus one
+                    // manifest.
+                    //
+                    // This was undocumented, and two independent readers concluded
+                    // it let one extra entry through. It does not — but the cost of
+                    // that ambiguity is real: "fixing" it to `entryCount <=
+                    // maxEntries` would silently REJECT a legitimate backup that
+                    // carries exactly `maxEntries` payload files.
+                    // NextBackupEntryBudgetTest pins both directions.
+                    //
+                    // A package with no manifest still passes this count check and
+                    // is then rejected by the manifest requirement, so the count is
+                    // never the only guard.
                     require(entryCount <= maxEntries + 1) { "Package has too many entries" }
                     val path = if (entry.name == "manifest.json") "manifest.json" else NextBackupIntegrity.safeRelativePath(entry.name)
                     val bytes = zip.readBytesBounded((maxTotalBytes - totalBytes).coerceAtLeast(0))

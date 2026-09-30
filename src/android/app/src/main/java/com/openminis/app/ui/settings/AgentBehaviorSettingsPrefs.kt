@@ -2,6 +2,10 @@ package com.openminis.app.ui.settings
 
 import android.content.Context
 import android.content.SharedPreferences
+import com.openminis.app.feature.runtime.AgentRetryPolicy
+import com.openminis.app.feature.runtime.AgentRetryRunner
+import com.openminis.app.feature.runtime.AgentRuntimeConfig
+import com.openminis.app.feature.runtime.RuntimeFailure
 
 /** Persistent, UI-owned preferences for Agent execution behavior. */
 class AgentBehaviorSettingsPrefs(context: Context) {
@@ -33,8 +37,7 @@ class AgentBehaviorSettingsPrefs(context: Context) {
             .coerceIn(MIN_WEB_REQUEST_TIMEOUT_MS, MAX_WEB_REQUEST_TIMEOUT_MS),
     )
 
-    fun save(settings: AgentBehaviorSettings) {
-        prefs.edit()
+    fun save(settings: AgentBehaviorSettings): Boolean = prefs.edit()
             .putString(KEY_WORK_STEP_DISPLAY, settings.workStepDisplay.name)
             .putInt(KEY_RECURSION_DEPTH, settings.recursionDepth.coerceIn(MIN_RECURSION_DEPTH, MAX_RECURSION_DEPTH))
             .putInt(KEY_PARALLEL_AGENT_LIMIT, settings.parallelAgentLimit.coerceIn(MIN_PARALLEL_AGENTS, MAX_PARALLEL_AGENTS))
@@ -47,8 +50,7 @@ class AgentBehaviorSettingsPrefs(context: Context) {
             .putInt(KEY_MAX_RETRY_ATTEMPTS, normalizeMaxRetryAttempts(settings.maxRetryAttempts))
             .putInt(KEY_WEB_SEARCH_MAX_RESULTS, settings.webSearchMaxResults.coerceIn(MIN_WEB_SEARCH_MAX_RESULTS, MAX_WEB_SEARCH_MAX_RESULTS))
             .putLong(KEY_WEB_REQUEST_TIMEOUT_MS, settings.webRequestTimeoutMs.coerceIn(MIN_WEB_REQUEST_TIMEOUT_MS, MAX_WEB_REQUEST_TIMEOUT_MS))
-            .apply()
-    }
+            .commit()
 
     companion object {
         private const val PREFS_NAME = "agent_behavior_settings"
@@ -107,3 +109,71 @@ data class AgentBehaviorSettings(
     val webSearchMaxResults: Int = AgentBehaviorSettingsPrefs.DEFAULT_WEB_SEARCH_MAX_RESULTS,
     val webRequestTimeoutMs: Long = AgentBehaviorSettingsPrefs.DEFAULT_WEB_REQUEST_TIMEOUT_MS,
 )
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The user's automatic-retry setting, in ONE place.
+//
+// [T-android-retry-governs-title-and-compaction] Every call site that is
+// governed by the user's retry setting — the agent main loop, session-title
+// generation and context compaction — must obtain its policy from
+// [agentRetryPolicyFromSettings] / [agentRetryRunnerFromSettings] below.
+// Recomputing "read the prefs, fold autoRetryEnabled into maxAttempts, build a
+// policy" at a second site is the defect this block exists to prevent: the two
+// copies drift, and one of them silently stops honouring the user's value.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * The user's retry budget in the [AgentRuntimeConfig.maxAttempts] vocabulary:
+ * `-1` = always, `0` = disabled, `N>0` = N retries. "Automatic retry off" is
+ * folded into `0` here and nowhere else, so disabling retries in Settings means
+ * the same thing (and only one thing) at every call site.
+ */
+val AgentBehaviorSettings.effectiveMaxRetryAttempts: Int
+    get() = if (autoRetryEnabled) maxRetryAttempts else 0
+
+/**
+ * Total provider calls one logical request may issue for [maxAttempts]: the
+ * first try plus the retry budget. `-1` (always) has no finite bound and
+ * reports [Int.MAX_VALUE].
+ */
+fun retryBudgetTotalAttempts(maxAttempts: Int): Int =
+    if (maxAttempts < 0) Int.MAX_VALUE else maxAttempts + 1
+
+/** The single persisted-settings → runtime-config mapping. */
+fun agentRuntimeConfigFromSettings(settings: AgentBehaviorSettings): AgentRuntimeConfig =
+    AgentRuntimeConfig(
+        maxAttempts = settings.effectiveMaxRetryAttempts,
+        initialRetryDelayMillis = 1_000L,
+        maxRetryDelayMillis = 30_000L,
+        backoffMultiplier = 1.2,
+        jitterRatio = 0.2,
+    )
+
+/**
+ * The single persisted-settings → retry-policy mapping. Jitter is random in
+ * production; tests that need a pinned delay build the policy themselves.
+ */
+fun agentRetryPolicyFromSettings(settings: AgentBehaviorSettings): AgentRetryPolicy =
+    AgentRetryPolicy(agentRuntimeConfigFromSettings(settings)) {
+        kotlin.random.Random.nextDouble(-1.0, 1.0)
+    }
+
+/** Convenience for the call sites that hold an Android [Context], not settings. */
+fun agentRetryPolicyFromContext(context: Context): AgentRetryPolicy =
+    agentRetryPolicyFromSettings(AgentBehaviorSettingsPrefs(context).load())
+
+/**
+ * The single persisted-settings → retry-LOOP mapping. [sleep] and [onRetry] are
+ * injectable so tests read the retry budget without waiting out the backoff.
+ */
+fun agentRetryRunnerFromSettings(
+    settings: AgentBehaviorSettings,
+    sleep: suspend (Long) -> Unit = { kotlinx.coroutines.delay(it) },
+    onRetry: (attempt: Int, delayMillis: Long, failure: RuntimeFailure) -> Unit = { _, _, _ -> },
+): AgentRetryRunner =
+    AgentRetryRunner(
+        policy = agentRetryPolicyFromSettings(settings),
+        maxAttempts = settings.effectiveMaxRetryAttempts,
+        sleep = sleep,
+        onRetry = onRetry,
+    )

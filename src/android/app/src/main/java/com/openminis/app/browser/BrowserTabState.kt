@@ -12,6 +12,39 @@ enum class BrowserIdleState { ACTIVE, SLEEPING }
 object BrowserIdleSleepStateMachine {
     fun state(inUse: Boolean, idleMs: Long, timeoutMs: Long): BrowserIdleState =
         if (inUse || idleMs < timeoutMs) BrowserIdleState.ACTIVE else BrowserIdleState.SLEEPING
+
+    /**
+     * The complete decision to sleep a tab, as a pure function.
+     *
+     * [T-browser-idle-eviction-conditions] This exists so the eviction rules can
+     * be tested at all. The evictor used to decide inline inside a method that
+     * needs an Android `Context` and a live `WebView`, so **no test ever
+     * exercised it** — which is exactly how a tab the user was reading, and a
+     * user-visible download in flight, both got destroyed by an idle timer
+     * without anyone noticing. One pure predicate, one place to test.
+     *
+     * Sleep is permitted only when nothing is happening to the page. The
+     * requirement lists the conditions explicitly: the model is not executing
+     * anything, the user has not opened it to look, and no script is running
+     * against it.
+     *
+     * @param isUserViewing the tab the user currently has on screen
+     * @param anyDownloadInFlight a download anywhere in the pool is still
+     *        transferring; blob:/data: downloads are fetched through the page's
+     *        WebView, so evicting during one silently loses the transfer and
+     *        leaves no record at all
+     */
+    fun shouldSleep(
+        inUse: Boolean,
+        idleMs: Long,
+        timeoutMs: Long,
+        isUserViewing: Boolean,
+        anyDownloadInFlight: Boolean,
+    ): Boolean {
+        if (isUserViewing) return false
+        if (anyDownloadInFlight) return false
+        return state(inUse = inUse, idleMs = idleMs, timeoutMs = timeoutMs) == BrowserIdleState.SLEEPING
+    }
 }
 
 

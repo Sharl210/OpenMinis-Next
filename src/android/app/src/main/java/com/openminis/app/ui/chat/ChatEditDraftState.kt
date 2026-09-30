@@ -20,16 +20,19 @@ enum class EditCommitMode {
     UPDATE_IN_PLACE,
 }
 
+/**
+ * The outcome of a commit. The "no send / no retry / no deletion of later
+ * messages" policy is carried by [mode] (`UPDATE_IN_PLACE`) and stated in
+ * [ChatEditDraftState.commitEditing]'s contract — it used to also be mirrored
+ * here as three `get() = false` markers, which no production code read and
+ * which could not fail, so they have been removed rather than left to read as
+ * guarantees that something was testing.
+ */
 data class EditCommitResult(
     val messageId: String,
     val replacement: ChatDraftSnapshot,
     val mode: EditCommitMode = EditCommitMode.UPDATE_IN_PLACE,
-) {
-    /** Explicit policy markers for integration code and tests. */
-    val sendsAutomatically: Boolean get() = false
-    val retriesAutomatically: Boolean get() = false
-    val deletesFollowingMessages: Boolean get() = false
-}
+)
 
 /**
  * Stateful, single-edit composer model.

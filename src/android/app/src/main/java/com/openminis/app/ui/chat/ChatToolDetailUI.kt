@@ -323,7 +323,7 @@ internal fun ToolDetailSheet(
                 ) {
                     Icon(
                         Icons.Default.Close,
-                        contentDescription = "Close",
+                        contentDescription = stringResource(R.string.common_close),
                         tint = ChatColors.primaryText,
                         modifier = Modifier.size(16.dp),
                     )
@@ -399,7 +399,7 @@ internal fun ToolDetailSheet(
                         .clickable {
                             if (isShellTool) {
                                 val command = extractShellCommand(toolArgsForAction, block)
-                                if (command.isNotBlank() && command != "Shell command") {
+                                if (command.isNotBlank() && command != SHELL_COMMAND_UNAVAILABLE_SENTINEL) {
                                     AppLogger.info(
                                         "ChatScreen",
                                         "opening terminal with prefill: ${command.take(120)}",
@@ -436,9 +436,9 @@ internal fun ToolDetailSheet(
                             else -> Icons.Default.ContentCopy
                         },
                         contentDescription = when {
-                            isShellTool -> "Open in terminal"
-                            isBrowserTool -> "Open in session browser"
-                            else -> "Copy"
+                            isShellTool -> stringResource(R.string.chat_tool_open_in_terminal)
+                            isBrowserTool -> stringResource(R.string.chat_tool_open_in_browser)
+                            else -> stringResource(R.string.common_copy)
                         },
                         tint = ChatColors.primaryText,
                         modifier = Modifier.size(16.dp),
@@ -531,7 +531,7 @@ internal fun ToolDetailSheet(
                                             .padding(bottom = hudReservePadding),
                                     ) {
                                         Text(
-                                            text = "$ $command",
+                                            text = "$ ${shellCommandText(command)}",
                                             fontSize = 13.sp,
                                             fontWeight = FontWeight.Bold,
                                             fontFamily = FontFamily.Monospace,
@@ -756,7 +756,7 @@ internal fun ToolDetailSheet(
                                     ) {
                                         Row(verticalAlignment = Alignment.CenterVertically) {
                                             Text(
-                                                text = "Edited",
+                                                text = stringResource(R.string.chat_tool_edited),
                                                 fontSize = 13.sp,
                                                 fontWeight = FontWeight.SemiBold,
                                                 color = ChatColors.primaryText,
@@ -932,7 +932,7 @@ internal fun ToolDetailSheet(
                                     screenshotBitmap.height.coerceAtLeast(1)
                                 Image(
                                     bitmap = screenshotBitmap.asImageBitmap(),
-                                    contentDescription = "Browser screenshot",
+                                    contentDescription = stringResource(R.string.common_browser_screenshot),
                                     contentScale = ContentScale.Fit,
                                     modifier = Modifier
                                         .fillMaxWidth()
@@ -961,7 +961,7 @@ internal fun ToolDetailSheet(
                                             strokeWidth = 2.dp,
                                             color = ChatColors.link,
                                         )
-                                        Text("Loading...", fontSize = 12.sp, color = ChatColors.tertiaryText)
+                                        Text(stringResource(R.string.chat_tool_loading), fontSize = 12.sp, color = ChatColors.tertiaryText)
                                     }
                                 }
                             }
@@ -991,7 +991,7 @@ internal fun ToolDetailSheet(
                                         )
                                         Spacer(modifier = Modifier.width(6.dp))
                                         Text(
-                                            text = "Result",
+                                            text = stringResource(R.string.chat_tool_result),
                                             fontSize = 13.sp,
                                             fontWeight = FontWeight.Medium,
                                             color = ChatColors.secondaryText,
@@ -1136,7 +1136,7 @@ internal fun ToolDetailSheet(
                                     )
                                     Spacer(modifier = Modifier.height(8.dp))
                                     Text(
-                                        text = if (isLive) "Running..." else "No output",
+                                        text = if (isLive) stringResource(R.string.chat_tool_running) else stringResource(R.string.chat_tool_no_output),
                                         color = ChatColors.tertiaryText,
                                         fontSize = 14.sp,
                                     )
@@ -1252,7 +1252,7 @@ internal fun ToolDetailSheet(
                     ) {
                         Icon(
                             Icons.Default.SkipPrevious,
-                            contentDescription = "Previous",
+                            contentDescription = stringResource(R.string.common_previous),
                             tint = if (currentIdx > 0) ChatColors.primaryText else ChatColors.disabledText,
                             modifier = Modifier.size(22.dp),
                         )
@@ -1272,7 +1272,7 @@ internal fun ToolDetailSheet(
                                     .background(Color(0xFF34C759), CircleShape),
                             )
                             Text(
-                                "Live",
+                                stringResource(R.string.chat_tool_live),
                                 fontSize = 13.sp,
                                 fontWeight = FontWeight.Medium,
                                 color = ChatColors.primaryText,
@@ -1298,7 +1298,7 @@ internal fun ToolDetailSheet(
                     ) {
                         Icon(
                             Icons.Default.SkipNext,
-                            contentDescription = "Next",
+                            contentDescription = stringResource(R.string.common_next),
                             tint = if (currentIdx < toolBlocks.lastIndex) ChatColors.primaryText else ChatColors.disabledText,
                             modifier = Modifier.size(22.dp),
                         )
@@ -1312,6 +1312,23 @@ internal fun ToolDetailSheet(
 // Helper: extract shell command from args or content (mirrors iOS toolDescription logic).
 // Also tolerant of *partial* streaming JSON (JSONObject.optString returns "" for
 // truncated objects, so fall back to a streaming-safe substring scan).
+// [R14 i18n] `extractShellCommand` falls back to this ASCII sentinel when no
+// command can be recovered. It is a *value* callers compare against (see the
+// "open in terminal" action) and it can be handed to the terminal as a prefill,
+// so it must stay locale-independent: the user-facing wording lives in
+// `R.string.chat_tool_shell_command` and is substituted only at render time by
+// [shellCommandText].
+internal const val SHELL_COMMAND_UNAVAILABLE_SENTINEL = "Shell command"
+
+/** Renders [command], swapping the internal sentinel for localized copy. */
+@Composable
+internal fun shellCommandText(command: String): String =
+    if (command == SHELL_COMMAND_UNAVAILABLE_SENTINEL) {
+        stringResource(R.string.chat_tool_shell_command)
+    } else {
+        command
+    }
+
 internal fun extractShellCommand(args: org.json.JSONObject, block: AssistantBlock): String {
     // 1. Try toolArgs "command" field (works once JSON is complete)
     val fromArgs = args.optString("command", "")
@@ -1326,7 +1343,7 @@ internal fun extractShellCommand(args: org.json.JSONObject, block: AssistantBloc
         if (firstLine.length > 2) return firstLine.drop(2)
     }
     // 4. iOS fallback: generic "Shell command"
-    return "Shell command"
+    return SHELL_COMMAND_UNAVAILABLE_SENTINEL
 }
 
 /**
@@ -1503,7 +1520,7 @@ private fun LazyRevealToolText(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(
-                    text = "Load more ($nextLines lines)",
+                    text = stringResource(R.string.chat_tool_load_more, nextLines),
                     fontSize = 13.sp,
                     fontWeight = FontWeight.Medium,
                     color = color.copy(alpha = 0.9f),
@@ -1512,7 +1529,7 @@ private fun LazyRevealToolText(
                     },
                 )
                 Text(
-                    text = "Load all (~$remainingLines)",
+                    text = stringResource(R.string.chat_tool_load_all, remainingLines),
                     fontSize = 13.sp,
                     fontWeight = FontWeight.Medium,
                     color = color.copy(alpha = 0.9f),

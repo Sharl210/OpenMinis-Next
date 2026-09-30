@@ -311,40 +311,89 @@ class MCPRepository(private val context: Context) {
 
     // -- Session Overrides (mirror SkillRepository) --
 
-    fun isEnabledForSession(mcpId: String, sessionId: String): Boolean {
+    /** Parent links come from the runtime tree; see [SessionTreeParentChain]. */
+    private val sessionParentChain by lazy { SessionTreeParentChain(context) }
+
+    /**
+     * [T-skill-mcp-session-switch-inheritance] Resolved upward through the
+     * runtime parent chain, not just for this session:
+     *
+     *   override(this session) → override(parent) → … → override(root) → global
+     *
+     * Keeps MCP switches on exactly the same rule as skills (both call
+     * [resolveInheritedEnabled]), so the two can no longer drift apart. A server
+     * turned off in the parent conversation is off for every descendant, and the
+     * walk runs per read, so an ancestor's later change is picked up by the
+     * descendant's next read.
+     */
+    fun isEnabledForSession(mcpId: String, sessionId: String): Boolean =
+        resolveInheritedEnabled(
+            sessionId = sessionId,
+            parentOf = sessionParentChain::parentOf,
+            overrideOf = { chainSessionId -> sessionOverride(mcpId, chainSessionId) },
+            globalDefault = { _servers.value.find { it.id == mcpId }?.enabled },
+        )
+
+    /**
+     * This session's own override for [mcpId], or `null` when it has none —
+     * `null` is what lets the inheriting walk continue to the next ancestor
+     * instead of collapsing "not set" into "off".
+     */
+    private fun sessionOverride(mcpId: String, sessionId: String): Boolean? {
         val cursor = db.rawQuery(
             "SELECT is_enabled FROM mcp_session_overrides WHERE session_id=? AND mcp_id=?",
             arrayOf(sessionId, mcpId)
         )
-        val override = if (cursor.moveToFirst()) cursor.getInt(0) == 1 else null
-        cursor.close()
-        if (override != null) return override
-        return _servers.value.find { it.id == mcpId }?.enabled ?: false
+        return try {
+            if (cursor.moveToFirst()) cursor.getInt(0) == 1 else null
+        } finally {
+            cursor.close()
+        }
     }
 
     /**
      * [T-mcp-review-fixes-android] FIX 3: sparse-clear to match iOS. When the
-     * chosen [enabled] equals the server's CURRENT global enabled, DELETE the
-     * override row instead of pinning it — so a later flip of the global
-     * default propagates to this session (a permanently-pinned row would leave
-     * the session stuck at the old value). Only store a row when the session
-     * value genuinely diverges from the global default. Read precedence
-     * (override → global → false) in [isEnabledForSession] is unchanged.
+     * chosen [enabled] equals the value this session would otherwise inherit,
+     * DELETE the override row instead of pinning it — so a later flip at the
+     * level that actually supplies the value propagates here (a permanently
+     * pinned row would leave the session stuck at the old value). Only store a
+     * row when the session value genuinely diverges.
+     *
+     * [T-skill-mcp-session-switch-inheritance] The baseline is now "what the
+     * ancestors already give this session", not "the global default". Comparing
+     * against the global was flat-world logic: with a parent chain in play it
+     * deleted a child's row whenever the child re-enabled a server whose global
+     * default is on — silently dropping the child's change and leaving it stuck
+     * on the parent's OFF. Comparing against the inherited value keeps the
+     * original propagation property and lets a child's toggle actually stick.
      */
     fun setSessionOverride(sessionId: String, mcpId: String, enabled: Boolean) {
-        val globalEnabled = _servers.value.find { it.id == mcpId }?.enabled
-        if (globalEnabled != null && enabled == globalEnabled) {
-            db.execSQL(
-                "DELETE FROM mcp_session_overrides WHERE session_id=? AND mcp_id=?",
-                arrayOf(sessionId, mcpId)
-            )
-        } else {
+        val inherited = inheritedValueFor(mcpId, sessionId)
+        if (shouldPinSessionOverride(enabled, inherited)) {
             db.execSQL(
                 "INSERT OR REPLACE INTO mcp_session_overrides (session_id, mcp_id, is_enabled) VALUES (?, ?, ?)",
                 arrayOf<Any>(sessionId, mcpId, if (enabled) 1 else 0)
             )
+        } else {
+            db.execSQL(
+                "DELETE FROM mcp_session_overrides WHERE session_id=? AND mcp_id=?",
+                arrayOf(sessionId, mcpId)
+            )
         }
     }
+
+    /**
+     * What [sessionId] resolves to when it has no override row of its own —
+     * its ancestors' nearest override, else the global default; `null` when the
+     * server is unknown.
+     */
+    private fun inheritedValueFor(mcpId: String, sessionId: String): Boolean? =
+        resolveInheritedValue(
+            sessionId = sessionId,
+            parentOf = sessionParentChain::parentOf,
+            overrideOf = { chainSessionId -> sessionOverride(mcpId, chainSessionId) },
+            globalDefault = { _servers.value.find { it.id == mcpId }?.enabled },
+        )
 
     fun clearSessionOverrides(sessionId: String) {
         db.execSQL("DELETE FROM mcp_session_overrides WHERE session_id=?", arrayOf(sessionId))

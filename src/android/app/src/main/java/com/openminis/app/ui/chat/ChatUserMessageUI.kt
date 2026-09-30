@@ -106,6 +106,8 @@ import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.Extension
+import androidx.compose.material.icons.filled.Fingerprint
+import androidx.compose.material.icons.filled.Tag
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Block
 import androidx.compose.material.icons.filled.CheckCircle
@@ -287,6 +289,17 @@ internal fun UserMessageBubble(
     // user→assistant→user cadence.
     precededByUser: Boolean = false,
     onCopy: () -> Unit = {},
+    // [T-android-copy-conversation-id] request.md:136. Two entries, not one,
+    // because the requirement names two objects and they answer different
+    // questions: the MESSAGE id locates this single row, the CONVERSATION id is
+    // what gets handed to the runtime to read the whole conversation
+    // (`conversation_query`). The requirement's own wording settles it —
+    // 「它有一个复制消息ID，或者叫做复制对话ID」 is the user thinking out loud
+    // between the two, so both are offered and neither guess is imposed.
+    // Null hides an entry (a host with no clipboard, or a draft row that has no
+    // id to copy yet).
+    onCopyMessageId: (() -> Unit)? = null,
+    onCopyConversationId: (() -> Unit)? = null,
     onRetry: (() -> Unit)? = {},
     onEdit: (() -> Unit)? = null,
     // [T-android-delete-from-here] Delete this message and everything after
@@ -371,17 +384,33 @@ internal fun UserMessageBubble(
                     // AIChatView.swift queued-bubble overlay.
                         val secondaryTextColor = ChatColors.secondaryText
                         val userBubbleColor = ChatColors.userBubble
+                        // [T-android-queued-delivery-visual-split] STEER vs QUEUE
+                        // resolved once, through the policy, so the label, the glyph
+                        // and the hairline below can never disagree about which
+                        // delivery this bubble is. request.md:172 asks for these two
+                        // to be distinguishable 一眼 ("at a glance") — before this
+                        // they rendered identically apart from the two words.
+                        val badgeStyle = QueuedPromptUiPolicy.badgeStyle(message.queuedDelivery)
                         if (isQueued) {
-                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Start) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.Start,
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Icon(
+                                    imageVector = badgeStyle.icon,
+                                    // The label beside the glyph already says STEER /
+                                    // QUEUE; announcing the same word twice would make a
+                                    // screen reader read the badge as noise.
+                                    contentDescription = null,
+                                    tint = secondaryTextColor,
+                                    modifier = Modifier.padding(start = 10.dp).size(12.dp),
+                                )
                                 Text(
-                                    text = when (message.queuedDelivery) {
-                                        QueuedPromptDelivery.STEER -> stringResource(R.string.chat_queue_steer_badge)
-                                        QueuedPromptDelivery.QUEUE -> stringResource(R.string.chat_queue_queue_badge)
-                                        null -> "QUEUE"
-                                    },
+                                    text = stringResource(badgeStyle.labelRes),
                                     color = secondaryTextColor,
                                     style = MaterialTheme.typography.labelSmall,
-                                    modifier = Modifier.padding(start = 10.dp, bottom = 2.dp),
+                                    modifier = Modifier.padding(start = 4.dp, bottom = 2.dp),
                                 )
                             }
                         }
@@ -392,13 +421,24 @@ internal fun UserMessageBubble(
                         val textColor = if (isQueued) secondaryTextColor else MaterialTheme.colorScheme.onSurface
                         val bubbleBg = if (isQueued) Color.Transparent else userBubbleColor
                         val shape = RoundedCornerShape(18.dp)
+                        // [T-android-queued-delivery-visual-split] The hairline is the
+                        // requirement's own suggested place for the marker
+                        // (「设计在边框上或者说整个边线上」) because it costs no bubble
+                        // space. QUEUE stays dashed (still waiting its turn); STEER is
+                        // drawn SOLID (it cut the line and is already in force). This
+                        // used to be keyed on `isQueued` alone, so both deliveries got
+                        // the identical dash pattern.
                         val dashedStroke = if (isQueued) {
                             Modifier.drawBehind {
                                 val stroke = androidx.compose.ui.graphics.drawscope.Stroke(
                                     width = 1.5.dp.toPx(),
-                                    pathEffect = androidx.compose.ui.graphics.PathEffect.dashPathEffect(
-                                        floatArrayOf(6.dp.toPx(), 4.dp.toPx()), 0f
-                                    ),
+                                    pathEffect = if (badgeStyle.borderDashed) {
+                                        androidx.compose.ui.graphics.PathEffect.dashPathEffect(
+                                            floatArrayOf(6.dp.toPx(), 4.dp.toPx()), 0f
+                                        )
+                                    } else {
+                                        null
+                                    },
                                 )
                                 val r = 18.dp.toPx()
                                 drawRoundRect(
@@ -463,7 +503,13 @@ internal fun UserMessageBubble(
                             ) {
                                 Icon(
                                     imageVector = Icons.Filled.Cancel,
-                                    contentDescription = stringResource(R.string.chat_queued_withdraw),
+                                    // Matches what the button IS wired to do (onWithdraw =
+                                    // withdraw-and-edit, the same action as the menu's
+                                    // 撤回并编辑). It used to announce chat_queued_withdraw
+                                    // — "Withdraw queued message" — which is the DISCARD menu
+                                    // item's string, so a screen reader named a different
+                                    // action from the one the tap performs.
+                                    contentDescription = stringResource(R.string.chat_queued_withdraw_and_edit),
                                     tint = Color(0xFFFF3B30),
                                     modifier = Modifier.size(24.dp),
                                 )
@@ -504,6 +550,23 @@ internal fun UserMessageBubble(
                     onClick = { showMenu = false; onCopy() },
                     leadingIcon = { Icon(Icons.Default.ContentCopy, contentDescription = null, modifier = Modifier.size(18.dp)) },
                 )
+                // [T-android-copy-conversation-id] Both IDs sit directly under
+                // "Copy" so the three clipboard actions read as one group
+                // (content → id-of-this-row → id-of-this-conversation).
+                if (onCopyMessageId != null) {
+                    DropdownMenuItem(
+                        text = { Text(stringResource(R.string.chat_copy_message_id)) },
+                        onClick = { showMenu = false; onCopyMessageId() },
+                        leadingIcon = { Icon(Icons.Default.Tag, contentDescription = null, modifier = Modifier.size(18.dp)) },
+                    )
+                }
+                if (onCopyConversationId != null) {
+                    DropdownMenuItem(
+                        text = { Text(stringResource(R.string.chat_copy_conversation_id)) },
+                        onClick = { showMenu = false; onCopyConversationId() },
+                        leadingIcon = { Icon(Icons.Default.Fingerprint, contentDescription = null, modifier = Modifier.size(18.dp)) },
+                    )
+                }
                 // T119: while the model is generating, hide every action that
                 // would mutate the in-flight turn. Retry truncates history and
                 // restarts the stream, which corrupts state if it races a live
@@ -600,7 +663,7 @@ internal fun UserAttachmentList(
         imageUris.forEachIndexed { idx, uri ->
             AsyncImage(
                 model = uri,
-                contentDescription = "Image attachment",
+                contentDescription = stringResource(R.string.chat_attachment_image),
                 contentScale = ContentScale.Crop,
                 modifier = Modifier
                     .size(tileSize)
@@ -742,7 +805,7 @@ private fun ImageGalleryDialog(
             ) {
                 Icon(
                     androidx.compose.material.icons.Icons.Default.Close,
-                    contentDescription = "Close",
+                    contentDescription = stringResource(R.string.common_close),
                     tint = Color.White,
                 )
             }

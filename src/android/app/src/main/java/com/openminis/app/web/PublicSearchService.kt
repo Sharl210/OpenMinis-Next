@@ -26,7 +26,7 @@ class PublicSearchService(private val adapters: List<PublicSearchAdapter>) {
             listOf(SearchFailure("service", "public search adapter not configured")),
         )
         val failures = mutableListOf<SearchFailure>()
-        val results = adapters.flatMap { adapter ->
+        val perAdapter = adapters.map { adapter ->
             when (val response = runCatching { adapter.search(normalizedQuery, bounded.maxResults, bounded.timeoutMs) }
                 .getOrElse { SearchAdapterResult.Failure(it.message ?: "adapter failed") }) {
                 is SearchAdapterResult.Success -> response.items
@@ -35,8 +35,30 @@ class PublicSearchService(private val adapters: List<PublicSearchAdapter>) {
                     emptyList()
                 }
             }
-        }.distinctBy { it.url }.take(bounded.maxResults)
+        }
+        // [T-android-web-search-engines] Round-robin the engines instead of concatenating them.
+        // Concatenating in adapter order meant the first engine to answer with a full page filled the
+        // whole budget: measured with the app's default maxResults=10 and the engines' real result counts
+        // (bing 10, baidu 8), the "aggregate" returned bing=10 and nothing from any other engine — i.e.
+        // registering more engines silently REPLACED the previous one instead of adding to it. Interleaving
+        // keeps each engine's own ranking order while guaranteeing every engine that has anything to say is
+        // represented, which is what an aggregate is for.
+        val results = interleaveByEngine(perAdapter)
+            .distinctBy { it.url }
+            .take(bounded.maxResults)
         return SearchResult(normalizedQuery, results, failures)
+    }
+
+    /** Takes the n-th item of every engine in turn, preserving each engine's internal order. */
+    internal fun interleaveByEngine(perAdapter: List<List<SearchItem>>): List<SearchItem> {
+        val merged = ArrayList<SearchItem>(perAdapter.sumOf { it.size })
+        val longest = perAdapter.maxOfOrNull { it.size } ?: 0
+        for (rank in 0 until longest) {
+            for (items in perAdapter) {
+                items.getOrNull(rank)?.let(merged::add)
+            }
+        }
+        return merged
     }
 }
 
@@ -78,8 +100,10 @@ class DuckDuckGoHtmlAdapter(
             if ((it.header("Content-Length")?.toLongOrNull() ?: 0L) > MAX_RESPONSE_BYTES) {
                 return@withContext SearchAdapterResult.Failure("response exceeds size limit")
             }
-            val bytes = body.source().readByteArray(MAX_RESPONSE_BYTES + 1)
-            if (bytes.size > MAX_RESPONSE_BYTES) return@withContext SearchAdapterResult.Failure("response exceeds size limit")
+            // The body must be read without okio's `readByteArray(n)`, which throws EOFException as soon
+            // as the page is shorter than n — i.e. for every ordinary DuckDuckGo response.
+            val bytes = readSearchBodyBounded(body, MAX_RESPONSE_BYTES)
+                ?: return@withContext SearchAdapterResult.Failure("response exceeds size limit")
             val html = bytes.toString(body.contentType()?.charset(Charsets.UTF_8) ?: Charsets.UTF_8)
             if (html.contains("anomaly-modal", ignoreCase = true) || html.contains("captcha", ignoreCase = true)) {
                 return@withContext SearchAdapterResult.Failure("search source returned an anti-bot challenge")
@@ -130,6 +154,33 @@ class DuckDuckGoHtmlAdapter(
 data class SearchOptions(val maxResults: Int = 10, val timeoutMs: Long = 20_000L) {
     fun normalized() = copy(maxResults = maxResults.coerceIn(1, 50), timeoutMs = timeoutMs.coerceIn(1_000L, 120_000L))
 }
+
+/**
+ * [T-android-web-search-settings] The options actually used for one search call.
+ *
+ * The requirement lets the user configure how many results the search tool may
+ * return and how long it may take ("它能返回最大多少条内容,然后超时时间是多少") —
+ * so the configured value is a CEILING, not merely a default. The model may ask
+ * for fewer results or a shorter timeout, but must never exceed what the user
+ * allowed.
+ *
+ * This lived inline in the tool executor, where it could not be tested at all and
+ * was therefore only ever read, never asserted. Kept pure so the ceiling
+ * contract, the fallback-to-user-setting behaviour and the interaction with
+ * [SearchOptions.normalized]'s bounds are all checkable on the JVM.
+ *
+ * @param requestedMaxResults what the model asked for; null = "use the setting".
+ * @param requestedTimeoutMs same, for the timeout.
+ */
+fun effectiveSearchOptions(
+    requestedMaxResults: Int?,
+    requestedTimeoutMs: Long?,
+    userMaxResults: Int,
+    userTimeoutMs: Long,
+): SearchOptions = SearchOptions(
+    maxResults = (requestedMaxResults ?: userMaxResults).coerceAtMost(userMaxResults),
+    timeoutMs = (requestedTimeoutMs ?: userTimeoutMs).coerceAtMost(userTimeoutMs),
+).normalized()
 
 data class SearchItem(val title: String, val url: String, val snippet: String? = null, val source: String)
 data class SearchFailure(val source: String, val detail: String)

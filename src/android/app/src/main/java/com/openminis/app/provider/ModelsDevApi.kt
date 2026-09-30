@@ -90,51 +90,89 @@ object ModelsDevApi {
     // MARK: - Public: Enrich models with models.dev data
 
     fun enrichModel(model: LLMModel): LLMModel {
-        val registry = loadRegistry() ?: return model
+        val registry = loadRegistry()
 
         // Try mapped provider keys first
         val keys = providerKeyMap[model.provider] ?: emptyList()
-        for (key in keys) {
-            val prov = registry[key] ?: continue
-            val devModel = prov.models[model.id] ?: continue
-            return applyDevData(model, devModel)
-        }
-
-        // Fallback: scan all providers for the model ID
-        for ((_, prov) in registry) {
-            val devModel = prov.models[model.id] ?: continue
-            return applyDevData(model, devModel)
-        }
-
-        return model
-    }
-
-    fun enrichModels(models: List<LLMModel>): List<LLMModel> {
-        val registry = loadRegistry() ?: return models
-        return models.map { model ->
-            val keys = providerKeyMap[model.provider] ?: emptyList()
+        if (registry != null) {
             for (key in keys) {
                 val prov = registry[key] ?: continue
                 val devModel = prov.models[model.id] ?: continue
-                return@map applyDevData(model, devModel)
+                return applyDevData(model, devModel)
             }
-            // Fallback scan: the same model id is published by many providers
-            // (e.g. `glm-5.2` appears under 19), and a custom relay's provider
-            // name matches none of them, so this scan is what third-party
-            // gateways actually hit.
-            //
-            // [T-reasoning-effort-data-driven] Map iteration order is not a
-            // stable contract, and these entries disagree on capabilities: 17 of
-            // the 19 `glm-5.2` entries declare effort tiers, 2 declare none.
-            // Sort by key for a stable pick and prefer an entry that carries
-            // reasoning metadata, so the richer declaration wins over a sparser
-            // duplicate. Mirrors iOS ModelsDevAPI.enrichModels.
-            val candidates = registry.keys.sorted().mapNotNull { registry[it]?.models?.get(model.id) }
-            val best = candidates.firstOrNull { !it.reasoningEffortValues.isNullOrEmpty() }
-                ?: candidates.firstOrNull()
-            if (best != null) return@map applyDevData(model, best)
-            model
+
+            // Fallback: scan all providers for the model ID
+            for ((_, prov) in registry) {
+                val devModel = prov.models[model.id] ?: continue
+                return applyDevData(model, devModel)
+            }
         }
+
+        // [R8-recent-model-defaults] Catalog miss (or no catalog at all): fall
+        // back to the built-in default parameter template before giving up.
+        // This is what makes the template reach a custom relay's model list: a
+        // DeepSeek/GLM/Qwen/MiniMax endpoint is a custom OpenAI- or
+        // Anthropic-compatible base URL (no ProviderType, so no built-in seed),
+        // and its /v1/models payload carries ids and nothing else — every
+        // capability field would stay null.
+        //
+        // Null-respecting (see [applyStaticDefaults]): the template only answers
+        // questions nobody else answered, so callers that supply their own value
+        // are unaffected.
+        return applyStaticDefaults(model)
+    }
+
+    fun enrichModels(models: List<LLMModel>): List<LLMModel> {
+        val registry = loadRegistry()
+        return models.map { model ->
+            if (registry != null) {
+                val keys = providerKeyMap[model.provider] ?: emptyList()
+                for (key in keys) {
+                    val prov = registry[key] ?: continue
+                    val devModel = prov.models[model.id] ?: continue
+                    return@map applyDevData(model, devModel)
+                }
+                // Fallback scan: the same model id is published by many providers
+                // (e.g. `glm-5.2` appears under 19), and a custom relay's provider
+                // name matches none of them, so this scan is what third-party
+                // gateways actually hit.
+                //
+                // [T-reasoning-effort-data-driven] Map iteration order is not a
+                // stable contract, and these entries disagree on capabilities: 17 of
+                // the 19 `glm-5.2` entries declare effort tiers, 2 declare none.
+                // Sort by key for a stable pick and prefer an entry that carries
+                // reasoning metadata, so the richer declaration wins over a sparser
+                // duplicate. Mirrors iOS ModelsDevAPI.enrichModels.
+                val candidates = registry.keys.sorted().mapNotNull { registry[it]?.models?.get(model.id) }
+                val best = candidates.firstOrNull { !it.reasoningEffortValues.isNullOrEmpty() }
+                    ?: candidates.firstOrNull()
+                if (best != null) return@map applyDevData(model, best)
+            }
+            // [R8-recent-model-defaults] Same last-resort step as enrichModel.
+            applyStaticDefaults(model)
+        }
+    }
+
+    // MARK: - Apply built-in default template
+
+    /**
+     * [R8-recent-model-defaults] Fill from `LLMModel.staticDefaultFor(id)`.
+     *
+     * Null-respecting, exactly like [applyDevData]: a value that already exists
+     * on the incoming model — from the provider's own /v1/models payload, from a
+     * persisted ModelEntry, or from a user override applied upstream — is never
+     * overwritten. The template only answers questions nobody else answered.
+     */
+    private fun applyStaticDefaults(model: LLMModel): LLMModel {
+        val template = LLMModel.staticDefaultFor(model.id) ?: return model
+        return model.copy(
+            contextWindow = model.contextWindow ?: template.contextWindow,
+            maxOutputTokens = model.maxOutputTokens ?: template.maxOutputTokens,
+            supportsReasoning = model.supportsReasoning ?: template.supportsReasoning,
+            inputModalities = model.inputModalities ?: template.inputModalities,
+            outputModalities = model.outputModalities ?: template.outputModalities,
+            supportsTools = model.supportsTools ?: template.supportsTools,
+        )
     }
 
     // MARK: - Apply models.dev data

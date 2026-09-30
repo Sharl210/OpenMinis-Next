@@ -37,6 +37,20 @@ class RuntimeCommunicationRepository(
     fun requestDetail(request: RuntimeCommunicationDetailRequest): RuntimeCommunicationDetailResult =
         directory.requestDetail(request)
 
+    @Synchronized
+    fun deleteForSession(sessionId: String): Int {
+        if (sessionId.isBlank()) return 0
+        val retained = directory.allRecords().filter { record ->
+            record.sender.sessionId != sessionId && record.receiver.sessionId != sessionId
+        }
+        val removed = directory.size() - retained.size
+        if (removed > 0) {
+            directory.replaceAll(retained)
+            store.write(snapshot())
+        }
+        return removed
+    }
+
     private fun snapshot(): List<RuntimeCommunicationMetadata> {
         val all = mutableListOf<RuntimeCommunicationMetadata>()
         var cursor: RuntimeCommunicationCursor? = null

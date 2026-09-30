@@ -66,6 +66,14 @@ import java.util.zip.CRC32
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.TextButton
+import androidx.compose.ui.graphics.PathEffect
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.clickable
+import androidx.compose.material3.RadioButton
 
 /** A pure-data node that can be rendered by a Compose topology view. */
 data class AgentTopologyNode(
@@ -89,8 +97,75 @@ data class AgentTopologyNode(
 
     companion object {
         const val DEFAULT_NODE_WIDTH = 176f
-        const val DEFAULT_NODE_HEIGHT = 92f
+        /**
+         * [T-android-topology-card-layout] Tall enough for the card the
+         * requirement describes: three header lines (level·tokens, creation
+         * time, global order), the horizontal divider, then three lines of body
+         * ("这里用来展示的可以展示3行").
+         *
+         * It was 92f, which fit exactly two body lines once the creation-time and
+         * global-order lines were added — the card would have silently dropped
+         * the third line the requirement asks for. Baselines start at top+20f and
+         * step 18f then 15f, so the last of three body lines sits at top+98f and
+         * the guard stops drawing at bottom-6f: 112f leaves that margin.
+         */
+        const val DEFAULT_NODE_HEIGHT = 112f
     }
+}
+
+/**
+ * [T-android-topology-peer-edges] What a line in the diagram MEANS.
+ *
+ * The runtime has always recorded more than parent/child links
+ * (`RuntimeEdgeKind.PARENT_CHILD / SUBSCRIPTION / TEAM_PEER`, exposed in the
+ * runtime snapshot as `topologyEdges`), and the requirement asks for the
+ * peer-to-peer structure to be visible: "团队模式的话，他们就是 P2P 的节点…
+ * 从和从之间可以 P2P 也就是可以拥有更多的一些拓扑关系和连接关系和交流"
+ * (request.md:33).
+ *
+ * The diagram previously drew ONLY parent/child lines — the `topologyEdges`
+ * array was never read on this side — so a Team's peer links and any
+ * subscriptions were invisible even though the data existed. Drawing them is
+ * what makes the P2P topology the requirement describes observable.
+ */
+/**
+ * [T-android-topology-peer-edges] How one edge kind is drawn.
+ *
+ * Single source of truth: both renderers (the on-screen Compose canvas and the
+ * PNG export) consult this, so a change here cannot make the screen and the
+ * export disagree — the failure mode this file has already been bitten by when
+ * each renderer assembled its own card by hand.
+ *
+ * Colours are ARGB so the export (`android.graphics`) and Compose (`Color(...)`)
+ * can share one value.
+ */
+internal data class TopologyEdgeStyle(
+    val argb: Int,
+    val strokeWidth: Float,
+    /** null = solid line. */
+    val dashIntervals: FloatArray?,
+)
+
+/**
+ * [T-android-topology-peer-edges] Delegation is the solid backbone; the two
+ * non-tree link kinds are dashed and differently coloured so a peer link is not
+ * mistaken for a delegation link at a glance.
+ */
+internal fun topologyEdgeStyle(kind: AgentTopologyEdgeKind): TopologyEdgeStyle = when (kind) {
+    AgentTopologyEdgeKind.PARENT -> TopologyEdgeStyle(0xFF4082BE.toInt(), 3f, null)
+    AgentTopologyEdgeKind.PEER -> TopologyEdgeStyle(0xFF7A4FC4.toInt(), 3f, floatArrayOf(14f, 9f))
+    AgentTopologyEdgeKind.SUBSCRIPTION -> TopologyEdgeStyle(0xFF8A9099.toInt(), 2f, floatArrayOf(4f, 7f))
+}
+
+enum class AgentTopologyEdgeKind {
+    /** Delegation: who commissioned whom. The tree's backbone. */
+    PARENT,
+
+    /** Team peer-to-peer link between two sub-agents. */
+    PEER,
+
+    /** Traditional sub-agent subscription/notification link. */
+    SUBSCRIPTION,
 }
 
 /** One directed relationship. Reverse edges are intentionally distinct. */
@@ -98,6 +173,7 @@ data class AgentTopologyRelation(
     val fromId: String,
     val toId: String,
     val label: String? = null,
+    val kind: AgentTopologyEdgeKind = AgentTopologyEdgeKind.PARENT,
 ) {
     init {
         require(fromId.isNotBlank() && toId.isNotBlank()) { "relation endpoints must not be blank" }
@@ -106,6 +182,58 @@ data class AgentTopologyRelation(
 }
 
 data class AgentTopologyPoint(val x: Float, val y: Float)
+
+/**
+ * [T-android-topology-arrow-parity] The arrowhead at the END of a routed edge, as
+ * drawable segments.
+ *
+ * WHY THIS IS SHARED AND NOT INLINED TWICE: the PNG exporter drew an arrowhead and
+ * the on-screen canvas did not, so the exported image showed edge direction while
+ * the screen — the surface users actually look at — showed none. A→B and B→A were
+ * visually identical on a device. The two renderers had each grown their own edge
+ * drawing (this file already had the same problem with stroke colour and dash
+ * pattern, solved by [topologyEdgeStyle]); the geometry is now owned here so the
+ * next divergence has to be a deliberate edit to one function.
+ *
+ * Returns TWO segments (the two barbs), each as (tip, barbEnd). The caller draws
+ * them with its own stroke; keeping this free of `Canvas`/`DrawScope` types is what
+ * lets both renderers and a JVM test share it.
+ *
+ * The maths mirrors the exporter's original `canvas.rotate(angle)` + local
+ * (-length, ±halfWidth) barbs, expressed as explicit rotation so no canvas state is
+ * needed:
+ *   barb = tip + rotate((-length, ±halfWidth), angle)
+ *
+ * Returns an empty list when there is no direction to show (fewer than two points).
+ */
+internal fun topologyArrowheadSegments(
+    points: List<AgentTopologyPoint>,
+    length: Float = TOPOLOGY_ARROW_LENGTH,
+    halfWidth: Float = TOPOLOGY_ARROW_HALF_WIDTH,
+): List<Pair<AgentTopologyPoint, AgentTopologyPoint>> {
+    if (points.size < 2) return emptyList()
+    val tip = points.last()
+    val before = points[points.size - 2]
+    val angle = kotlin.math.atan2((tip.y - before.y).toDouble(), (tip.x - before.x).toDouble())
+    val cos = kotlin.math.cos(angle).toFloat()
+    val sin = kotlin.math.sin(angle).toFloat()
+    fun barb(sign: Float): Pair<AgentTopologyPoint, AgentTopologyPoint> {
+        val wx = -length
+        val wy = halfWidth * sign
+        return tip to AgentTopologyPoint(
+            x = tip.x + wx * cos - wy * sin,
+            y = tip.y + wx * sin + wy * cos,
+        )
+    }
+    return listOf(barb(1f), barb(-1f))
+}
+
+/** Arrowhead length in logical pixels; matches the exporter's original barb. */
+internal const val TOPOLOGY_ARROW_LENGTH = 10f
+
+/** Arrowhead half-spread in logical pixels; matches the exporter's original barb. */
+internal const val TOPOLOGY_ARROW_HALF_WIDTH = 5f
+
 
 data class AgentTopologyRect(
     val left: Float,
@@ -274,21 +402,40 @@ fun summarizeAgentTopology(
     return lines
 }
 
-/** Formats a non-negative token count using compact K/M/B units. */
+/**
+ * Formats a non-negative token count using compact K/M/B units.
+ *
+ * [T-agent-topology-token-unit-bug] The unit boundaries are chosen so the
+ * rounded label never crosses into the next unit, and [compactTokenUnit] only
+ * strips trailing zeros when a decimal point is actually present.
+ *
+ * Both halves matter. The old code formatted with `%.0f` for values ≥100 (which
+ * yields a plain integer such as "200") and then unconditionally ran
+ * `trimEnd('0')` — turning "200" into "2", i.e. **200 000 tokens displayed as
+ * "2K", a 100× understatement** (999 999 showed as "1K", ~1000×). It also
+ * rounded 999 999 to "1000K" territory and then trimmed it to "1K". The
+ * requirement asks for the "238.4K/M/B" shape, so one decimal is kept and the
+ * promotion thresholds account for rounding.
+ */
 fun formatAgentTokens(tokens: Long): String {
     require(tokens >= 0L) { "token count must not be negative" }
     return when {
         tokens < 1_000L -> tokens.toString()
-        tokens < 1_000_000L -> compactTokenUnit(tokens.toDouble() / 1_000.0, "K")
-        tokens < 1_000_000_000L -> compactTokenUnit(tokens.toDouble() / 1_000_000.0, "M")
+        // 999_950/1000 = 999.95 → "1000.0" would leave the K range after
+        // rounding, so promote earlier and keep the label monotonic.
+        tokens < 999_950L -> compactTokenUnit(tokens.toDouble() / 1_000.0, "K")
+        tokens < 999_950_000L -> compactTokenUnit(tokens.toDouble() / 1_000_000.0, "M")
         else -> compactTokenUnit(tokens.toDouble() / 1_000_000_000.0, "B")
     }
 }
 
 private fun compactTokenUnit(value: Double, suffix: String): String {
-    val decimals = if (value >= 100.0) 0 else 1
-    val raw = String.format(Locale.US, "%.${decimals}f", value)
-    return raw.trimEnd('0').trimEnd('.') + suffix
+    val raw = String.format(Locale.US, "%.1f", value)
+    // Only trim when there is a fractional part to trim. Stripping zeros from a
+    // whole number deletes magnitude ("200" → "2"); stripping "238.4" or
+    // "200.0" of redundant zeros is cosmetic and safe.
+    val trimmed = if (raw.contains('.')) raw.trimEnd('0').trimEnd('.') else raw
+    return trimmed + suffix
 }
 
 /**
@@ -418,16 +565,32 @@ private fun routeAgentTopologyEdge(
     val maxRight = rects.values.maxOfOrNull { it.right } ?: max(start.x, end.x)
     val minTop = rects.values.minOfOrNull { it.top } ?: min(start.y, end.y)
     val maxBottom = rects.values.maxOfOrNull { it.bottom } ?: max(start.y, end.y)
-    val margin = max(16f, clearance * 2f)
-    val candidates = listOf(
-        listOf(start, AgentTopologyPoint(minLeft - margin, start.y), AgentTopologyPoint(minLeft - margin, end.y), end),
-        listOf(start, AgentTopologyPoint(maxRight + margin, start.y), AgentTopologyPoint(maxRight + margin, end.y), end),
-        listOf(start, AgentTopologyPoint(start.x, minTop - margin), AgentTopologyPoint(end.x, minTop - margin), end),
-        listOf(start, AgentTopologyPoint(start.x, maxBottom + margin), AgentTopologyPoint(end.x, maxBottom + margin), end),
-    )
-    return candidates.firstOrNull {
-        agentTopologyPathIsClear(it, fromId, toId, rects, clearance)
-    } ?: listOf(start, end)
+    // [T-android-topology-edge-clearance] Escalate the channel margin before giving
+    // up. The requirement is absolute — "所有的线不能够被节点遮挡住…就要绕过节点"
+    // (request.md:35) — and it explains why: an occluded stretch turns into a black
+    // box where the user cannot tell which line is which. A single margin used to
+    // mean that when one channel width happened to be blocked, the router fell
+    // straight through to the last resort below and drew a line through the nodes.
+    //
+    // Trying successively wider channels costs a handful of cheap segment tests and
+    // keeps the collision flag honest: it is now false only when every width failed,
+    // not merely the first one.
+    for (factor in listOf(1f, 2f, 4f, 8f)) {
+        val margin = max(16f, clearance * 2f) * factor
+        val candidates = listOf(
+            listOf(start, AgentTopologyPoint(minLeft - margin, start.y), AgentTopologyPoint(minLeft - margin, end.y), end),
+            listOf(start, AgentTopologyPoint(maxRight + margin, start.y), AgentTopologyPoint(maxRight + margin, end.y), end),
+            listOf(start, AgentTopologyPoint(start.x, minTop - margin), AgentTopologyPoint(end.x, minTop - margin), end),
+            listOf(start, AgentTopologyPoint(start.x, maxBottom + margin), AgentTopologyPoint(end.x, maxBottom + margin), end),
+        )
+        candidates.firstOrNull {
+            agentTopologyPathIsClear(it, fromId, toId, rects, clearance)
+        }?.let { return it }
+    }
+    // Genuinely boxed in (malformed or fully enclosing rectangles). A straight line is
+    // the only route left; `collisionFree` is set to false for this path, which is the
+    // one case where the requirement cannot be honoured.
+    return listOf(start, end)
 }
 
 /** Returns true when no segment intersects a non-endpoint rectangle. */
@@ -492,6 +655,8 @@ private fun agentTopologySegmentIntersectsRect(
 
 /** Options for the real topology raster export. */
 data class AgentTopologyExportOptions(
+    /** [T-android-topology-i18n] Localized card labels; see TopologyCardStrings. */
+    val cardStrings: TopologyCardStrings = DEFAULT_TOPOLOGY_CARD_STRINGS,
     val transparentBackground: Boolean = AgentTopologyPrefs.DEFAULT_POSTER_EXPORT_TRANSPARENT_BACKGROUND,
     val dpi: Int = AgentTopologyPrefs.DEFAULT_POSTER_EXPORT_DPI,
     val maxPixels: Long = AgentTopologyPrefs.DEFAULT_MAX_EXPORT_PIXELS,
@@ -530,7 +695,7 @@ fun renderAgentTopologyPng(
         canvas.save()
         canvas.scale(scaleX, scaleY)
         canvas.translate(-bounds.left, -bounds.top)
-        drawAgentTopologyAndroid(canvas, layout)
+        drawAgentTopologyAndroid(canvas, layout, options.cardStrings)
         canvas.restore()
         return encodePngWithDpi(bitmap, size.dpi)
     } finally {
@@ -557,11 +722,21 @@ private fun agentTopologyContentBounds(
     return AgentTopologyRect(minX, minY, (maxX - minX).coerceAtLeast(1f), (maxY - minY).coerceAtLeast(1f))
 }
 
-private fun drawAgentTopologyAndroid(canvas: AndroidCanvas, layout: AgentTopologyLayout) {
-    val edgePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.STROKE
-        strokeWidth = 3f
-        color = android.graphics.Color.rgb(64, 130, 190)
+private fun drawAgentTopologyAndroid(
+    canvas: AndroidCanvas,
+    layout: AgentTopologyLayout,
+    cardStrings: TopologyCardStrings,
+) {
+    // [T-android-topology-peer-edges] One paint per edge kind, built from the
+    // shared style so the export matches the screen.
+    val edgePaints = AgentTopologyEdgeKind.entries.associateWith { kind ->
+        val style = topologyEdgeStyle(kind)
+        Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            this.style = Paint.Style.STROKE
+            strokeWidth = style.strokeWidth
+            color = style.argb
+            style.dashIntervals?.let { pathEffect = android.graphics.DashPathEffect(it, 0f) }
+        }
     }
     val nodePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
@@ -581,26 +756,26 @@ private fun drawAgentTopologyAndroid(canvas: AndroidCanvas, layout: AgentTopolog
         color = android.graphics.Color.rgb(72, 83, 102)
         textSize = 12f
     }
+    /** [T-android-topology-card-layout] The divider the requirement asks for. */
+    val dividerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 1f
+        color = android.graphics.Color.rgb(210, 216, 226)
+    }
     layout.edges.forEach { edge ->
         if (edge.points.size < 2) return@forEach
+        val edgePaint = edgePaints.getValue(edge.relation.kind)
         val path = Path().apply {
             moveTo(edge.points.first().x, edge.points.first().y)
             edge.points.drop(1).forEach { lineTo(it.x, it.y) }
         }
         canvas.drawPath(path, edgePaint)
-        val before = edge.points[edge.points.lastIndex - 1]
-        val tip = edge.points.last()
-        val angle = kotlin.math.atan2((tip.y - before.y).toDouble(), (tip.x - before.x).toDouble()).toFloat()
-        canvas.save()
-        canvas.rotate(Math.toDegrees(angle.toDouble()).toFloat(), tip.x, tip.y)
-        val arrow = Path().apply {
-            moveTo(tip.x, tip.y)
-            lineTo(tip.x - 10f, tip.y - 5f)
-            moveTo(tip.x, tip.y)
-            lineTo(tip.x - 10f, tip.y + 5f)
+        // [T-android-topology-arrow-parity] Shared geometry (see
+        // topologyArrowheadSegments): this used to be a canvas rotate + local-coord
+        // Path, which the on-screen renderer had no equivalent of.
+        topologyArrowheadSegments(edge.points).forEach { (tip, barb) ->
+            canvas.drawLine(tip.x, tip.y, barb.x, barb.y, edgePaint)
         }
-        canvas.drawPath(arrow, edgePaint)
-        canvas.restore()
     }
     layout.nodes.forEach { node ->
         val rect = RectF(node.rect.left, node.rect.top, node.rect.right, node.rect.bottom)
@@ -608,14 +783,214 @@ private fun drawAgentTopologyAndroid(canvas: AndroidCanvas, layout: AgentTopolog
         canvas.drawRoundRect(rect, 12f, 12f, borderPaint)
         val left = node.rect.left + 10f
         var y = node.rect.top + 20f
-        canvas.drawText("${node.node.title} · ${node.tokenLabel}", left, y, titlePaint)
+        // [T-android-topology-card-layout] Shared card lines, in the order the
+        // requirement fixes: level·tokens, creation time, global order, divider,
+        // body. The screen canvas draws the SAME list — previously each renderer
+        // assembled this by hand and the two disagreed.
+        val card = topologyCardLines(node.node, node.tokenLabel, cardStrings)
+        canvas.drawText(card.title, left, y, titlePaint)
         y += 18f
+        canvas.drawText(card.created, left, y, bodyPaint)
+        y += 15f
+        canvas.drawText(card.order, left, y, bodyPaint)
+        y += 15f
+        // Horizontal divider between header and body.
+        canvas.drawLine(left, y - 10f, node.rect.right - 10f, y - 10f, dividerPaint)
         node.summaryLines.forEach { line ->
             if (y <= node.rect.bottom - 6f) canvas.drawText(line, left, y, bodyPaint)
             y += 15f
         }
     }
 }
+
+/**
+ * Fallback labels for callers without a Context (JVM tests, and any future
+ * headless export). Mirrors the English resources; the UI always passes the
+ * localized set explicitly.
+ */
+internal val DEFAULT_TOPOLOGY_CARD_STRINGS = TopologyCardStrings(
+    mainAgent = "Main agent",
+    subAgentTemplate = "Level-%1\$s sub-agent",
+    levelNumerals = (1..10).map(Int::toString),
+    createdKnown = "Created %1\$s",
+    createdUnknown = "Creation time unknown",
+    order = "Global order: %1\$d",
+)
+
+/** [T-android-topology-i18n] Resolve the card labels from resources. */
+internal fun topologyCardStrings(context: android.content.Context): TopologyCardStrings =
+    TopologyCardStrings(
+        mainAgent = context.getString(R.string.agent_topology_level_main),
+        subAgentTemplate = context.getString(R.string.agent_topology_level_sub),
+        levelNumerals = context.resources
+            .getStringArray(R.array.agent_topology_level_numerals)
+            .toList(),
+        createdKnown = context.getString(R.string.agent_topology_created_known),
+        createdUnknown = context.getString(R.string.agent_topology_created_unknown),
+        order = context.getString(R.string.agent_topology_order),
+    )
+
+/**
+ * [T-android-topology-level-label] The card TITLE: which level of sub-agent this
+ * node is.
+ *
+ * The requirement is explicit that the level name IS the title — "作为它的标题，
+ * 它是几级子代理 … 主代理，就是第一层，然后第二层就是一级子代理" — and that
+ * siblings are told apart by a numeric suffix: "每一层可能会有多个子代理，那么多个
+ * 子代理就是比如说二级子代理-1，-2以此类推".
+ *
+ * The previous title was `sessionTitles[id] ?: model.ifBlank { "Agent ${depth}" }`,
+ * so the user read implementation-side identifiers ("Agent 1", or a raw model id)
+ * where the requirement asks for the tree position. The session/model name is not
+ * lost: it becomes the body fallback when the node has no message yet (see
+ * `agentTopologyGraphFromRuntimeJson`).
+ *
+ * @param siblingIndex 1-based position among agents sharing this node's parent —
+ *   i.e. the "-1, -2" in "二级子代理-1". Siblings are the set the user
+ *   distinguishes on screen; nodes under different parents are already told apart
+ *   by their parent, and every node additionally carries a global order number.
+ *   Children are numbered unconditionally (see the note at the return) so a
+ *   label never changes just because a sibling appeared. If the product ever
+ *   wants the numbering to run across a whole level instead of per parent, only
+ *   this function and `topologySiblingIndexes` change.
+ */
+internal fun topologyLevelLabel(depth: Int, siblingIndex: Int, strings: TopologyCardStrings): String {
+    val level = if (depth <= 0) {
+        strings.mainAgent
+    } else {
+        // Counting is 1-based from the first level BELOW the root: depth 1 is
+        // "一级子代理". Past the supplied numerals the digit is used rather than a
+        // made-up name.
+        val numeral = strings.levelNumerals.getOrNull(depth - 1) ?: depth.toString()
+        java.lang.String.format(java.util.Locale.ROOT, strings.subAgentTemplate, numeral)
+    }
+    // Children are ALWAYS numbered, including a lone one. The requirement's own
+    // example is "二级子代理-1，-2", so "-1" is the expected first form; and
+    // suppressing the suffix for an only child would make the label unstable —
+    // a node would be renamed the moment a sibling appeared.
+    return if (depth <= 0) level else "$level-${siblingIndex.coerceAtLeast(1)}"
+}
+
+/**
+ * [T-android-topology-i18n] Every user-visible string the card needs, resolved
+ * from resources by the caller.
+ *
+ * These labels were hardcoded Chinese in this file — the exact defect the
+ * requirement calls out ("加入的资源也要支持多国语言啊不是直接硬编码"). Passing them
+ * in keeps the builders pure and JVM-testable while letting the UI localize;
+ * tests supply explicit strings, so they assert the SHAPE rather than whatever
+ * locale happens to be active.
+ */
+data class TopologyCardStrings(
+    val mainAgent: String,
+    /** `%1$s` = the level numeral/designator, e.g. 一 or 1. */
+    val subAgentTemplate: String,
+    val levelNumerals: List<String>,
+    /** `%1$s` = the formatted creation time. */
+    val createdKnown: String,
+    val createdUnknown: String,
+    /** `%1$d` = the global order. */
+    val order: String,
+)
+
+/**
+ * [T-android-topology-level-label] The title line, shared by BOTH renderers.
+ *
+ * It used to be hand-written identically in the on-screen canvas and the PNG
+ * export. Two copies of one concept drift, and these two already had: the screen
+ * card drew title+token+body while the export drew an extra metadata line, so the
+ * creation time and global order the requirement asks for were visible ONLY in
+ * the exported file. Sharing the builders makes that divergence impossible
+ * rather than merely unlikely.
+ */
+internal fun topologyTitleLine(title: String, tokenLabel: String): String = "$title · $tokenLabel"
+
+/** Second line: when the node was created. */
+internal fun topologyCreatedLabel(createdAtMillis: Long, strings: TopologyCardStrings): String =
+    if (createdAtMillis > 0L) {
+        java.lang.String.format(java.util.Locale.ROOT, strings.createdKnown, formatTopologyTime(createdAtMillis))
+    } else {
+        strings.createdUnknown
+    }
+
+/** Third line: the global creation index — "第三行就是的全局序号". */
+internal fun topologyOrderLabel(globalOrder: Int, strings: TopologyCardStrings): String =
+    java.lang.String.format(java.util.Locale.ROOT, strings.order, globalOrder)
+
+/**
+ * 1-based sibling position for every node, keyed by node id.
+ *
+ * Ordered by `globalOrder` (creation order) rather than by list position, so a
+ * node's suffix never changes because an unrelated node was inserted earlier in
+ * the array. Nodes whose parent is absent from the set are numbered among the
+ * nodes that share the same depth, keeping the label defined for a partial tree
+ * (e.g. a child included while its parent was filtered out).
+ */
+internal fun topologySiblingIndexes(nodes: List<AgentTopologyNode>): Map<String, Int> {
+    val byParent = LinkedHashMap<String, MutableList<AgentTopologyNode>>()
+    val orphaned = LinkedHashMap<Int, MutableList<AgentTopologyNode>>()
+    val ids = nodes.mapTo(HashSet()) { it.id }
+    for (node in nodes) {
+        if (node.depth <= 0) continue
+        val parent = node.parentId
+        if (parent != null && parent in ids) {
+            byParent.getOrPut(parent) { mutableListOf() }.add(node)
+        } else {
+            orphaned.getOrPut(node.depth) { mutableListOf() }.add(node)
+        }
+    }
+    val result = HashMap<String, Int>(nodes.size)
+    for (group in byParent.values) {
+        group.sortedBy { it.globalOrder }.forEachIndexed { i, n -> result[n.id] = i + 1 }
+    }
+    for (group in orphaned.values) {
+        group.sortedBy { it.globalOrder }.forEachIndexed { i, n -> result[n.id] = i + 1 }
+    }
+    return result
+}
+
+/**
+ * [T-android-topology-card-layout] The lines a node card draws, built once and
+ * consumed by BOTH renderers.
+ *
+ * This is the fix for the "two renderers" defect: the on-screen canvas and the
+ * PNG export each assembled the card by hand, and they had already diverged. The
+ * screen showed only `title · tokens` followed by the body, while the export
+ * added a metadata line — so the creation time and global order the requirement
+ * asks for ("第二行就是它被创建的时间，第三行就是的全局序号") existed solely in the
+ * exported PNG and were INVISIBLE in the canvas the user actually looks at.
+ *
+ * Returning plain strings keeps it JVM-testable: the requirement fixed the card's
+ * content and line order, and that is exactly what these assertions can pin
+ * without a Canvas, a Bitmap or a Compose runtime.
+ */
+internal data class TopologyCardLines(
+    /** Line 1: level name + " · " + token count. */
+    val title: String,
+    /** Line 2: creation time. */
+    val created: String,
+    /** Line 3: global creation index. */
+    val order: String,
+    /**
+     * The three lines above the divider, in draw order. Renderers draw exactly
+     * this list and then the body, so the line order cannot drift between them.
+     */
+    val header: List<String>,
+)
+
+internal fun topologyCardLines(
+    node: AgentTopologyNode,
+    tokenLabel: String,
+    strings: TopologyCardStrings,
+): TopologyCardLines {
+    val title = topologyTitleLine(node.title, tokenLabel)
+    val created = topologyCreatedLabel(node.createdAtMillis, strings)
+    val order = topologyOrderLabel(node.globalOrder, strings)
+    return TopologyCardLines(title = title, created = created, order = order, header = listOf(title, created, order))
+}
+
+private fun formatTopologyTime(timestampMillis: Long): String =
+    java.text.SimpleDateFormat("MM-dd HH:mm", Locale.US).format(java.util.Date(timestampMillis))
 
 /**
  * Inserts a PNG pHYs chunk after IHDR. Android's Bitmap.compress does not
@@ -676,15 +1051,80 @@ data class AgentTopologyGraph(
     val currentNodeId: String,
 )
 
+fun aggregateAgentTopologyTokens(
+    sessionIds: Set<String>,
+    usageRows: List<com.openminis.app.data.db.SessionTokenUsageRow>,
+): Map<String, Long> = usageRows
+    .asSequence()
+    .filter { it.sessionId in sessionIds }
+    .mapNotNull { row ->
+        runCatching {
+            val json = JSONObject(row.tokenUsage)
+            row.sessionId to (json.optLong("inputTokens") + json.optLong("outputTokens"))
+        }.getOrNull()
+    }
+    .groupingBy { it.first }
+    .fold(0L) { total, entry -> total + entry.second }
+
+/**
+ * [T-android-topology-run-root-keys] Re-key per-session data onto runtime NODE ids.
+ *
+ * THE BUG THIS EXISTS FOR: after a conversation's first run finishes, the runtime
+ * tree roots every subsequent run at `"<sessionId>#run-<n>"` (`RuntimeSessionCoordinator
+ * .createRoot`), while chat messages and token rows live under the plain
+ * conversation id. Three lookups here were keyed by node id, so on every run after
+ * the first they all silently missed:
+ *
+ *  - the node body's first message fell back to `currentSummary` — i.e. the LATEST
+ *    assistant reply, which is precisely what the requirement replaced it with
+ *    ("就是这个节点所对应的对话内容的第一条消息", request.md:37);
+ *  - `aggregateAgentTopologyTokens` filters `row.sessionId in sessionIds`, so the
+ *    conversation's rows were dropped and the root node showed **0 tokens**;
+ *  - session titles came back null.
+ *
+ * Folding happens through [com.openminis.app.data.repository.canonicalRuntimeSessionId]
+ * rather than a second copy of the `#run-` rule: that helper already owns the
+ * definition (including the deliberate refusal to strip a non-numeric suffix), and
+ * duplicating it here is how the two would drift.
+ *
+ * @param nodeIds runtime tree node ids (what the layout and graph are built from).
+ * @param valuesBySessionId values fetched using canonical conversation ids.
+ * @return the same values keyed by node id, for the callers that index by node.
+ *   A node whose canonical id has no value is simply absent, so "unknown" stays
+ *   distinguishable from "empty".
+ */
+internal fun <T> remapRuntimeNodeKeys(
+    nodeIds: Set<String>,
+    valuesBySessionId: Map<String, T>,
+): Map<String, T> = buildMap {
+    nodeIds.forEach { nodeId ->
+        val sessionId = com.openminis.app.data.repository.canonicalRuntimeSessionId(nodeId)
+        valuesBySessionId[sessionId]?.let { put(nodeId, it) }
+    }
+}
+
 /** Builds the display graph from the durable runtime tree without changing its schema. */
-fun agentTopologyGraphFromRuntimeJson(
+internal fun agentTopologyGraphFromRuntimeJson(
     runtimeJson: String,
     sessionId: String,
     sessionTitle: String,
     currentSummary: String,
     currentTokens: Long = 0L,
+    sessionTitles: Map<String, String> = emptyMap(),
+    cardStrings: TopologyCardStrings = DEFAULT_TOPOLOGY_CARD_STRINGS,
+    tokenTotalsBySession: Map<String, Long> = emptyMap(),
+    /**
+     * [T-android-topology-first-message] Each node's OPENING message text, keyed by
+     * session id. This is what the requirement puts in the node body: "就是这个节点
+     * 所对应的对话内容的第一条消息" (request.md:37). Missing key = the session has no
+     * messages yet, which is different from "has an empty message".
+     */
+    firstMessagesBySession: Map<String, String> = emptyMap(),
 ): AgentTopologyGraph {
     require(sessionId.isNotBlank())
+    // [T-android-topology-peer-edges] Peer/subscription links the runtime already
+    // records. Parsed here (not in the UI) so the mapping stays pure and testable.
+    val runtimeLinks = parseRuntimeTopologyLinks(runtimeJson)
     val runtimeNodes = runCatching {
         val array = JSONObject(runtimeJson).optJSONArray("nodes") ?: JSONArray()
         buildList {
@@ -701,7 +1141,20 @@ fun agentTopologyGraphFromRuntimeJson(
                         createdAtMillis = json.optLong("createdAtMillis"),
                         model = json.optJSONObject("model")?.optString("model").orEmpty(),
                         note = json.optJSONObject("model")?.optString("note").orEmpty(),
-                        order = index,
+                        // 1-based on purpose. The requirement defines this number as
+                        // "这个序号就是全局的索引号，就是它的第几个被创建的"
+                        // (request.md:37) and shows it as "全局序号: 3" — both are the
+                        // Chinese ordinal "第几个", which starts at 1. The array position
+                        // is a 0-based index, so without the +1 the first node created
+                        // (the root) would be labelled "全局序号: 0".
+                        //
+                        // `nodes` is serialised from a LinkedHashMap in insertion order,
+                        // so this index IS creation order; only the base changes here.
+                        //
+                        // Sorting is unaffected: `topologySiblingIndexes` sorts by this
+                        // value and a constant offset cannot reorder. Nothing else reads
+                        // `globalOrder` — it is display-only and is not exported.
+                        order = index + 1,
                     ),
                 )
             }
@@ -716,7 +1169,9 @@ fun agentTopologyGraphFromRuntimeJson(
             title = sessionTitle.ifBlank { "Session" },
             summary = currentSummary,
             tokens = currentTokens,
-            globalOrder = 0,
+            // Same 1-based convention as the parsed path above; this synthetic node
+            // stands in for "the first node of this session".
+            globalOrder = 1,
             status = "RUNNING",
         )
         return AgentTopologyGraph(listOf(node), emptyList(), sessionId)
@@ -730,13 +1185,47 @@ fun agentTopologyGraphFromRuntimeJson(
         }
     }
     val graphItems = runtimeNodes.filter { it.id in included }
+    // [T-android-topology-level-label] The card title is the node's POSITION in
+    // the tree ("主代理" / "一级子代理" / "二级子代理-1"), per the requirement.
+    // The session/model name it used to show is not dropped — it moves to the
+    // body so a node with no message yet still says something identifiable.
+    val siblingIndexes = topologySiblingIndexes(
+        graphItems.map { item ->
+            AgentTopologyNode(
+                id = item.id,
+                title = "",
+                parentId = item.parentId,
+                depth = item.depth,
+                globalOrder = item.order,
+            )
+        },
+    )
     val displayNodes = graphItems.map { item ->
         AgentTopologyNode(
             id = item.id,
-            title = if (item.id == root.id) sessionTitle.ifBlank { "Session" }
-                else item.model.ifBlank { "Agent ${item.depth}" },
-            summary = if (item.id == root.id && currentSummary.isNotBlank()) currentSummary else item.note,
-            tokens = if (item.id == root.id) currentTokens else 0L,
+            title = topologyLevelLabel(item.depth, siblingIndexes[item.id] ?: 1, cardStrings),
+            // [T-android-topology-first-message] The body is the conversation's
+            // FIRST message, per the requirement. The chain below it is a fallback
+            // for a node whose session has no rows yet (a child created but not yet
+            // spoken to) — it is deliberately NOT allowed to outrank the first
+            // message, which is what used to happen: the box showed a session title
+            // or the raw model id instead of the line the user is looking for.
+            summary = when {
+                firstMessagesBySession[item.id]?.isNotBlank() == true ->
+                    firstMessagesBySession.getValue(item.id)
+                // Root-only fallback, and only when the session has no message row
+                // yet: the first turn can still be streaming, so nothing has been
+                // persisted and there IS no first message to show. Kept BELOW the
+                // first-message branch deliberately — otherwise a session with
+                // history would keep showing its latest reply, which is not the
+                // "第一条消息" the requirement asks for.
+                item.id == root.id && currentSummary.isNotBlank() -> currentSummary
+                item.note.isNotBlank() -> item.note
+                // Legacy fallback, previously the title: still shown, just not as
+                // the heading.
+                else -> sessionTitles[item.id] ?: item.model
+            },
+            tokens = if (item.id == root.id) currentTokens else tokenTotalsBySession[item.id] ?: 0L,
             parentId = item.parentId,
             depth = item.depth,
             createdAtMillis = item.createdAtMillis,
@@ -745,11 +1234,82 @@ fun agentTopologyGraphFromRuntimeJson(
         )
     }
     val ids = displayNodes.mapTo(HashSet()) { it.id }
-    val relations = displayNodes.mapNotNull { item ->
-        item.parentId?.takeIf(ids::contains)?.let { AgentTopologyRelation(it, item.id, "parent") }
+    val parentRelations = displayNodes.mapNotNull { item ->
+        item.parentId?.takeIf(ids::contains)?.let {
+            AgentTopologyRelation(it, item.id, "parent", AgentTopologyEdgeKind.PARENT)
+        }
     }
-    return AgentTopologyGraph(displayNodes, relations, root.id)
+    // Runtime links are added only when both endpoints are on screen, and a
+    // PARENT_CHILD link is skipped because the parentId above already produced it
+    // — drawing both would double-stroke the same delegation line.
+    val existing = parentRelations.mapTo(HashSet()) { Triple(it.fromId, it.toId, it.kind) }
+    val linkRelations = runtimeLinks.mapNotNull { link ->
+        if (link.fromId !in ids || link.toId !in ids) return@mapNotNull null
+        if (link.kind == AgentTopologyEdgeKind.PARENT) return@mapNotNull null
+        if (!existing.add(Triple(link.fromId, link.toId, link.kind))) return@mapNotNull null
+        AgentTopologyRelation(link.fromId, link.toId, link.label, link.kind)
+    }
+    return AgentTopologyGraph(displayNodes, parentRelations + linkRelations, root.id)
 }
+
+/**
+ * [T-android-topology-peer-edges] One non-tree link carried by the runtime snapshot.
+ *
+ * `kind` is already mapped to the diagram's own vocabulary so the renderer never
+ * has to know about runtime enums.
+ */
+internal data class RuntimeTopologyLink(
+    val fromId: String,
+    val toId: String,
+    val kind: AgentTopologyEdgeKind,
+    val label: String?,
+)
+
+/**
+ * [T-android-topology-peer-edges] Read the runtime snapshot's non-tree links.
+ *
+ * Sources (see `SessionTreeRuntime`):
+ *  - `topologyEdges[]` — `{fromNodeId, toNodeId, kind: PARENT_CHILD|SUBSCRIPTION|
+ *    TEAM_PEER, revokedAtMillis}`. A missing `revokedAtMillis` means still active.
+ *    PARENT_CHILD is dropped here so the caller can derive delegation lines from
+ *    `parentId` and avoid double-stroking.
+ *  - `subscriptions[]` — the traditional publisher/subscriber link. The arrow
+ *    points publisher → subscriber, i.e. the direction notifications travel.
+ *
+ * A malformed or absent array yields an empty list rather than throwing: a
+ * diagram must still render when the runtime JSON is partial.
+ */
+internal fun parseRuntimeTopologyLinks(runtimeJson: String): List<RuntimeTopologyLink> =
+    runCatching {
+        val root = JSONObject(runtimeJson)
+        buildList {
+            val edges = root.optJSONArray("topologyEdges") ?: JSONArray()
+            for (index in 0 until edges.length()) {
+                val json = edges.optJSONObject(index) ?: continue
+                val from = json.optString("fromNodeId").takeIf(String::isNotBlank) ?: continue
+                val to = json.optString("toNodeId").takeIf(String::isNotBlank) ?: continue
+                if (from == to) continue
+                // Absent key == never revoked == active.
+                val revoked = json.optLong("revokedAtMillis", 0L)
+                if (revoked != 0L) continue
+                val kind = when (json.optString("kind")) {
+                    "TEAM_PEER" -> AgentTopologyEdgeKind.PEER
+                    "SUBSCRIPTION" -> AgentTopologyEdgeKind.SUBSCRIPTION
+                    else -> AgentTopologyEdgeKind.PARENT
+                }
+                add(RuntimeTopologyLink(from, to, kind, json.optString("kind").lowercase()))
+            }
+            val subscriptions = root.optJSONArray("subscriptions") ?: JSONArray()
+            for (index in 0 until subscriptions.length()) {
+                val json = subscriptions.optJSONObject(index) ?: continue
+                val publisher = json.optString("publisherNodeId").takeIf(String::isNotBlank) ?: continue
+                val subscriber = json.optString("subscriberNodeId").takeIf(String::isNotBlank) ?: continue
+                if (publisher == subscriber) continue
+                if (json.optLong("revokedAtMillis", 0L) != 0L) continue
+                add(RuntimeTopologyLink(publisher, subscriber, AgentTopologyEdgeKind.SUBSCRIPTION, "subscription"))
+            }
+        }
+    }.getOrDefault(emptyList())
 
 private data class RuntimeTopologyItem(
     val id: String,
@@ -777,22 +1337,50 @@ fun AgentTopologyRoute(
         mutableStateOf(AgentTopologyGraph(emptyList(), emptyList(), sessionId))
     }
     LaunchedEffect(sessionId, sessionTitle, currentSummary) {
-        graph = withContext(Dispatchers.IO) {
-            val runtimeJson = runCatching {
-                RuntimeTreeStore.open(context.applicationContext).snapshot().toJson()
-            }.getOrDefault("{}")
-            val tokenCount = runCatching {
-                chatRepository.sessionTokenUsages(sessionId).sumOf { raw ->
-                    val json = JSONObject(raw)
-                    json.optLong("inputTokens") + json.optLong("outputTokens")
+        val runtimeJson = withContext(Dispatchers.IO) {
+            runCatching { RuntimeTreeStore.open(context.applicationContext).snapshot().toJson() }.getOrDefault("{}")
+        }
+        val topologyIds = runCatching {
+            val nodes = JSONObject(runtimeJson).optJSONArray("nodes") ?: JSONArray()
+            buildSet {
+                for (i in 0 until nodes.length()) nodes.optJSONObject(i)?.optString("id")?.takeIf { it.isNotBlank() }?.let(::add)
+            }
+        }.getOrDefault(setOf(sessionId))
+        // [T-android-topology-run-root-keys] Node ids are NOT conversation ids once a
+        // session has re-run: the tree roots run N>1 at "<sessionId>#run-<N>" while
+        // messages/token rows stay under the plain id. Every DB lookup below goes
+        // through the canonical id, and the results are re-keyed onto node ids for
+        // the graph builder (which indexes by node). See remapRuntimeNodeKeys.
+        val canonicalByNode = topologyIds.associateWith {
+            com.openminis.app.data.repository.canonicalRuntimeSessionId(it)
+        }
+        val canonicalIds = canonicalByNode.values.toSet()
+        val firstMessages = withContext(Dispatchers.IO) {
+            runCatching { chatRepository.firstMessagesForSessions(canonicalIds.toList()) }
+                .getOrDefault(emptyMap())
+        }.let { remapRuntimeNodeKeys(topologyIds, it) }
+        val sessionTitles = withContext(Dispatchers.IO) {
+            buildMap {
+                canonicalIds.filter { it != sessionId }.forEach { id ->
+                    chatRepository.getSession(id)?.title?.takeIf { it.isNotBlank() }?.let { put(id, it) }
                 }
-            }.getOrDefault(0L)
-            agentTopologyGraphFromRuntimeJson(
+            }
+        }.let { remapRuntimeNodeKeys(topologyIds, it) }
+        chatRepository.observeTokenUsagesForSessions(canonicalIds.toList()).collect { rows ->
+            val canonicalTotals = aggregateAgentTopologyTokens(canonicalIds, rows)
+            val totals = remapRuntimeNodeKeys(topologyIds, canonicalTotals)
+            graph = agentTopologyGraphFromRuntimeJson(
                 runtimeJson = runtimeJson,
                 sessionId = sessionId,
                 sessionTitle = sessionTitle,
                 currentSummary = currentSummary,
-                currentTokens = tokenCount,
+                // The root node may be "<sessionId>#run-N"; totals are re-keyed onto
+                // node ids above, so ask for the node that is actually the root.
+                currentTokens = totals[sessionId] ?: canonicalTotals[sessionId] ?: 0L,
+                sessionTitles = sessionTitles,
+                tokenTotalsBySession = totals,
+                cardStrings = topologyCardStrings(context),
+                firstMessagesBySession = firstMessages,
             )
         }
     }
@@ -834,10 +1422,17 @@ fun AgentTopologyScreen(
 ) {
     val context = LocalContext.current
     val prefs = remember(context) { AgentTopologyPrefs(context) }
+    val cardStrings = remember(context) { topologyCardStrings(context) }
     var zoom by remember { mutableStateOf(prefs.loadZoom()) }
     var pan by remember { mutableStateOf(Offset.Zero) }
     var viewport by remember { mutableStateOf(IntSize.Zero) }
-    var transparent by remember { mutableStateOf(false) }
+    // [T-android-topology-export-options] Remembered, not transient: the
+    // requirement asks for a default the user picks once.
+    var transparent by remember { mutableStateOf(prefs.loadExportTransparent()) }
+    // [T-android-topology-export-quality] The requirement asks the user to CHOOSE
+    // the fineness, so the dialog needs a selection, not just a stated default.
+    var exportQuality by remember { mutableStateOf(prefs.loadExportQuality()) }
+    var showExportOptions by remember { mutableStateOf(false) }
     val layout = remember(nodes, relations) { layoutAgentTopology(nodes, relations) }
     val exportLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.CreateDocument("image/png"),
@@ -845,7 +1440,13 @@ fun AgentTopologyScreen(
         if (uri != null) {
             runCatching {
                 context.contentResolver.openOutputStream(uri)?.use { stream ->
-                    stream.write(renderAgentTopologyPng(layout, AgentTopologyExportOptions(transparentBackground = transparent)))
+                    stream.write(renderAgentTopologyPng(layout, AgentTopologyExportOptions(
+                        transparentBackground = transparent,
+                        cardStrings = cardStrings,
+                        dpi = exportQuality.dpi,
+                        maxDimensionPx = exportQuality.maxDimensionPx,
+                        maxPixels = exportQuality.maxPixels,
+                    )))
                 }
             }
         }
@@ -900,15 +1501,34 @@ fun AgentTopologyScreen(
                         scaleY = zoom
                     },
             ) {
+                // [T-android-topology-peer-edges] Peer and subscription links are
+                // drawn here too (dashed, differently coloured) — previously only
+                // parent/child lines reached the screen at all, so a Team's P2P
+                // structure was invisible in the very view meant to show it.
                 layout.edges.forEach { edge ->
                     if (edge.points.size >= 2) {
+                        val edgeStyle = topologyEdgeStyle(edge.relation.kind)
                         val points = edge.points
                         for (index in 0 until points.lastIndex) {
                             drawLine(
-                                color = Color(0xFF4082BE),
+                                color = Color(edgeStyle.argb),
                                 start = Offset(points[index].x, points[index].y),
                                 end = Offset(points[index + 1].x, points[index + 1].y),
-                                strokeWidth = 3f,
+                                strokeWidth = edgeStyle.strokeWidth,
+                                pathEffect = edgeStyle.dashIntervals
+                                    ?.let { PathEffect.dashPathEffect(it, 0f) },
+                            )
+                        }
+                        // [T-android-topology-arrow-parity] Same shared geometry as
+                        // the PNG exporter. Without this the screen showed no edge
+                        // direction at all, so A->B and B->A looked identical here
+                        // while the exported image distinguished them.
+                        topologyArrowheadSegments(points).forEach { (tip, barb) ->
+                            drawLine(
+                                color = Color(edgeStyle.argb),
+                                start = Offset(tip.x, tip.y),
+                                end = Offset(barb.x, barb.y),
+                                strokeWidth = edgeStyle.strokeWidth,
                             )
                         }
                     }
@@ -938,9 +1558,30 @@ fun AgentTopologyScreen(
                         color = android.graphics.Color.rgb(72, 83, 102)
                         textSize = 12f
                     }
+                    // [T-android-topology-card-layout] The SAME card lines the PNG
+                    // export draws. This is the renderer the user actually sees,
+                    // and it used to omit creation time and global order entirely —
+                    // so those two required lines existed only in the exported
+                    // file. Both renderers now consume one builder.
+                    val card = topologyCardLines(item.node, item.tokenLabel, cardStrings)
+                    val dividerPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+                        color = android.graphics.Color.rgb(210, 216, 226)
+                        strokeWidth = 1f
+                    }
                     var textY = item.rect.top + 20f
-                    native.drawText("${item.node.title} · ${item.tokenLabel}", item.rect.left + 10f, textY, titlePaint)
+                    native.drawText(card.title, item.rect.left + 10f, textY, titlePaint)
                     textY += 18f
+                    native.drawText(card.created, item.rect.left + 10f, textY, bodyPaint)
+                    textY += 15f
+                    native.drawText(card.order, item.rect.left + 10f, textY, bodyPaint)
+                    textY += 15f
+                    native.drawLine(
+                        item.rect.left + 10f,
+                        textY - 10f,
+                        item.rect.right - 10f,
+                        textY - 10f,
+                        dividerPaint,
+                    )
                     item.summaryLines.forEach { line ->
                         if (textY <= item.rect.bottom - 6f) native.drawText(line, item.rect.left + 10f, textY, bodyPaint)
                         textY += 15f
@@ -954,19 +1595,170 @@ fun AgentTopologyScreen(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
+            // [T-android-topology-peer-edges] Legend.
+            //
+            // EDITORIAL CHOICE, not requirement text: the request describes what
+            // the graph must SHOW (P2P links between sub-agents, request.md:33) but
+            // never asks for a legend. Once the diagram draws three line styles,
+            // however, a reader who has not seen this file cannot tell a delegation
+            // edge from a peer edge — so "drawn" would not become "understandable",
+            // which is the point of the requirement. Only rendered when a non-tree
+            // link actually exists, so the common tree-only view is unchanged.
+            val legendKinds = remember(relations) {
+                relations.map { it.kind }.filter { it != AgentTopologyEdgeKind.PARENT }.distinct()
+            }
+            if (legendKinds.isNotEmpty()) {
+                Column(
+                    modifier = Modifier.align(Alignment.TopStart).padding(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    (listOf(AgentTopologyEdgeKind.PARENT) + legendKinds).forEach { kind ->
+                        val style = topologyEdgeStyle(kind)
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Canvas(modifier = Modifier.width(26.dp).height(10.dp)) {
+                                drawLine(
+                                    color = Color(style.argb),
+                                    start = Offset(0f, size.height / 2f),
+                                    end = Offset(size.width, size.height / 2f),
+                                    strokeWidth = style.strokeWidth,
+                                    pathEffect = style.dashIntervals
+                                        ?.let { PathEffect.dashPathEffect(it, 0f) },
+                                )
+                            }
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = stringResource(
+                                    when (kind) {
+                                        AgentTopologyEdgeKind.PARENT -> R.string.agent_topology_legend_parent
+                                        AgentTopologyEdgeKind.PEER -> R.string.agent_topology_legend_peer
+                                        AgentTopologyEdgeKind.SUBSCRIPTION ->
+                                            R.string.agent_topology_legend_subscription
+                                    },
+                                ),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
+            }
             Row(
                 modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                androidx.compose.material3.FilterChip(
-                    selected = transparent,
-                    onClick = { transparent = !transparent },
-                    label = { Text(stringResource(R.string.agent_topology_transparent)) },
-                )
-                FloatingActionButton(onClick = { exportLauncher.launch("agent-topology.png") }) {
+                // [T-android-topology-export-options] Zoom is PERSISTED, so a user
+                // who zoomed far out and closed the canvas had no way back to the
+                // default scale — the string for this button existed and was
+                // referenced nowhere, i.e. the affordance was designed and never
+                // wired. The background chip that used to live here moved into the
+                // export dialog, where the requirement puts that choice.
+                androidx.compose.material3.TextButton(onClick = {
+                    zoom = prefs.saveZoom(AgentTopologyPrefs.DEFAULT_GLOBAL_ZOOM)
+                }) {
+                    Text(stringResource(R.string.agent_topology_zoom_reset))
+                }
+                FloatingActionButton(onClick = { showExportOptions = true }) {
                     Icon(Icons.Default.Download, contentDescription = stringResource(R.string.agent_topology_export))
                 }
+            }
+            // [T-android-topology-export-options] The requirement: tapping export
+            // must first offer the quality/background choice, with poster grade as
+            // the default ("导出用这个图标，然后点击以后，可以选择默认的一个…精细度…
+            // 默认的话就是达到一个海报级别的质感…导出的话，可以选择带上背景或者纯透明").
+            // It used to jump straight into the system file picker, so the only
+            // control was a chip whose state was lost on every reopen.
+            //
+            // The wording below reuses the strings that already existed for this
+            // dialog and had zero references anywhere — i.e. the UI they were
+            // written for was never built.
+            if (showExportOptions) {
+                AlertDialog(
+                    onDismissRequest = { showExportOptions = false },
+                    title = { Text(stringResource(R.string.agent_topology_export_png)) },
+                    text = {
+                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            // [T-android-topology-export-quality] Selectable fineness.
+                            // Previously this block only STATED the default
+                            // ("agent_topology_export_poster_default" + _description",
+                            // whose text used to claim 300 DPI while the code exported
+                            // 350) — the requirement's "可以选择" had no control.
+                            Text(
+                                text = stringResource(R.string.agent_topology_export_quality_label),
+                                style = MaterialTheme.typography.titleSmall,
+                            )
+                            AgentTopologyExportQuality.entries.forEach { quality ->
+                                val label = when (quality) {
+                                    AgentTopologyExportQuality.STANDARD ->
+                                        R.string.agent_topology_export_quality_standard
+                                    AgentTopologyExportQuality.POSTER ->
+                                        R.string.agent_topology_export_quality_poster
+                                }
+                                val description = when (quality) {
+                                    AgentTopologyExportQuality.STANDARD ->
+                                        R.string.agent_topology_export_quality_standard_description
+                                    AgentTopologyExportQuality.POSTER ->
+                                        R.string.agent_topology_export_quality_poster_description
+                                }
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clickable {
+                                            exportQuality = prefs.saveExportQuality(quality)
+                                        }
+                                        .padding(vertical = 6.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    RadioButton(
+                                        selected = quality == exportQuality,
+                                        onClick = { exportQuality = prefs.saveExportQuality(quality) },
+                                    )
+                                    Column {
+                                        Text(
+                                            text = stringResource(label),
+                                            style = MaterialTheme.typography.bodyMedium,
+                                        )
+                                        Text(
+                                            text = stringResource(description),
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        )
+                                    }
+                                }
+                            }
+                            Text(
+                                text = stringResource(R.string.agent_topology_export_background),
+                                style = MaterialTheme.typography.titleSmall,
+                                modifier = Modifier.padding(top = 8.dp),
+                            )
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                androidx.compose.material3.FilterChip(
+                                    selected = transparent,
+                                    onClick = { transparent = true; prefs.saveExportTransparent(true) },
+                                    label = { Text(stringResource(R.string.agent_topology_export_transparent)) },
+                                )
+                                androidx.compose.material3.FilterChip(
+                                    selected = !transparent,
+                                    onClick = { transparent = false; prefs.saveExportTransparent(false) },
+                                    label = { Text(stringResource(R.string.agent_topology_export_solid)) },
+                                )
+                            }
+                        }
+                    },
+                    confirmButton = {
+                        androidx.compose.material3.TextButton(onClick = {
+                            showExportOptions = false
+                            exportLauncher.launch("agent-topology.png")
+                        }) {
+                            Text(stringResource(R.string.agent_topology_export_png))
+                        }
+                    },
+                    dismissButton = {
+                        androidx.compose.material3.TextButton(onClick = { showExportOptions = false }) {
+                            Text(stringResource(android.R.string.cancel))
+                        }
+                    },
+                )
             }
         }
     }

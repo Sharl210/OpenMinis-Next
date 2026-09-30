@@ -16,14 +16,33 @@ interface LLMProvider {
 
     /**
      * Effective max output tokens ceiling for the given model.
-     * Priority: model.maxOutputTokens > provider-level default.
+     * Priority: this model's own value > the built-in template / family floor
+     * for its id > provider-level default.
      * Used as the upper bound in dynamicMaxTokens().
+     *
+     * [G3-max-output-family-floor] The provider-level default is now the LAST
+     * resort rather than the second. A model carrying no value of its own but
+     * whose id the template knows — or whose family has a documented floor —
+     * used to be handed the generic 16_384 while its own siblings were handed
+     * 393_216 (DeepSeek), so an unregistered id looked like a corrupt result to
+     * the user and the model could not explain the cut. The template and family
+     * values are model-level evidence and belong in the model's slot; that is
+     * the same order this line already had (model first, constant second).
+     *
+     * A provider that publishes a real ceiling for its own API (Anthropic:
+     * 64_000) still gets that ceiling whenever the model has no evidence of its
+     * own, because [LLMModel.resolvedMaxOutputTokens] cannot see the provider
+     * and returns `null` in exactly that case.
      */
     fun effectiveMaxOutputTokens(model: LLMModel): Int =
-        model.maxOutputTokens ?: defaultMaxOutputTokens
+        model.resolvedMaxOutputTokens ?: defaultMaxOutputTokens
 
-    /** Provider-level fallback when model.maxOutputTokens is unknown. */
-    val defaultMaxOutputTokens: Int get() = 16_384
+    /**
+     * Provider-level fallback when [LLMModel.resolvedMaxOutputTokens] is null —
+     * i.e. neither the model, the catalog nor the built-in template has an
+     * answer. Overridden by providers whose API publishes a real ceiling.
+     */
+    val defaultMaxOutputTokens: Int get() = LLMModel.DEFAULT_MAX_OUTPUT_TOKENS
 
     /**
      * [T-android-tool-splits-reply-fix] True when the streamed assistant text

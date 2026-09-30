@@ -9,11 +9,52 @@ import com.openminis.app.agent.SoulIcon
 import com.openminis.app.data.model.MessagePartsCodec
 import com.openminis.app.data.model.MessageProvenance
 import com.openminis.app.data.model.ModelAttributionSnapshot
+import com.openminis.app.data.model.ThinkingLevel
 import kotlinx.coroutines.flow.Flow
 import java.util.UUID
 
-class ChatRepository(internal val dao: ChatDao) {
+/**
+ * [T-android-loadmessages-fallback-truncation] Page through a fixed number of
+ * rows, tolerating slices that cannot be read.
+ *
+ * `loadPage(offset, limit)` returns the slice's rows plus whether it had to fall
+ * back to reading one row at a time (`fellBack`). An EMPTY slice means two
+ * different things depending on that flag:
+ *
+ *  - normal path → there is genuinely nothing more, so stopping is right;
+ *  - row-by-row fallback → every row in this slice was unreadable (an oversized
+ *    blob). Treating that as "nothing more" silently dropped the whole REST of
+ *    the transcript, so the user's later messages simply vanished from the
+ *    session. `offset` is a DB-row position, so skipping past an unreadable
+ *    slice and continuing is safe and cannot loop (offset always advances).
+ *
+ * Generic over the row type and free of DAO/Android dependencies so the policy
+ * is testable on the JVM.
+ */
+internal suspend fun <T> loadAllPages(
+    total: Int,
+    pageSize: Int,
+    loadPage: suspend (offset: Int, limit: Int) -> Pair<List<T>, Boolean>,
+): List<T> {
+    if (total <= 0 || pageSize <= 0) return emptyList()
+    val out = ArrayList<T>(total)
+    var offset = 0
+    while (offset < total) {
+        val (page, fellBack) = loadPage(offset, pageSize)
+        if (page.isEmpty()) {
+            if (fellBack && offset + pageSize < total) {
+                offset += pageSize
+                continue
+            }
+            break
+        }
+        out.addAll(page)
+        offset += pageSize
+    }
+    return out
+}
 
+class ChatRepository(internal val dao: ChatDao) {
     fun observeSessions(): Flow<List<ChatSessionEntity>> = dao.observeSessions()
 
     suspend fun createSession(
@@ -45,7 +86,39 @@ class ChatRepository(internal val dao: ChatDao) {
 
     suspend fun getSession(id: String): ChatSessionEntity? = dao.getSession(id)
 
+    suspend fun listSessions(): List<ChatSessionEntity> = dao.listSessions()
+
     suspend fun sessionTokenUsages(sessionId: String): List<String> = dao.tokenUsages(sessionId)
+
+    fun observeTokenUsagesForSessions(sessionIds: List<String>): Flow<List<com.openminis.app.data.db.SessionTokenUsageRow>> =
+        dao.observeTokenUsagesForSessions(sessionIds)
+
+    suspend fun tokenUsagesForSessions(sessionIds: List<String>): List<com.openminis.app.data.db.SessionTokenUsageRow> =
+        dao.tokenUsagesForSessions(sessionIds)
+
+    /**
+     * [T-android-topology-first-message] Each session's OPENING message, as text.
+     *
+     * The topology graph shows this as a node's body, per the requirement: "就是这个
+     * 节点所对应的对话内容的第一条消息" (request.md:37). Before this the graph had
+     * no first-message data and fell back to a session title or the model id, so the
+     * box the user reads was showing something the requirement never asked for.
+     *
+     * Reuses [extractTextForOffload] rather than decoding `parts_json` again: that
+     * helper already owns "what does this message actually say" (text → media label
+     * → tool titles), including stripping `<system-reminder>` wrappers. A second
+     * decoder here would be a second definition of that question — the exact
+     * duplication this codebase has been bitten by elsewhere.
+     *
+     * Sessions with no rows yet are simply absent from the map, so the caller can
+     * tell "no message" apart from "empty message".
+     */
+    suspend fun firstMessagesForSessions(sessionIds: List<String>): Map<String, String> {
+        if (sessionIds.isEmpty()) return emptyMap()
+        return dao.firstMessagesForSessions(sessionIds)
+            .associate { row -> row.sessionId to extractTextForOffload(row.partsJson).trim() }
+            .filterValues { it.isNotEmpty() }
+    }
 
     /**
      * [T-android-session-paused-badge-hardkill] Session ids whose agent loop was
@@ -55,9 +128,34 @@ class ChatRepository(internal val dao: ChatDao) {
      * then the SAME interrupted-tail predicate as ChatViewModel.loadSession's
      * detection (kept in sync intentionally). Mirrors iOS
      * ChatStore.interruptedSessionIds.
+     *
+     * THREE-STATE CONTRACT — the nullable return is load-bearing. `null` means
+     * "the tail scan FAILED, so the interrupted set is UNKNOWN"; it does NOT
+     * mean "nothing is interrupted". Callers must skip their reconcile on
+     * `null`: `SessionBadgeStore.reconcileInterruptedSessions` removes AND
+     * PERSISTS the removal of a PAUSED badge for every session missing from the
+     * set it is handed, so handing it `emptySet()` after a failed read wipes
+     * every PAUSED badge and writes that wipe to disk. Collapsing the failure
+     * into `emptySet()` is exactly how "query failed" became indistinguishable
+     * from "nothing is interrupted" — both MinisApp call sites (cold start and
+     * foreground resume) branch on `?: return@launch` for this reason.
      */
-    suspend fun interruptedSessionIds(): Set<String> {
-        val tails = runCatching { dao.lastMessageTailPerSession() }.getOrElse { emptyList() }
+    suspend fun interruptedSessionIds(): Set<String>? {
+        val tails = try {
+            dao.lastMessageTailPerSession()
+        } catch (cancellation: kotlinx.coroutines.CancellationException) {
+            // Cancellation is not a read failure. Reporting UNKNOWN here would
+            // turn a cancelled scan into a "successful, empty" answer for any
+            // caller that does not itself check for cancellation.
+            throw cancellation
+        } catch (error: Throwable) {
+            android.util.Log.w(
+                "ChatRepository",
+                "interruptedSessionIds: tail scan failed — interrupted set is UNKNOWN, not empty",
+                error,
+            )
+            return null
+        }
         val result = HashSet<String>()
         for (row in tails) {
             if (isInterruptedTail(row.role, row.partsJson)) result.add(row.sessionId)
@@ -136,6 +234,21 @@ class ChatRepository(internal val dao: ChatDao) {
     /** Deletes an already-authorized Chat Room session subtree atomically. */
     suspend fun deleteSessionSubtree(sessionIds: List<String>): Int =
         dao.deleteSessionSubtree(sessionIds)
+
+    /**
+     * Which of [ids] still have a session row.
+     *
+     * [deleteSessionSubtree] refuses the whole batch when one id is unknown, and
+     * a subtree resolved out of the runtime tree can contain nodes for sessions
+     * the database never had — so a recursive delete intersects with this before
+     * asking for the atomic delete. Chunked to stay under SQLite's
+     * bound-parameter ceiling, matching the delete's own 500-row chunking.
+     */
+    suspend fun existingSessionIds(ids: Collection<String>): List<String> {
+        val distinct = ids.filter { it.isNotBlank() }.distinct()
+        if (distinct.isEmpty()) return emptyList()
+        return distinct.chunked(500).flatMap { dao.existingSessionIds(it) }
+    }
 
     // ─── Session groups ("folders") ────────────────────────────────────────
     // [T-android-session-grouping] Ported from iOS ChatStore's Folders section.
@@ -300,11 +413,24 @@ class ChatRepository(internal val dao: ChatDao) {
      * SQLiteBlobTooBigException and the chat loader hung the UI thread.
      *
      * This paginated loader keeps each underlying query small enough that
-     * the CursorWindow can hold a normal-shaped page. If a single page
-     * still contains an individual >2MB row we fall back to fetching
-     * that range row-by-row and substitute a proxy MessageEntity for
-     * any single row that genuinely can't be materialised — the
-     * transcript stays continuous instead of crashing the load.
+     * the CursorWindow can hold a normal-shaped page. If a page still contains
+     * an individual >2MB row we re-fetch that range row-by-row and DROP
+     * the rows that genuinely cannot be materialised — the rest of the
+     * transcript still loads, instead of the whole load crashing.
+     *
+     * MEASURED, so nobody re-derives it from the old wording: this comment used
+     * to claim the unreadable row was replaced by a "proxy MessageEntity" that
+     * kept the transcript continuous. No such substitution exists anywhere in
+     * the repository — `loadPageRowByRow` skips the row (`?: continue`), so a
+     * message that cannot be read is ABSENT from the returned list, not
+     * represented by a stand-in. Consumers that pair UI positions with DB rows
+     * must therefore tolerate a gap rather than assume they line up 1:1.
+     * Introducing a real placeholder would invent message content; that is a
+     * product decision, not a comment fix.
+     *
+     * [T-android-loadmessages-fallback-truncation] A page made up ENTIRELY of
+     * unreadable rows comes back empty through this fallback, which must not be
+     * read as "no more rows" — see [loadAllPages].
      *
      * Existing oversized rows are not migrated; new oversized inserts
      * are prevented by the cap in [appendMessage].
@@ -325,31 +451,24 @@ class ChatRepository(internal val dao: ChatDao) {
         }
         val total = dao.messageCountForSession(sessionId)
         if (total == 0) return emptyList()
-        val out = ArrayList<MessageEntity>(total)
-        var offset = 0
-        while (offset < total) {
-            val limit = LOAD_PAGE_SIZE
-            val page = try {
-                dao.loadMessagesPage(sessionId, offset, limit)
+        return loadAllPages(total, LOAD_PAGE_SIZE) { offset, limit ->
+            try {
+                dao.loadMessagesPage(sessionId, offset, limit) to false
             } catch (e: SQLiteBlobTooBigException) {
                 // Fall back to single-row pages so we can isolate the
                 // offending blob(s) and serve the rest of the slice.
-                loadPageRowByRow(sessionId, offset, limit)
+                loadPageRowByRow(sessionId, offset, limit) to true
             } catch (e: IllegalStateException) {
                 // Some Room/SQLite combinations wrap the CursorWindow
                 // overflow in IllegalStateException("Couldn't read row N,
                 // col N from CursorWindow"); treat the same way.
                 if (e.message?.contains("CursorWindow", ignoreCase = true) == true) {
-                    loadPageRowByRow(sessionId, offset, limit)
+                    loadPageRowByRow(sessionId, offset, limit) to true
                 } else {
                     throw e
                 }
             }
-            if (page.isEmpty()) break
-            out.addAll(page)
-            offset += limit
         }
-        return out
     }
 
     private suspend fun loadPageRowByRow(
@@ -371,7 +490,13 @@ class ChatRepository(internal val dao: ChatDao) {
         return result
     }
 
-    suspend fun deleteMessagesAfter(sessionId: String, keepCount: Int) =
+    /**
+     * [T-android-persistence-result-check] Returns the number of rows actually
+     * deleted, so callers can tell "the rewind happened" from "silently did
+     * nothing" — the previous `Unit` return made a failed cut indistinguishable
+     * from a successful one.
+     */
+    suspend fun deleteMessagesAfter(sessionId: String, keepCount: Int): Int =
         dao.deleteMessagesAfter(sessionId, keepCount)
 
     /**
@@ -380,21 +505,35 @@ class ChatRepository(internal val dao: ChatDao) {
      * boundary cut to trim the kept assistant row to the parts before the
      * target tool_use. Mirrors iOS ChatStore.updateMessageParts.
      */
-    suspend fun updateMessageParts(id: String, partsJson: String) =
+    /** Returns 1 when the row was rewritten, 0 when no such row exists. */
+    suspend fun updateMessageParts(id: String, partsJson: String): Int =
         dao.updateMessageParts(id, partsJson)
 
-    /** Replace one persisted human-user row in place; returns false on role/id mismatch. */
-    suspend fun replaceUserMessageInPlace(messageId: String, partsJson: String): Boolean {
+    /**
+     * Replace one persisted human-user row in place.
+     *
+     * Returns the parts_json that was ACTUALLY stored — or null when no row
+     * matched the id (the failure the old `Boolean` carried).
+     *
+     * [T-android-persistence-result-check] Returning the persisted payload
+     * matters because this function caps oversized input
+     * ([MAX_MESSAGE_PARTS_JSON_LENGTH]): a caller that rendered its own uncapped
+     * copy showed the user the full text while the database held the truncated
+     * version, so an edited message visibly shrank on the next reload. A caller
+     * that builds its UI from this return value cannot drift.
+     */
+    suspend fun replaceUserMessageInPlace(messageId: String, partsJson: String): String? {
         val capped = if (partsJson.length > MAX_MESSAGE_PARTS_JSON_LENGTH) {
             buildTruncatedPartsJson(partsJson)
         } else {
             partsJson
         }
-        return dao.replaceUserMessagePartsInPlace(
+        val rows = dao.replaceUserMessagePartsInPlace(
             id = messageId,
             partsJson = capped,
             updatedAt = System.currentTimeMillis(),
-        ) == 1
+        )
+        return capped.takeIf { rows == 1 }
     }
 
     /** [T-error-persist-android] Set/clear the error sticker on a row by id. */
@@ -420,6 +559,18 @@ class ChatRepository(internal val dao: ChatDao) {
      * that served it. Reading it here would reproduce the exact bug this
      * snapshot exists to fix, only scoped to one row instead of the whole
      * session.
+     *
+     * [T-android-thinking-level-persist] `thinkingLevel` follows the identical
+     * rule and for the identical reason: it is the level the reply was
+     * produced at, so the CALLER supplies it from the turn it is persisting —
+     * never `_thinkingLevel.value` read at persist time, which is one mutable
+     * setting shared by the whole session and would re-label every restored row
+     * with whatever the user has selected now. Null means "not recorded" (rows
+     * written before this argument existed); it is stored as NULL and the UI
+     * then shows no level capsule rather than substituting a current value.
+     *
+     * Appended at the END of the parameter list so existing positional callers
+     * (`appendMessage(id, "assistant", parts, tokenJson)`) keep compiling.
      */
     suspend fun appendMessage(
         sessionId: String,
@@ -429,6 +580,7 @@ class ChatRepository(internal val dao: ChatDao) {
         reasoningContent: String? = null,
         modelSnapshot: ModelAttributionSnapshot? = null,
         provenance: MessageProvenance = MessageProvenance.UNKNOWN,
+        thinkingLevel: ThinkingLevel? = null,
     ): MessageEntity {
         val sortOrder = dao.nextSortOrder(sessionId)
         val now = System.currentTimeMillis()
@@ -462,6 +614,9 @@ class ChatRepository(internal val dao: ChatDao) {
             modelDisplayName = modelSnapshot?.displayName,
             providerType = modelSnapshot?.providerTypeRaw,
             providerInstanceId = modelSnapshot?.providerInstanceId,
+            // .name is the enum's stable wire token ("HIGH"), the same encoding
+            // ThinkingLevel.decoded reads back and kotlinx already writes.
+            thinkingLevel = thinkingLevel?.name,
         )
         dao.insertMessage(message)
         // [T-android-preview-flicker-toolresult] Only overwrite the preview
@@ -726,7 +881,12 @@ class ChatRepository(internal val dao: ChatDao) {
      * those collapse markdown for a 100-char single-line preview, while
      * this preserves the full text the offload caller wants to inspect.
      */
-    private fun extractTextForOffload(partsJson: String): String {
+    /**
+     * [T-android-topology-first-message] Relaxed from `private` so
+     * [firstMessagesForSessions] — and anything else that needs "what does this
+     * message say" — can reuse THIS definition instead of writing a second one.
+     */
+    internal fun extractTextForOffload(partsJson: String): String {
         return try {
             val arr = org.json.JSONArray(partsJson)
             val texts = mutableListOf<String>()

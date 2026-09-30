@@ -130,4 +130,69 @@ class InterruptedTailDetectorTest {
         assertTrue(InterruptedTailDetector.isInterrupted(assistant(toolUse())))
         assertFalse(InterruptedTailDetector.isInterrupted(assistant(text("done"))))
     }
+
+    // ─── [T-android-interrupted-tail-drift] app-authored reminders ───────────────
+    //
+    // The app writes rows on the API's `user` role that no human typed: `resume()`'s
+    // re-entry reminder, and the delegated-child abnormal-end note. Without the
+    // `isAppReminder` check such a tail fell through to UNANSWERED_USER_TURN, so
+    // merely reloading the session offered a paused/Resume affordance over the app's
+    // own note. The live rule in `ChatViewModel.loadSession` already excluded them;
+    // this object did not, which is how the two copies had drifted.
+
+    @Test
+    fun `an app reminder is not offered as an unanswered human turn`() {
+        val m = user(
+            text("<system-reminder>The delegated child agent finished WITHOUT calling the `subagent_complete` completion tool.</system-reminder>"),
+        )
+        assertEquals(
+            "an app-authored reminder must not light the paused/Resume affordance",
+            InterruptedTailShape.NONE,
+            InterruptedTailDetector.classify(m),
+        )
+    }
+
+    @Test
+    fun `a leading whitespace variant of an app reminder is still excluded`() {
+        // The check trims leading whitespace, matching how `loadSession` and
+        // `MessagePartsCodec.hasHumanTurnContent` read the same prefix; a stray
+        // newline before the tag must not change the verdict.
+        val m = user(text("\n  <system-reminder>note from the app</system-reminder>"))
+        assertEquals(InterruptedTailShape.NONE, InterruptedTailDetector.classify(m))
+    }
+
+    @Test
+    fun `an app reminder that also carries the continue marker still reports C`() {
+        // ORDER IS LOAD-BEARING. `resume()`'s own reminder is app-authored AND carries
+        // the continue marker:
+        //   "<system-reminder>The user stopped the previous response but now wants to
+        //    continue. Pick up exactly where you left off.</system-reminder>"
+        // Both predicates match it. It MUST stay CONTINUE_REMINDER — that turn really
+        // was cut off, so the session must keep reporting an interruption. Reordering
+        // the `when` branches (checking isAppReminder first) would silently drop that
+        // recovery path, and this test is what fails when someone does.
+        val m = user(
+            text(
+                "<system-reminder>${InterruptedTailDetector.CONTINUE_REMINDER_MARKER} " +
+                    "but now wants to continue. Pick up exactly where you left off.</system-reminder>",
+            ),
+        )
+        assertEquals(
+            "resume()'s reminder must keep reporting an interruption",
+            InterruptedTailShape.CONTINUE_REMINDER,
+            InterruptedTailDetector.classify(m),
+        )
+    }
+
+    @Test
+    fun `a tool result tail is unaffected by the new exclusion`() {
+        // The exclusion must only affect the plain-text fallback, never the cases that
+        // describe a turn already mid-flight. A ToolResult part is not a Text part, so
+        // it can never satisfy `isAppReminder` — pin that so the new check cannot be
+        // widened into the A path by mistake.
+        assertEquals(
+            InterruptedTailShape.TOOL_RESULT_TAIL,
+            InterruptedTailDetector.classify(user(toolResult())),
+        )
+    }
 }

@@ -341,47 +341,6 @@ class BackupExporter(
         BackupModelSnapshotCodec.sessionTitleFields(s).forEach { (key, value) -> put(key, value) }
     }
 
-    /**
-     * The message row as iOS writes it.
-     *
-     * `parts` is spliced in as pre-parsed JSON rather than re-encoded: the
-     * column already holds the exact `[ContentPart]` array iOS's ContentPart
-     * encoder produces (`{"type":…,"value":…}`), so passing it through keeps
-     * MediaRef paths and tool payloads byte-identical. Re-encoding through a
-     * Kotlin model would risk reordering or dropping a field the Android model
-     * doesn't know about.
-     *
-     * `errorInfo` is NOT written. §0.2 lists it with `part_flags` as a
-     * device-local field the portable record excludes: an error sticker for a
-     * failed turn on the old device is meaningless on the new one, and
-     * restoring it would resurrect a red error badge against a message that
-     * never failed for this install.
-     */
-    private fun messageRecord(m: MessageEntity): JsonElement = buildJsonObject {
-        put("id", JsonPrimitive(m.id))
-        put("sessionId", JsonPrimitive(m.sessionId))
-        put("role", JsonPrimitive(m.role))
-        put("parts", parseParts(m.partsJson))
-        put("createdAt", JsonPrimitive(iso8601(m.createdAt)))
-        put("tokenUsage", m.tokenUsage?.let { parseJsonOrNull(it) } ?: JsonNull)
-        put("reasoningContent", m.reasoningContent?.let(::JsonPrimitive) ?: JsonNull)
-        put("streamInterruptCount", JsonPrimitive(m.streamInterruptCount))
-        put("sortOrder", JsonPrimitive(m.sortOrder))
-        // [T-token-attribution-snapshot] Per-message model attribution. Emitted
-        // only when present, so a package from a device with no snapshots keeps
-        // its previous shape and older importers see nothing new.
-        //
-        // camelCase, NOT snake_case: iOS serializes `RawMessage` straight
-        // through Codable with no CodingKeys, so its wire keys are the Swift
-        // property names — the rest of this record already matches that
-        // (`tokenUsage`, `streamInterruptCount`, `sortOrder`). A snake_case key
-        // here would simply not decode on iOS, which is the same silent
-        // cross-platform drop we hit with the env-var `createdAt` format.
-        m.modelId?.let { put("modelId", JsonPrimitive(it)) }
-        m.modelDisplayName?.let { put("modelDisplayName", JsonPrimitive(it)) }
-        m.providerType?.let { put("providerType", JsonPrimitive(it)) }
-        m.providerInstanceId?.let { put("providerInstanceId", JsonPrimitive(it)) }
-    }
 
     private fun markerRecord(c: CompactMarkerEntity): JsonElement = buildJsonObject {
         put("id", JsonPrimitive(c.id))
@@ -753,11 +712,6 @@ class BackupExporter(
 
     // MARK: - Helpers
 
-    private fun parseParts(partsJson: String): JsonElement =
-        parseJsonOrNull(partsJson) ?: BackupFormat.json.parseToJsonElement("[]")
-
-    private fun parseJsonOrNull(raw: String): JsonElement? =
-        runCatching { BackupFormat.json.parseToJsonElement(raw) }.getOrNull()
 
     private fun appVersion(): String = runCatching {
         context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "?"
@@ -808,6 +762,70 @@ class BackupExporter(
         fun mcpServerCount(source: File): Int = runCatching {
             org.json.JSONObject(source.readText()).optJSONObject("mcpServers")?.length() ?: 1
         }.getOrDefault(1)
+
+        private fun parseParts(partsJson: String): JsonElement =
+            parseJsonOrNull(partsJson) ?: BackupFormat.json.parseToJsonElement("[]")
+
+        private fun parseJsonOrNull(raw: String): JsonElement? =
+            runCatching { BackupFormat.json.parseToJsonElement(raw) }.getOrNull()
+
+        /**
+         * The message row as iOS writes it.
+         *
+         * `parts` is spliced in as pre-parsed JSON rather than re-encoded: the
+         * column already holds the exact `[ContentPart]` array iOS's ContentPart
+         * encoder produces (`{"type":…,"value":…}`), so passing it through keeps
+         * MediaRef paths and tool payloads byte-identical. Re-encoding through a
+         * Kotlin model would risk reordering or dropping a field the Android model
+         * doesn't know about.
+         *
+         * `errorInfo` is NOT written. §0.2 lists it with `part_flags` as a
+         * device-local field the portable record excludes: an error sticker for a
+         * failed turn on the old device is meaningless on the new one, and
+         * restoring it would resurrect a red error badge against a message that
+         * never failed for this install.
+         *
+         * `internal` rather than private so the export half of "a restored message
+         * keeps its thinking level" can be asserted against the REAL mapping from a
+         * JVM test instead of a copy of it written inside the test. The same reason
+         * [BackupModelSnapshotCodec] exists as its own file — one owner for the shape
+         * of what goes on the wire.
+         */
+        internal fun messageRecord(m: MessageEntity): JsonElement = buildJsonObject {
+            put("id", JsonPrimitive(m.id))
+            put("sessionId", JsonPrimitive(m.sessionId))
+            put("role", JsonPrimitive(m.role))
+            put("parts", parseParts(m.partsJson))
+            put("createdAt", JsonPrimitive(iso8601(m.createdAt)))
+            put("tokenUsage", m.tokenUsage?.let { parseJsonOrNull(it) } ?: JsonNull)
+            put("reasoningContent", m.reasoningContent?.let(::JsonPrimitive) ?: JsonNull)
+            put("streamInterruptCount", JsonPrimitive(m.streamInterruptCount))
+            put("sortOrder", JsonPrimitive(m.sortOrder))
+            // [T-token-attribution-snapshot] Per-message model attribution. Emitted
+            // only when present, so a package from a device with no snapshots keeps
+            // its previous shape and older importers see nothing new.
+            //
+            // camelCase, NOT snake_case: iOS serializes `RawMessage` straight
+            // through Codable with no CodingKeys, so its wire keys are the Swift
+            // property names — the rest of this record already matches that
+            // (`tokenUsage`, `streamInterruptCount`, `sortOrder`). A snake_case key
+            // here would simply not decode on iOS, which is the same silent
+            // cross-platform drop we hit with the env-var `createdAt` format.
+            m.modelId?.let { put("modelId", JsonPrimitive(it)) }
+            m.modelDisplayName?.let { put("modelDisplayName", JsonPrimitive(it)) }
+            m.providerType?.let { put("providerType", JsonPrimitive(it)) }
+            m.providerInstanceId?.let { put("providerInstanceId", JsonPrimitive(it)) }
+            // [T-android-thinking-level-persist] Same rule, same reason, and the
+            // last write path that had to be found: the level a reply was produced
+            // at is part of its attribution, so omitting it here meant a
+            // backup → restore silently dropped the level badge for every message
+            // (the model name survived, the level did not). Emitted only when
+            // present, so a package from a build without the column keeps its
+            // previous shape. Plain `ThinkingLevel.name` — the same token the
+            // `messages.thinking_level` column stores and `ThinkingLevel.decoded`
+            // reads, so the local column and the wire field never disagree.
+            m.thinkingLevel?.let { put("thinkingLevel", JsonPrimitive(it)) }
+        }
 
         /** ISO-8601 in UTC, matching Swift's `.iso8601` date encoding strategy. */
         fun iso8601(millis: Long): String = SimpleDateFormat(

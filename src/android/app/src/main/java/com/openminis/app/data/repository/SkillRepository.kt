@@ -198,22 +198,78 @@ class SkillRepository(private val context: Context) {
 
     // -- Session Overrides --
 
-    fun isEnabledForSession(skillId: String, sessionId: String): Boolean {
+    /** Parent links come from the runtime tree; see [SessionTreeParentChain]. */
+    private val sessionParentChain by lazy { SessionTreeParentChain(context) }
+
+    /**
+     * [T-skill-mcp-session-switch-inheritance] Resolved upward through the
+     * runtime parent chain, not just for this session:
+     *
+     *   override(this session) → override(parent) → … → override(root) → global
+     *
+     * A sub-agent session inherits the switches of the conversation it was
+     * derived from, so a skill turned off in the parent conversation is off for
+     * every descendant. Resolution runs on each call (no value is snapshotted at
+     * spawn time), so an ancestor's later change reaches a descendant's next
+     * read. A child's own row stays keyed to the child, so a lower layer's
+     * change can only reach itself and its own descendants. Shared with MCP
+     * through [resolveInheritedEnabled].
+     */
+    fun isEnabledForSession(skillId: String, sessionId: String): Boolean =
+        resolveInheritedEnabled(
+            sessionId = sessionId,
+            parentOf = sessionParentChain::parentOf,
+            overrideOf = { chainSessionId -> sessionOverride(skillId, chainSessionId) },
+            globalDefault = { _skills.value.find { it.id == skillId }?.isEnabled },
+        )
+
+    /**
+     * This session's own override for [skillId], or `null` when it has none —
+     * `null` is what lets the inheriting walk continue to the next ancestor
+     * instead of collapsing "not set" into "off".
+     */
+    private fun sessionOverride(skillId: String, sessionId: String): Boolean? {
         val cursor = db.rawQuery(
             "SELECT is_enabled FROM session_skill_overrides WHERE session_id=? AND skill_id=?",
             arrayOf(sessionId, skillId)
         )
-        val override = if (cursor.moveToFirst()) cursor.getInt(0) == 1 else null
-        cursor.close()
-        if (override != null) return override
-        return _skills.value.find { it.id == skillId }?.isEnabled ?: false
+        return try {
+            if (cursor.moveToFirst()) cursor.getInt(0) == 1 else null
+        } finally {
+            cursor.close()
+        }
     }
 
+    /**
+     * [T-skill-mcp-session-switch-inheritance] Sparse-clear, matching
+     * [MCPRepository.setSessionOverride] and sharing its decision function.
+     *
+     * Writing a row that merely repeats what the session already inherits pins
+     * the session at that value and stops its ancestors from reaching it — which
+     * would break the requirement that an ancestor's toggle propagates all the
+     * way down. So the row is written only when the session genuinely diverges
+     * (or when the skill is unknown to the app, where the value is the session's
+     * own business); otherwise any existing row is removed and the session keeps
+     * following the level that supplies the value.
+     */
     fun setSessionOverride(sessionId: String, skillId: String, enabled: Boolean) {
-        db.execSQL(
-            "INSERT OR REPLACE INTO session_skill_overrides (session_id, skill_id, is_enabled) VALUES (?, ?, ?)",
-            arrayOf<Any>(sessionId, skillId, if (enabled) 1 else 0)
+        val inherited = resolveInheritedValue(
+            sessionId = sessionId,
+            parentOf = sessionParentChain::parentOf,
+            overrideOf = { chainSessionId -> sessionOverride(skillId, chainSessionId) },
+            globalDefault = { _skills.value.find { it.id == skillId }?.isEnabled },
         )
+        if (shouldPinSessionOverride(enabled, inherited)) {
+            db.execSQL(
+                "INSERT OR REPLACE INTO session_skill_overrides (session_id, skill_id, is_enabled) VALUES (?, ?, ?)",
+                arrayOf<Any>(sessionId, skillId, if (enabled) 1 else 0)
+            )
+        } else {
+            db.execSQL(
+                "DELETE FROM session_skill_overrides WHERE session_id=? AND skill_id=?",
+                arrayOf(sessionId, skillId)
+            )
+        }
     }
 
     fun clearSessionOverrides(sessionId: String) {

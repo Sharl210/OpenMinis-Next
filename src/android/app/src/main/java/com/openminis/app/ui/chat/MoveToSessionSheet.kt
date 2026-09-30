@@ -31,12 +31,9 @@ import androidx.compose.material.icons.outlined.Palette
 import androidx.compose.material.icons.outlined.Payments
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.outlined.Translate
-import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Text
-import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -76,6 +73,16 @@ import java.util.concurrent.TimeUnit
  * 16dp rounded surface card so the picker reads as a discrete control
  * inside the sheet rather than naked list items.
  *
+ * [T-android-moveto-halfscreen] request.md:85 asks that this session list use
+ * the SAME half-screen window style as the token-usage panel. That style IS
+ * [StandardChatSheet]'s `heightFraction`, and [TokenUsageSheet] passes 0.5f to
+ * match iOS's `.medium` detent (AIChatView.swift:508) — so this picker now
+ * passes the same value. Before this it built its OWN `ModalBottomSheet`: full
+ * height, Material's default container colour and default drag handle, i.e. it
+ * was the only sheet reachable from the chat composer that did not go through
+ * [StandardChatSheet] (the other six all do). Aligning it also inherits the
+ * shell's compact drag handle and its <1.0-fraction nested-scroll guard.
+ *
  * [T-android-moveto-new-chat] A "New Chat" row sits above the list, as on
  * iOS (AIChatView.swift:5500). Without it the picker could only ever hand
  * content to a session that already existed, so content arriving by share
@@ -86,7 +93,6 @@ import java.util.concurrent.TimeUnit
  * already understands (AppNavigation's own New Chat action builds one the
  * same way), so nothing downstream needs to special-case it.
  */
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MoveToSessionSheet(
     currentSessionId: String,
@@ -94,7 +100,6 @@ fun MoveToSessionSheet(
     onDismiss: () -> Unit,
     onSelect: (String) -> Unit,
 ) {
-    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     var sessions by remember { mutableStateOf<List<ChatSessionEntity>>(emptyList()) }
 
     LaunchedEffect(Unit) {
@@ -103,13 +108,12 @@ fun MoveToSessionSheet(
         }
     }
 
-    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = sheetState) {
+    StandardChatSheet(
+        title = stringResource(R.string.move_to_sheet_title),
+        onDismiss = onDismiss,
+        heightFraction = MOVE_TO_SHEET_HEIGHT_FRACTION,
+    ) {
         Column(modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp)) {
-            Text(
-                stringResource(R.string.move_to_sheet_title),
-                style = MaterialTheme.typography.titleMedium,
-                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
-            )
             // [T-android-moveto-new-chat] Deliberately OUTSIDE the
             // `sessions.isEmpty()` branch below: "no other sessions" is
             // precisely when the user most needs a new one, and the old
@@ -158,6 +162,13 @@ fun MoveToSessionSheet(
         }
     }
 }
+
+/**
+ * [T-android-moveto-halfscreen] Half of the screen, matching
+ * [TokenUsageSheet]'s value (iOS `.medium`). Named rather than inlined so the
+ * link to the requirement is greppable from the call site and from here.
+ */
+private const val MOVE_TO_SHEET_HEIGHT_FRACTION = 0.5f
 
 /**
  * [T-android-moveto-new-chat] The "New Chat" entry, above the session list.

@@ -86,6 +86,29 @@ class RuntimeCommunicationPersistenceTest {
     }
 
     @Test
+    fun deleteForSessionRemovesSenderAndReceiverRecordsAndPreservesOthers() {
+        val root = Files.createTempDirectory("runtime-communication-delete").toFile()
+        val repository = RuntimeCommunicationRepository(RuntimeCommunicationFileStore(root.resolve("records.json")))
+        val senderMatch = record("sender-match", "sender")
+        val receiverMatch = record("receiver-match", "receiver").copy(
+            sender = peer("other-sender"),
+            receiver = peer("target-session"),
+        )
+        val preserved = record("preserved", "keep")
+        repository.append(senderMatch)
+        repository.append(receiverMatch)
+        repository.append(preserved)
+
+        assertEquals(1, repository.deleteForSession("sender-sender-match"))
+        assertEquals(1, repository.deleteForSession("target-session"))
+        val page = repository.query(RuntimeCommunicationQuery(limit = 10)) as RuntimeCommunicationQueryResult.Accepted
+        assertEquals(listOf(preserved), page.page.records)
+        val restarted = RuntimeCommunicationRepository(RuntimeCommunicationFileStore(root.resolve("records.json")))
+        val restored = restarted.query(RuntimeCommunicationQuery(limit = 10)) as RuntimeCommunicationQueryResult.Accepted
+        assertEquals(listOf(preserved), restored.page.records)
+        assertEquals(0, restarted.deleteForSession(""))
+    }
+    @Test
     fun corruptJsonAndStaleTempFileDoNotBecomeRecords() {
         val root = Files.createTempDirectory("runtime-communication-recovery").toFile()
         val file = root.resolve("records.json")

@@ -126,6 +126,12 @@ internal fun ChatViewModel.filteredSlashCommands(): List<SlashCommand> {
             "clear" -> cmd.copy(
                 subtitle = context.getString(R.string.slash_clear_subtitle),
             )
+            "fork" -> cmd.copy(
+                subtitle = context.getString(R.string.slash_fork_subtitle),
+            )
+            "goal" -> cmd.copy(
+                subtitle = context.getString(R.string.slash_goal_subtitle),
+            )
             else -> cmd
         }
     }
@@ -142,6 +148,9 @@ internal fun ChatViewModel.filteredSlashCommands(): List<SlashCommand> {
                 title = skill.name,
                 subtitle = sub,
                 isSkill = true,
+                // A skill row is a typing aid: the model reads SKILL.md when the
+                // message is sent, so the tap only primes "/<name> ".
+                fillText = "/${skill.name} ",
             )
         } ?: emptyList()
     // [T-mcp-integration-android] MCP servers appear in the / picker too,

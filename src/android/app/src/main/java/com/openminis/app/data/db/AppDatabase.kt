@@ -15,7 +15,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         WebAppShortcutEntity::class,
         FolderEntity::class,
     ],
-    version = 13,
+    version = 14,
     // [T-android-downgrade-compat] Kept ON so MigrationTestHelper and CI can
     // validate every migration (and its downgrade counterpart) against the
     // committed schema json. Without it the upgrade/downgrade chain has no
@@ -319,11 +319,56 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * [T-android-thinking-level-persist] Add the per-message thinking level.
+         *
+         * Same additive shape as [MIGRATION_11_12], and nullable for the same
+         * reason: `ALTER TABLE … ADD COLUMN` is an O(1) metadata change, every
+         * existing row reads NULL, and NULL is the signal the message header
+         * uses to decide "this reply's level was never recorded, so show no
+         * capsule" — as opposed to a recorded `OFF`, which must render as Off.
+         * A `NOT NULL DEFAULT ''` would blur those two and hand the reader a
+         * bogus string to decode.
+         *
+         * No downgrade counterpart on purpose: an older build that meets a v14
+         * file is stopped by [com.openminis.app.data.db.DatabaseVersionGuard]
+         * (its guidance screen keeps the file untouched) before Room is ever
+         * constructed, so a 14 → 13 no-op would be unreachable code — unlike
+         * [MIGRATION_12_11], which predates that guard.
+         */
+        val MIGRATION_13_14 = object : Migration(13, 14) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE messages ADD COLUMN thinking_level TEXT")
+            }
+        }
+
         val MIGRATION_12_11 = object : Migration(12, 11) {
             override fun migrate(db: SupportSQLiteDatabase) {
                 // Keep additive columns on downgrade.
             }
         }
+
+        /**
+         * Every migration this build can execute, in one place.
+         *
+         * [getInstance] hands exactly this array to `addMigrations`, so the list a
+         * unit test can read IS the list the real builder installs. That matters
+         * because "the migration constant exists" and "Room can use it" are
+         * different facts, and only the second one keeps a real upgrade from
+         * throwing `IllegalStateException: A migration from 13 to 14 was required
+         * but not found` on the user's first launch after the update. Reading the
+         * migration object cannot tell you whether it was registered; reading one
+         * shared list can, and applies the fix in one place instead of two.
+         *
+         * Explicit `Array<Migration>` element type: the individual migrations are
+         * anonymous objects, so an inferred array would be an array of their
+         * common anonymous supertype rather than of [Migration].
+         */
+        internal val ALL_MIGRATIONS: Array<Migration> = arrayOf(
+            MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6,
+            MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10, MIGRATION_10_11,
+            MIGRATION_11_12, MIGRATION_12_13, MIGRATION_12_11, MIGRATION_13_14,
+        )
 
         fun getInstance(context: Context): AppDatabase {
             return INSTANCE ?: synchronized(this) {
@@ -335,11 +380,7 @@ abstract class AppDatabase : RoomDatabase() {
                     // MIGRATION_12_11 is the downgrade counterpart of
                     // MIGRATION_11_12 — registering it is what lets an older
                     // build open a newer database instead of failing to start.
-                    .addMigrations(
-                        MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6,
-                        MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10, MIGRATION_10_11,
-                        MIGRATION_11_12, MIGRATION_12_13, MIGRATION_12_11,
-                    )
+                    .addMigrations(*ALL_MIGRATIONS)
                     .build()
                     .also { INSTANCE = it }
             }

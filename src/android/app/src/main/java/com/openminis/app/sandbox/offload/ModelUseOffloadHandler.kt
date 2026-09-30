@@ -1415,6 +1415,11 @@ class ModelUseOffloadHandler(
         com.openminis.app.offload.ModelUseManager.entryDict(
             entry,
             providerRepository.instance(entry.providerInstanceId),
+            // [T-android-subagent-model-guidance] The user's own "when to use this
+            // model as a sub-agent" note. `subAgentModelNote` existed and had zero
+            // callers; the note reached no output surface at all, so the main agent
+            // could not see guidance written specifically for it.
+            subagentNote = providerRepository.subAgentModelNote(entry.id),
         )
 
     /**

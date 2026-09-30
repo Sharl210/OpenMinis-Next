@@ -224,7 +224,7 @@ object MarkdownClipboard {
     /** Inline markdown → HTML, escaping non-markdown characters. */
     private fun inlineToHtml(s: String): String {
         // Pull code spans out first so their contents aren't re-escaped/processed.
-        val codePlaceholder = " CODE "
+        val codePlaceholder = "\u0000CODE\u0000"
         val codes = mutableListOf<String>()
         var work = Regex("`([^`]+)`").replace(s) { m ->
             codes.add(m.groupValues[1])

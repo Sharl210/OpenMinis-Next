@@ -306,7 +306,16 @@ internal sealed class FlatChatItem {
         override fun hashCode(): Int = message.hashCode() * 31 + precededByUser.hashCode()
     }
 
-    data class AssistantHeader(val messageId: String) : FlatChatItem() {
+    /**
+     * @param snapshot model attribution for this turn, or null for legacy rows.
+     *   Carried on the flat item rather than looked up by [messageId] in the
+     *   renderer so the header cannot show a stale attribution if the id lookup
+     *   ever misses — the item and the value that renders it travel together.
+     */
+    data class AssistantHeader(
+        val messageId: String,
+        val snapshot: AssistantHeaderSnapshot? = null,
+    ) : FlatChatItem() {
         override val key = "header:$messageId"
         override val contentType = "header"
     }
@@ -481,6 +490,40 @@ internal sealed class FlatChatItem {
             return h
         }
     }
+
+    /**
+     * [T-android-r37-system-row] An app-layer SYSTEM row: a row the app
+     * synthesised on the API's `user` role (an injected `<system-reminder>` —
+     * see [ChatMessage.isAppSystemRow]) that must read as neither the human's
+     * words nor the assistant's reply.
+     *
+     * A subtype of its own rather than a reuse of [AssistantInfo], because that
+     * type means "an info block inside the assistant's OWN turn": it is keyed by
+     * an assistant message, it runs through the assistant render path, and the
+     * assistant cluster's rules (header suppression lookbacks, attribution,
+     * "system rows never grayed") all reason about it being part of that turn.
+     * A system row is a class of its own in R37's three-message model, so it gets
+     * its own type instead — the assistant semantics stay unpolluted.
+     *
+     * Only the payload travels on the item: the label and the sheet title are
+     * user-facing text and are resolved in the composable, where
+     * `stringResource` is available — this builder is a pure function.
+     */
+    data class SystemRow(
+        val messageId: String,
+        /** Verbatim injected text; blank means there is nothing to expand. */
+        val injectedText: String,
+    ) : FlatChatItem() {
+        override val key = "sysrow:$messageId"
+        override val contentType = "sysrow"
+
+        /**
+         * Whether the row offers a tap-through to the injected content. Pure, so
+         * the predicate that decides "can the user open this?" is unit-testable
+         * without a Compose runtime.
+         */
+        val canExpand: Boolean get() = injectedText.isNotBlank()
+    }
 }
 
 /**
@@ -506,6 +549,26 @@ internal fun mergeStreamingOverlay(
         )
     }
 }
+
+internal fun FlatChatItem.messageIdOrNull(): String = when (this) {
+    is FlatChatItem.UserBubble -> message.id
+    is FlatChatItem.AssistantHeader -> messageId
+    is FlatChatItem.AssistantText -> messageId
+    is FlatChatItem.AssistantMarkdownBlock -> messageId
+    is FlatChatItem.AssistantThinking -> messageId
+    is FlatChatItem.AssistantToolUse -> messageId
+    is FlatChatItem.AssistantInfo -> messageId
+    is FlatChatItem.AssistantTyping -> messageId
+    is FlatChatItem.AssistantError -> messageId
+    is FlatChatItem.AssistantLegacyContent -> messageId
+    is FlatChatItem.SystemRow -> messageId
+}
+
+internal fun conversationRowIndexForMessage(
+    displayedItems: List<FlatChatItem>,
+    messageId: String,
+): Int = displayedItems.indexOfFirst { it.messageIdOrNull() == messageId }
+
 
 internal fun buildFlatChatItems(
     messages: List<ChatMessage>,
@@ -562,6 +625,7 @@ internal fun buildFlatChatItems(
                 isStreaming = item.isStreaming,
                 messageMarkdown = item.messageMarkdown,
             )
+            is FlatChatItem.SystemRow -> item.copy(messageId = "${item.messageId}#$n")
         }
     }
     for (idx in fromIndex until messages.size) {
@@ -578,11 +642,27 @@ internal fun buildFlatChatItems(
             )
         }
         if (message.role == "user") {
+            // [T-android-r37-system-row] A row the app synthesised on the USER
+            // role — an injected `<system-reminder>` — belongs to the app
+            // layer's SYSTEM class. It must never be drawn as the human's bubble
+            // (and its injected text is reachable only through the neutral row's
+            // tap-through). Data and wire are untouched: the row is still a
+            // `user` role message and is still sent to the provider verbatim.
+            if (message.isAppSystemRow()) {
+                out.add(dedupe(FlatChatItem.SystemRow(
+                    messageId = message.id,
+                    injectedText = message.injectedSystemText.orEmpty(),
+                )))
+                continue
+            }
             // [T-android-candidate-bubble-gap] Flag when the previous message
             // is also a user message so the bubble can add a separating top
             // gap — back-to-back candidate / queued sends otherwise have no
-            // AssistantHeader between them and visually merge.
-            val prevIsUser = idx > 0 && messages[idx - 1].role == "user"
+            // AssistantHeader between them and visually merge. The lookback asks
+            // "was the previous row a BUBBLE?", not "was its role user": a
+            // neutral system row in between already separates them, so the extra
+            // gap would be a stray double margin.
+            val prevIsUser = idx > 0 && messages[idx - 1].rendersAsUserBubble()
             out.add(dedupe(FlatChatItem.UserBubble(message, precededByUser = prevIsUser)))
             continue
         }
@@ -610,7 +690,7 @@ internal fun buildFlatChatItems(
             .firstOrNull { it.role != "system" }
         val isResumeContinuation = prevNonSystem?.role == "assistant"
         if (!isSystem && !isResumeContinuation) {
-            out.add(dedupe(FlatChatItem.AssistantHeader(message.id)))
+            out.add(dedupe(FlatChatItem.AssistantHeader(message.id, message.assistantHeaderSnapshot)))
         }
 
         val blocks = message.toolBlocks

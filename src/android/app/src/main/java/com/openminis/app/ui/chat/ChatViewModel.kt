@@ -15,8 +15,10 @@ import com.openminis.app.browser.BrowserActionInput
 import com.openminis.app.browser.BrowserTabPool
 import com.openminis.app.data.db.MessageEntity
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.CallSplit
 import androidx.compose.material.icons.filled.Compress
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Flag
 import androidx.compose.material.icons.filled.Lightbulb
 import androidx.compose.material.icons.filled.Psychology
 import androidx.compose.material.icons.outlined.Build
@@ -34,7 +36,9 @@ import com.openminis.app.data.model.ModelRoleRequestSnapshot
 import com.openminis.app.data.model.AgentToolDefinition
 import com.openminis.app.data.model.LLMError
 import com.openminis.app.data.model.LLMMessage
+import com.openminis.app.data.model.LLMResponse
 import com.openminis.app.data.model.LLMModel
+import com.openminis.app.data.model.systemPromptWithModelFragments
 import com.openminis.app.data.model.LLMStreamChunk
 import com.openminis.app.data.model.LLMUsage
 import com.openminis.app.data.model.MessagePartsCodec
@@ -59,6 +63,8 @@ import com.openminis.app.agent.shell.OnDemandBash
 import com.openminis.app.sandbox.ExecutionCoordinator
 import com.openminis.app.terminal.MinisOpenUrlBroker
 import com.openminis.app.terminal.MinisUrlMarker
+import com.openminis.app.tools.AgentToolExecutor
+import com.openminis.app.tools.ChatRepositoryConversationSource
 import com.openminis.app.tools.AgentTools
 import com.openminis.app.tools.BrowserDevToolsTools
 import com.openminis.app.tools.FileEditTool
@@ -66,27 +72,56 @@ import com.openminis.app.tools.FileReadTool
 import com.openminis.app.tools.FileWriteTool
 import com.openminis.app.tools.MemoryTools
 import com.openminis.app.tools.ReadImageTool
+import com.openminis.app.tools.RestartedChildRun
 import com.openminis.app.tools.ToolExecutionResult
-import com.openminis.app.web.DuckDuckGoHtmlAdapter
-import com.openminis.app.web.PublicSearchService
-import com.openminis.app.web.PublicWebFetcher
-import com.openminis.app.web.SearchOptions
 import com.openminis.app.web.SearchResult
-import com.openminis.app.web.WebFetchOptions
-import com.openminis.app.web.WebFetchResult
 import com.openminis.app.offload.OffloadPermissionManager
+import com.openminis.app.feature.runtime.RuntimeFailure
 import com.openminis.app.feature.runtime.AgentRetryPolicy
 import com.openminis.app.feature.runtime.AgentRuntimeConfig
-import com.openminis.app.feature.runtime.RuntimeFailure
+import com.openminis.app.feature.runtime.RuntimeCommunicationDetailRequest
+import com.openminis.app.feature.runtime.RuntimeCommunicationDetailResult
+import com.openminis.app.feature.runtime.RuntimeCommunicationDirection
+import com.openminis.app.feature.runtime.RuntimeCommunicationFileStore
+import com.openminis.app.feature.runtime.RuntimeCommunicationQuery
+import com.openminis.app.feature.runtime.RuntimeCommunicationQueryResult
+import com.openminis.app.feature.runtime.RuntimeCommunicationRepository
+import com.openminis.app.feature.runtime.RuntimeCommunicationState
+import com.openminis.app.feature.runtime.RuntimeCommunicationMetadata
+import com.openminis.app.feature.runtime.RuntimeCommunicationGateway
+import com.openminis.app.feature.runtime.RuntimeContextAttachments
+import com.openminis.app.feature.runtime.RuntimeConversationAddress
+import com.openminis.app.feature.runtime.RuntimeDelivery
+import com.openminis.app.feature.runtime.DelegationMode
+import com.openminis.app.feature.runtime.RuntimeCommunicationCursor
 import com.openminis.app.feature.runtime.DeleteSubtreeResult
 import com.openminis.app.feature.runtime.RuntimeChildRunner
+import com.openminis.app.feature.runtime.RuntimeChildExecutionResult
+import com.openminis.app.feature.runtime.RuntimeDelegationRequest
 import com.openminis.app.feature.runtime.RuntimeSessionCoordinator
 import com.openminis.app.feature.runtime.RuntimeDelegationParser
 import com.openminis.app.feature.runtime.RuntimeModelSnapshot
 import com.openminis.app.feature.runtime.RoundInjectionCoordinator
+import com.openminis.app.feature.runtime.ForkGoalCommand
+import com.openminis.app.feature.runtime.ForkGoalCommandParser
+import com.openminis.app.feature.runtime.ForkNameAllocator
+import com.openminis.app.feature.runtime.ForkGoalNode
+import com.openminis.app.feature.runtime.ForkGoalRuntime
+import com.openminis.app.feature.runtime.SlashCommandWords
+import com.openminis.app.feature.runtime.GoalRequest
+import com.openminis.app.feature.runtime.GoalAutoContinuationPolicy
+import com.openminis.app.feature.runtime.GoalAutoContinuationReason
+import com.openminis.app.feature.runtime.ChildCompletionProtocol
+import com.openminis.app.feature.runtime.ConversationIdProtocol
 import com.openminis.app.service.SessionActivityTracker
 import com.openminis.app.service.SessionConcurrencyManager
+import com.openminis.app.feature.runtime.AgentRetryRunner
+import com.openminis.app.feature.runtime.RuntimeInboxSurfacing
 import com.openminis.app.ui.settings.AgentBehaviorSettingsPrefs
+import com.openminis.app.ui.settings.agentRetryPolicyFromSettings
+import com.openminis.app.ui.settings.agentRetryRunnerFromSettings
+import com.openminis.app.ui.settings.effectiveMaxRetryAttempts
+import com.openminis.app.ui.settings.retryBudgetTotalAttempts
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -106,6 +141,7 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.yield
 import org.json.JSONArray
 import org.json.JSONObject
@@ -126,9 +162,352 @@ class ChatViewModel(
     private val runtimeCoordinator: RuntimeSessionCoordinator by lazy {
         RuntimeSessionCoordinator.open(context.applicationContext)
     }
+    /**
+     * [T-android-agent-messaging] Declared BEFORE [portableToolExecutor] because
+     * that executor is handed this instance: the gateway rewrites the whole
+     * communication directory file, and each repository keeps its own in-memory
+     * copy, so a second repository over the same path would silently drop the
+     * records this one wrote (and vice versa). One file, one instance.
+     */
+    private val communicationRepository: RuntimeCommunicationRepository by lazy {
+        RuntimeCommunicationRepository(
+            RuntimeCommunicationFileStore(java.io.File(context.filesDir, "runtime/communication-metadata.json")),
+        )
+    }
+    /**
+     * [T-android-child-agent-tools] Executor for the agent tools that need no
+     * chat-UI state. It is the same class a delegated child agent uses, so the
+     * two dispatchers cannot drift apart.
+     */
+    private val portableToolExecutor = AgentToolExecutor(
+        context = context,
+        // [T-android-child-restart] The executor owns *whether* a descendant may
+        // be restarted; only the app can own *re-running* it (a coroutine scope,
+        // the provider stack and the parent's transcript all live here). Without
+        // this the executor deliberately refuses `restart_descendant` instead of
+        // re-arming a node that nothing would drive.
+        launchRestartedChild = { parent, child, request ->
+            launchRestartedChild(parent, child, request)
+        },
+        // [T-android-conversation-id-query] The live chat store, so
+        // `conversation_query` reads what the user actually sees.
+        conversationSource = ChatRepositoryConversationSource(chatRepository),
+        // [T-android-agent-messaging] The SAME directory instance used by
+        // `recordDelivered` on the delegation path, so `message_child`'s records
+        // and the delegation records live in one file instead of overwriting
+        // each other.
+        communicationRepository = communicationRepository,
+    )
+    private val goalStore: com.openminis.app.feature.runtime.GoalRuntimeStore by lazy {
+        com.openminis.app.feature.runtime.GoalRuntimeStore.open(context.applicationContext, sessionId)
+    }
+
+    /**
+     * [T-android-goal-auto-continuation] Whether this chat session is the real
+     * root primary agent, asked of the runtime tree instead of assumed.
+     *
+     * This used to be `ForkGoalNode(sessionId, sessionId)`, which makes
+     * [ForkGoalNode.isRootPrimary] true for every session — including a
+     * sub-agent's own chat window. The requirement (`request.md:31`) says the
+     * opposite: `/goal` belongs to the root primary only, "otherwise it would
+     * recurse forever". The parent link comes from
+     * [com.openminis.app.data.repository.SessionTreeParentChain] — the same
+     * lookup the skill/MCP inheritance chain uses to walk from a sub-agent up to
+     * its ancestors, and the same runtime tree `SessionActivityTracker
+     * .beginDelegatedChild` writes a child node into (the child session id *is*
+     * the node id). No second notion of "is this a sub-agent" is introduced here.
+     *
+     * Failure degrades to "no parent known" (⇒ treated as root), matching the
+     * inheritance chain's own safe fallback.
+     */
+    private val goalNode: com.openminis.app.feature.runtime.ForkGoalNode by lazy {
+        val parentChain = runCatching {
+            com.openminis.app.data.repository.SessionTreeParentChain(context.applicationContext)
+        }.getOrNull()
+        com.openminis.app.feature.runtime.goalNodeForChatSession(sessionId) { id ->
+            runCatching { parentChain?.parentOf(id) }.getOrNull()
+        }
+    }
+
+    private val goalRuntimeLock = Any()
+    private var loadedGoalRuntime: ForkGoalRuntime? = null
+
+    private val goalRuntime: ForkGoalRuntime
+        get() = synchronized(goalRuntimeLock) {
+            loadedGoalRuntime ?: ForkGoalRuntime(goalNode, goalStore.load()).also { loadedGoalRuntime = it }
+        }
+
+    /**
+     * [T-android-goal-auto-continuation] Re-reads the goal snapshot from its file
+     * before deciding anything.
+     *
+     * The abnormal-stop transition (`status = NEEDS_CONTINUATION`) is written by
+     * `MinisApp`'s `SessionActivityTracker` completion listener through its own
+     * `ForkGoalRuntime` instance over the same `GoalRuntimeStore`. This
+     * ViewModel's in-memory snapshot therefore does not know about it, and
+     * deciding from stale memory is exactly how an auto-continuation silently
+     * never happens. Reading the medium back is also what makes the decision
+     * provable: the state the policy sees is the state that is actually persisted.
+     */
+    private fun reloadGoalRuntimeFromStore() {
+        synchronized(goalRuntimeLock) {
+            loadedGoalRuntime = ForkGoalRuntime(goalNode, goalStore.load())
+        }
+    }
+
+    private fun persistGoalSnapshot() {
+        if (!goalStore.save(goalRuntime.snapshot)) {
+            Log.w(TAG, "Failed to persist goal snapshot for session $sessionId")
+        }
+    }
+
+    /**
+     * Injects the pending goal continuation prompt into [agentHistory] and
+     * re-activates the goal. Returns whether a prompt was actually consumed.
+     *
+     * `@Synchronized` because there are now two consumers — a real user send and
+     * the unattended auto-continuation — and they can be reached from different
+     * threads (the run-end hook runs off the main thread). The one-shot guarantee
+     * itself stays where it was designed: [ForkGoalRuntime.pollContinuationPrompt]
+     * flips `continuationDelivered`, so the second caller gets `null` and the
+     * same prompt cannot be injected twice.
+     */
+    @Synchronized
+    private fun consumePendingGoalContinuation(): Boolean {
+        val prompt = goalRuntime.pollContinuationPrompt(System.currentTimeMillis()) ?: return false
+        agentHistory.add(
+            LLMMessage(
+                role = LLMMessage.Role.USER,
+                content = prompt,
+                contentParts = listOf(AgentContentPart.Text(prompt)),
+            ),
+        )
+        goalRuntime.resume(System.currentTimeMillis())
+        persistGoalSnapshot()
+        return true
+    }
+
+    private fun showPendingGoalContinuationNotice() {
+        val snapshot = goalRuntime.snapshot
+        if (snapshot.status != com.openminis.app.feature.runtime.GoalStatus.NEEDS_CONTINUATION ||
+            snapshot.continuationDelivered
+        ) return
+        appendSystemInfo(
+            text = goalContinuationNoticeText(snapshot),
+            iconKind = "goal",
+        )
+        if (GoalAutoContinuationPolicy.decide(goalNode, snapshot).isExhausted) {
+            goalAutoContinuationStopNotified = true
+        }
+    }
+
+    /**
+     * [T-android-goal-auto-continuation] The same notice, in the two states that
+     * matter to the reader: "we will continue automatically" while the budget is
+     * still there, and "we stopped, this is yours now" once it is spent. The
+     * stopped wording is not a footnote — it is the user-visible hand-over the
+     * bounded budget exists to produce.
+     */
+    private fun goalContinuationNoticeText(snapshot: com.openminis.app.feature.runtime.GoalRuntimeSnapshot): String {
+        val decision = GoalAutoContinuationPolicy.decide(goalNode, snapshot)
+        return if (decision.isExhausted) {
+            context.getString(
+                R.string.chat_goal_auto_continuation_stopped,
+                decision.used,
+                decision.budget,
+            )
+        } else {
+            context.getString(R.string.chat_goal_interrupted)
+        }
+    }
+
+    /**
+     * Set once the "auto-advance gave up" card has been shown, so re-checking on
+     * every later run end does not repeat it. Deliberately not persisted: the
+     * durable fact is [com.openminis.app.feature.runtime.GoalRuntimeSnapshot
+     * .autoContinuationCount], and a reload that shows the card once more is the
+     * correct outcome, not a duplicate (the user is looking at a goal that is
+     * waiting for them).
+     */
+    private var goalAutoContinuationStopNotified = false
+
+    /**
+     * [T-android-goal-auto-continuation] The trigger the mode was missing: after
+     * a run has ended with the goal still waiting for a continuation, continue it
+     * without a human typing anything.
+     *
+     * The entry point is intentionally a plain fire-and-forget call from the run
+     * tail (see [scheduleGoalAutoContinuation]); everything that decides *whether*
+     * to continue lives in the pure
+     * [GoalAutoContinuationPolicy], and everything about *how* to run another turn
+     * is reused from the interruption-resume path
+     * ([resumeRun]) — provider resolution, fallback list, system prompt, the
+     * streaming/slot lifecycle. No second, provider-free request path exists here.
+     *
+     * `@Synchronized` for the same reason as
+     * [consumePendingGoalContinuation]: the two consumers of one pending prompt
+     * must not interleave.
+     *
+     * [fromGoalRun] says whether the run that just ended was itself an
+     * auto-continuation. Only such a run may turn its own *normal* end into the
+     * stop that the next continuation hangs off; see the branch below.
+     */
+    @Synchronized
+    private fun maybeAutoContinueGoal(fromGoalRun: Boolean) {
+        // A run is already live (a user send slipped in first): that run consumes
+        // the pending prompt itself, and its own tail asks again.
+        if (_isStreaming.value) return
+        // The stop transition was written by another instance over the same file.
+        reloadGoalRuntimeFromStore()
+        var snapshot = goalRuntime.snapshot
+
+        // A goal-active run that ends *without* the exit tool is a stop too — the
+        // requirement's continuation condition is "the run stopped and
+        // `goal_complete` was never called", not "the run errored". The error path
+        // is already covered (`MinisApp` writes NEEDS_CONTINUATION on an error
+        // completion), but a continuation run that merely ends its turn would
+        // otherwise leave the goal ACTIVE with nobody left to advance it, and the
+        // mode would stall one step after its first automatic step.
+        //
+        // Narrowed to goal-driven runs on purpose: an ordinary run is the user's
+        // own turn to end, and synthesising a stop for it would let the goal
+        // hijack the very next turn. The transition used is the same
+        // [ForkGoalRuntime.onStopped] `MinisApp` uses, so there stays exactly one
+        // meaning of "the goal stopped".
+        if (fromGoalRun && snapshot.status == com.openminis.app.feature.runtime.GoalStatus.ACTIVE) {
+            val stop = goalRuntime.onStopped(
+                com.openminis.app.feature.runtime.GoalStopReason.ABNORMAL,
+                System.currentTimeMillis(),
+            )
+            if (stop.accepted) persistGoalSnapshot()
+            snapshot = goalRuntime.snapshot
+        }
+
+        val decision = GoalAutoContinuationPolicy.decide(goalNode, snapshot)
+        when (decision.reason) {
+            GoalAutoContinuationReason.CONTINUE -> Unit
+            GoalAutoContinuationReason.BUDGET_EXHAUSTED -> {
+                // "Not done until it is done" stops here, on purpose: the budget
+                // is spent, so the decision goes back to the human — visibly, in
+                // the transcript, and the pending prompt stays on disk so the next
+                // real send continues the goal by hand.
+                if (!goalAutoContinuationStopNotified) {
+                    goalAutoContinuationStopNotified = true
+                    AppLogger.info(
+                        TAG,
+                        "goal auto-continuation exhausted (${decision.used}/${decision.budget}) — waiting for the user",
+                    )
+                    appendSystemInfo(
+                        context.getString(
+                            R.string.chat_goal_auto_continuation_stopped,
+                            decision.used,
+                            decision.budget,
+                        ),
+                        "goal",
+                    )
+                }
+                return
+            }
+            else -> return
+        }
+
+        // Spend the budget before consuming the prompt: an attempt that dies
+        // between these two steps must not be repeatable without bound.
+        goalRuntime.noteAutoContinuation(System.currentTimeMillis())
+        persistGoalSnapshot()
+        if (!consumePendingGoalContinuation()) {
+            // Should be unreachable (the decision just saw an undelivered prompt),
+            // but a lost race must end as "no injection", never as a second one.
+            Log.w(TAG, "goal auto-continuation: pending prompt was gone before injection")
+            return
+        }
+        AppLogger.info(
+            TAG,
+            "goal auto-continuation ${decision.used + 1}/${decision.budget}: re-running with the saved prompt",
+        )
+        appendSystemInfo(
+            context.getString(
+                R.string.chat_goal_auto_continuing,
+                decision.used + 1,
+                decision.budget,
+            ),
+            "goal",
+        )
+        // `requireCanResume = false`: the goal's continuation must not depend on
+        // the "tap Continue" banner being up. `markStreamErrorOnFailure = true`:
+        // if this continuation fails too, the stop must be recorded again, or the
+        // goal would sit ACTIVE with nobody left to re-arm it.
+        resumeRun(
+            phase = GOAL_CONTINUATION_PHASE,
+            requireCanResume = false,
+            markStreamErrorOnFailure = true,
+        )
+    }
+
+    /**
+     * Called from a run's tail, off the main thread, once that run is fully over
+     * (`_isStreaming` cleared, the active-stop state already written to disk by
+     * the `SessionActivityTracker` completion listener).
+     *
+     * Hopping to the main thread matters for two things: the system card below is
+     * appended to `_messages`, and [resumeRun] starts its own run — running it on
+     * the main thread keeps those two from racing a user tap, because
+     * `viewModelScope`'s immediate dispatcher then assigns `streamJob` inside the
+     * same turn.
+     */
+    private fun scheduleGoalAutoContinuation(fromGoalRun: Boolean) {
+        viewModelScope.launch(Dispatchers.Main) {
+            runCatching { maybeAutoContinueGoal(fromGoalRun) }.onFailure { error ->
+                Log.w(TAG, "goal auto-continuation failed: ${error.message}")
+            }
+        }
+    }
 
     companion object {
         internal const val TAG = "ChatViewModel"
+
+        /**
+         * [T-android-goal-auto-continuation] Log phase for the unattended
+         * continuation run, so a goal-driven turn is distinguishable from a
+         * human-driven resume in the stream log.
+         */
+        internal const val GOAL_CONTINUATION_PHASE = "goalAutoContinue"
+
+        /**
+         * Which model entry a title request may be attributed to.
+         *
+         * The answer is always the model that ANSWERED: the resolved title
+         * sub-model when one was resolved, otherwise the session's own active
+         * entry — because that is what `currentProvider`, the fallback the
+         * request actually goes out on, was built from.
+         *
+         * Deliberately NOT `primaryModelEntryId`. This used to fall back to the
+         * Primary Agent Model setting, which the fallback path never consults
+         * when choosing a provider, so the session row named the primary model
+         * while the current model produced the title. A null answer is the
+         * honest one when nothing resolved: the caller then records the
+         * provider's own model instead of guessing an entry.
+         *
+         * Pure and Android-free so a JVM test can pin the policy without a
+         * ViewModel; see `TitleModelAttributionTest`.
+         */
+        internal fun titleAttributionEntryId(
+            resolvedSubEntryId: String?,
+            activeEntryId: String?,
+        ): String? = resolvedSubEntryId?.takeIf { it.isNotBlank() }
+            ?: activeEntryId?.takeIf { it.isNotBlank() }
+
+        /**
+         * Whether [entryModelId] may stand as the attribution of a request that
+         * [servedModelId] answered.
+         *
+         * Equal ids only — not "both known", not "same provider". The entry is a
+         * claim about which model ran, and a claim that disagrees with the model
+         * that actually ran is worse than no claim: `capture` would record the
+         * wrong model rather than fall back to the provider's own.
+         */
+        internal fun titleAttributionMatches(entryModelId: String?, servedModelId: String?): Boolean =
+            entryModelId != null && entryModelId == servedModelId
 
         // ── [T-android-compact-runaway] Compaction budgets ──────────────
         //
@@ -179,6 +558,53 @@ class ChatViewModel(
             return (COMPACT_TIMEOUT_BASE_MS + growth).coerceAtMost(COMPACT_TIMEOUT_MAX_MS)
         }
 
+        // ── [T-android-retry-governs-title-and-compaction] Title wall clock ─
+        //
+        // Compaction bounds an unbounded retry budget with a finite wall clock
+        // (see COMPACT_TIMEOUT_MAX_MS above, and its comment: "keeps an
+        // unbounded budget finite"). Now that title generation obeys the user's
+        // retry setting, it needs the same bound — before this, title
+        // generation had NO ceiling of any kind, so with the shipped default
+        // (`autoRetryEnabled = true`, `maxRetryAttempts = -1`, i.e. always) a
+        // transient failure left a background request retrying indefinitely:
+        // network, battery and a session stuck on "New Chat" with nobody
+        // watching.
+        //
+        // This does NOT change the user's configured attempt count — `-1` stays
+        // `-1` and 2 stays 2. It bounds a different dimension: how long one
+        // title dispatch may occupy the device. Same structure as compaction,
+        // deliberately.
+
+        /**
+         * Wall-clock ceiling for one title-generation dispatch, retries
+         * included.
+         *
+         * Sized off the retry backoff sequence (`initialRetryDelayMillis`
+         * 1000ms, multiplier 1.2, cap 30s) AND the measured cost of the request
+         * it wraps. The GH#210 comment on
+         * [applyFallbackTitleFromFirstMessage] records "the title request runs
+         * 22–51s against a real provider", so a legitimate worst case of
+         * `51s call + 1s backoff + 51s retry ≈ 103s` must fit — a deadline
+         * below that would silently cancel a retry the user explicitly
+         * configured, which is the same defect class this change removes.
+         *
+         * 120s covers that with headroom and stays under half of compaction's
+         * 300s ceiling, which is right for the payload: compaction may carry a
+         * whole transcript, a title carries the first/last message pair capped
+         * at 200 chars each.
+         *
+         * Known consequence, deliberate: a LARGE configured budget cannot be
+         * fully spent inside 120s. The slider allows up to 150, and at 22–51s
+         * per call that is minutes of retrying — the deadline stops the
+         * dispatch first and the first-message fallback lands. That is the
+         * point of a wall clock (compaction has the same property via its
+         * 300s ceiling); the alternative, no bound at all, is what left a
+         * background title request retrying indefinitely under the default
+         * `-1`. Users who want the full budget honoured need a longer deadline
+         * here, not a different retry value.
+         */
+        internal const val TITLE_GEN_TIMEOUT_MS = 120_000L
+
         /**
          * Should a failed summary attempt be retried by splitting the input in
          * half? Pure predicate, in the companion so it is testable without an
@@ -221,6 +647,236 @@ class ChatViewModel(
             // payload-size independent.
             if (error is java.io.IOException) return false
             return true
+        }
+
+        /** HTTP-ish status codes appearing in provider error prose. */
+        private val STATUS_CODE_IN_TEXT = Regex("\\b[1-5][0-9]{2}\\b")
+
+        /**
+         * [T-android-retry-governs-title-and-compaction] Does [error]'s text
+         * name a request-SIZE problem? The single definition of that idea —
+         * [isContextTooLargeError] delegates here, and
+         * [compactionInnerRetryFailure] uses it to decide which layer handles
+         * the failure.
+         *
+         * Deliberately an explicit phrase list, not a heuristic: providers word
+         * an over-length refusal in ways no status code reveals, and
+         * OpenMinis#133 is the record of what guessing costs (`[context_length
+         * _exceeded] Your input exceeds the context window of this model`
+         * slipped past the earlier, shorter list and silently disabled
+         * halving).
+         */
+        internal fun isSizeCausedFailure(error: Throwable): Boolean {
+            val desc = (error.message ?: error.toString()).lowercase()
+            return desc.contains("too many tokens") ||
+                desc.contains("context length") ||
+                desc.contains("max_tokens") ||
+                desc.contains("content is too long") ||
+                desc.contains("exceeds the model") ||
+                desc.contains("request too large") ||
+                desc.contains("prompt is too long") ||
+                desc.contains("token limit") ||
+                desc.contains("context window")
+        }
+
+        /**
+         * [T-android-retry-governs-title-and-compaction] Failures that mean
+         * "stop", not "try again": the retry loop must rethrow these untouched
+         * rather than classify them.
+         *
+         * [LLMError.Cancelled] has to be listed separately from
+         * [kotlinx.coroutines.CancellationException] because it is an ordinary
+         * Exception, so [AgentRetryRunner.run] does not recognise it — and its
+         * message ("Request was cancelled") matches no stop-retry keyword, so
+         * `AgentRetryPolicy` would happily retry it forever under `-1`, against
+         * a user who just pressed cancel.
+         */
+        internal fun isRetryStopSignal(error: Throwable): Boolean =
+            error is LLMError.Cancelled
+
+        /**
+         * [T-android-retry-governs-title-and-compaction] The retry VOCABULARY,
+         * in one place: how a thrown provider/IO error is described to
+         * `AgentRetryPolicy`. The agent loop, title generation and compaction
+         * all classify their failures here, so a 503 — or a rate limit — is
+         * judged the same wherever it surfaces, instead of each path growing
+         * its own idea of "retryable".
+         *
+         * Note this is a DIFFERENT question from [shouldSplitOnError]:
+         *   - here:     would repeating the SAME request plausibly succeed?
+         *   - there:    would a SMALLER request plausibly succeed?
+         * They are not two implementations of one concept, so they are not
+         * merged. [compactionInnerRetryFailure] composes them.
+         */
+        internal fun runtimeFailureFor(error: Throwable): RuntimeFailure {
+            val detail = (error as? LLMError.ProviderError)?.detail.orEmpty()
+            val statusCode = (error as? LLMError)?.diagnostics?.statusCode
+                ?.takeIf { it in 100..599 }
+                ?: STATUS_CODE_IN_TEXT.find(detail)?.value?.toIntOrNull()?.takeIf { it in 100..599 }
+            val message = (error.message ?: detail).ifBlank { error.javaClass.simpleName }
+            return RuntimeFailure(
+                code = error.javaClass.simpleName.ifBlank { "RuntimeFailure" },
+                message = message.ifBlank { "provider failure" },
+                retryable = error is LLMError.NetworkError ||
+                    error is LLMError.TransientError ||
+                    error is LLMError.RateLimited ||
+                    statusCode in 500..599,
+                statusCode = statusCode,
+                networkError = error is LLMError.NetworkError,
+            )
+        }
+
+        /**
+         * [T-android-retry-governs-title-and-compaction] The INNER retry gate
+         * for compaction, i.e. the exact boundary between compaction's two
+         * recovery layers — keep them separate:
+         *
+         *  - INNER (AgentRetryRunner + AgentRetryPolicy): the user's automatic
+         *    retry budget, applied to a failure that repeating the SAME request
+         *    can plausibly fix.
+         *  - OUTER (`generateCompactSummaryWithSplitting`): halve the input when
+         *    the failure is a function of request SIZE. That is not a retry of
+         *    the same thing; it is a different, smaller request, with its own
+         *    depth bound.
+         *
+         * Returning `null` means "hand this straight up to the halving layer".
+         *
+         * Why the decision is ordered as it is — a first cut of this function
+         * asked `shouldSplitOnError(error) && !runner.isRetryable(failure)`,
+         * and that was WRONG: `shouldSplitOnError` returns true for every
+         * untyped `ProviderError` (which is how an over-length refusal normally
+         * arrives), while `runtimeFailureFor` folds the provider's text into
+         * the message, where `AgentRetryPolicy`'s retry keywords ("timeout",
+         * "try again", "overloaded", …) then match. So a size-caused failure
+         * whose wording happened to include such a word was handed to the inner
+         * loop, and under the shipped default (`-1`, always) the run's own wall
+         * clock fired before the halving layer ever ran — compaction failing
+         * outright where it used to rescue itself. Evidence therefore has to be
+         * weighed in this order:
+         *
+         *  1. `isRetryStopSignal` — "stop" beats every retry decision.
+         *  2. `isSizeCausedFailure` — the error TEXT names a size problem. That
+         *     is direct evidence, and it wins even when the same text also
+         *     carries a transient-looking word: halving can fix size, retrying
+         *     the identical request cannot fix it at any budget.
+         *  3. `!shouldSplitOnError` — the payload-independent classes (network,
+         *     typed 429/5xx, auth, IO) where halving provably cannot help. These
+         *     retry, as the user's setting asks.
+         *  4. Otherwise the failure is AMBIGUOUS: untyped, so the evidence
+         *     cannot separate "too big" from "server wobbled". Prefer the
+         *     halving layer, which is both the pre-existing behaviour for this
+         *     class and the only option that can still succeed — but only when
+         *     the budget is UNBOUNDED. With a bounded budget the inner loop
+         *     retries first (honouring the user's value), and if it exhausts the
+         *     throw still reaches the halving layer's own catch, so no rescue is
+         *     lost either way.
+         */
+        internal fun compactionInnerRetryFailure(
+            error: Throwable,
+            runner: AgentRetryRunner,
+        ): RuntimeFailure? {
+            if (isRetryStopSignal(error)) return null
+            if (isSizeCausedFailure(error)) return null
+            val failure = runtimeFailureFor(error)
+            if (!shouldSplitOnError(error)) return failure
+            if (runner.maxAttempts < 0) return null
+            return failure
+        }
+
+        /**
+         * Session-title generation's model call, retried by [runner] — which the
+         * caller builds from the user's automatic-retry setting via
+         * `agentRetryRunnerFromSettings`. Lives in the companion for the same
+         * reason [shouldSplitOnError] does: a JVM test can assert the real
+         * provider call count against the user's budget without an
+         * Android-bound ViewModel.
+         */
+        internal suspend fun callTitleModelWithRetry(
+            provider: LLMProvider,
+            prompt: String,
+            systemPrompt: String,
+            maxTokens: Int,
+            runner: AgentRetryRunner,
+        ): LLMResponse = runner.run(
+            failureOf = { error -> if (isRetryStopSignal(error)) null else runtimeFailureFor(error) },
+        ) {
+            provider.sendMessage(
+                messages = listOf(LLMMessage(role = LLMMessage.Role.USER, content = prompt)),
+                systemPrompt = systemPrompt,
+                maxTokens = maxTokens,
+                // Mirror iOS AIChatViewModel.swift:11244 — null so the gpt-5.x
+                // family doesn't reject the request (only temperature=1 is
+                // allowed there); buildRequestBody omits the field when null.
+                temperature = null,
+                thinkingLevel = ThinkingLevel.OFF,
+            )
+        }
+
+        /**
+         * One title dispatch, end to end: the model call retried per [runner]
+         * (the user's automatic-retry setting) and the whole thing bounded by
+         * [timeoutMs].
+         *
+         * Returns null — and only null — when the wall clock fired and the
+         * dispatch was abandoned mid-flight. The caller must then fall back to
+         * the first-message title and say so: [onDeadline] is the observability
+         * hook, because a deadline that abandons a request silently is how a
+         * background failure becomes invisible (the defect class this file
+         * keeps re-learning).
+         *
+         * The two bounds are orthogonal and both are needed:
+         *   - [runner] bounds ATTEMPTS: the user's number, honoured or not.
+         *   - [timeoutMs] bounds DURATION: stops an always-retry budget from
+         *     occupying the device indefinitely. It never shortens a bounded
+         *     budget's retries in the normal case — see [TITLE_GEN_TIMEOUT_MS]
+         *     for the sizing argument.
+         *
+         * Cancellation from the caller's own scope still propagates: only the
+         * deadline is reported as null.
+         */
+        internal suspend fun generateTitleUnderDeadline(
+            provider: LLMProvider,
+            prompt: String,
+            systemPrompt: String,
+            maxTokens: Int,
+            runner: AgentRetryRunner,
+            timeoutMs: Long = TITLE_GEN_TIMEOUT_MS,
+            onDeadline: (timeoutMs: Long) -> Unit = {},
+        ): LLMResponse? {
+            val response = withTimeoutOrNull(timeoutMs) {
+                callTitleModelWithRetry(provider, prompt, systemPrompt, maxTokens, runner)
+            }
+            if (response == null) onDeadline(timeoutMs)
+            return response
+        }
+
+        /**
+         * Compaction's single-shot summary call, retried by [runner] per the
+         * user's setting. The halving layer stays OUTSIDE this function and
+         * keeps its own depth bound — see [compactionInnerRetryFailure] for the
+         * boundary between the two, and do not fold one into the other.
+         */
+        internal suspend fun callCompactModelWithRetry(
+            provider: LLMProvider,
+            userMessage: String,
+            systemPrompt: String,
+            maxTokens: Int,
+            runner: AgentRetryRunner,
+        ): LLMResponse = runner.run(failureOf = { compactionInnerRetryFailure(it, runner) }) {
+            provider.sendMessage(
+                messages = listOf(LLMMessage(role = LLMMessage.Role.USER, content = userMessage)),
+                systemPrompt = systemPrompt,
+                maxTokens = maxTokens,
+                // temperature = null (not 1.0): mirror iOS
+                // AIChatViewModel.swift:12926 — null lets the provider/model use
+                // its default, and gpt-5.x rejects any temperature != 1 with
+                // HTTP 400 while Android's OpenAIProvider omits the field
+                // entirely when it is null.
+                temperature = null,
+                imageParts = emptyList(),
+                tools = emptyList(),
+                thinkingLevel = ThinkingLevel.OFF,
+            )
         }
 
         /**
@@ -818,6 +1474,11 @@ class ChatViewModel(
     fun appendToInputText(snippet: String) {
         val joined = joinDraftWithSnippet(_inputText.value, snippet) ?: return
         _inputText.value = joined
+        // The draft model mirrors what the composer shows, so every write to the
+        // rendered field goes through it. Without this the appended snippet lived
+        // only in `_inputText`: entering and leaving edit mode (which restores the
+        // draft, not the field) dropped it on the floor.
+        editDraftState.updateCurrentDraft(joined, _attachments.value)
     }
 
     private val _isStreaming = MutableStateFlow(false)
@@ -1045,6 +1706,29 @@ class ChatViewModel(
     val imageBudgetEvent: SharedFlow<ImageBudget.BudgetResult> = _imageBudgetEvent.asSharedFlow()
 
     /**
+     * One-shot fork completion events. The ChatSplitScaffold consumes the new id
+     * and switches the detail pane to the copied session.
+     */
+    private val _forkedSessionEvent = MutableSharedFlow<String>(extraBufferCapacity = 1)
+    val forkedSessionEvent: SharedFlow<String> = _forkedSessionEvent.asSharedFlow()
+
+    fun forkCurrentSession(requestedName: String? = null) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val source = chatRepository.getSession(sessionId) ?: return@launch
+            val baseName = source.title?.trim().takeUnless { it.isNullOrEmpty() } ?: "Chat"
+            val existingNames = chatRepository.listSessions()
+                .mapNotNull { it.title }
+            val title = requestedName?.trim()?.takeIf { it.isNotEmpty() }
+                ?: ForkNameAllocator.nextName(baseName, existingNames)
+            val newId = com.openminis.app.data.SessionForkManager(
+                context = context,
+                chatRepository = chatRepository,
+            ).duplicateSession(sessionId, title) ?: return@launch
+            _forkedSessionEvent.emit(newId)
+        }
+    }
+
+    /**
      * Request-level image-budget events (T-request-imgsize). Emitted by
      * [applyRequestImageBudget] when the cumulative history image payload
      * exceeds [ImageBudget.MAX_REQUEST_BYTES] and older images had to be
@@ -1164,6 +1848,15 @@ class ChatViewModel(
      * Leaf LLM calls issued by the current compaction. Reset at the start of
      * each run; read/incremented from the split recursion, which can interleave
      * across suspension points, hence atomic.
+     *
+     * [T-android-retry-governs-title-and-compaction] This counts SEGMENTS, i.e.
+     * distinct (smaller and smaller) requests — not physical provider calls.
+     * Since the user's automatic-retry setting may re-issue each segment's
+     * request, physical calls can be several times this number; bounding that
+     * product here would silently cap the user's configured budget, which is
+     * the defect this change exists to fix. The run's wall-clock bound
+     * (`compactTimeoutMsFor`, applied as `withTimeout` by the caller) is what
+     * keeps an unbounded budget finite.
      */
     private val compactCallsIssued = java.util.concurrent.atomic.AtomicInteger(0)
 
@@ -1189,6 +1882,29 @@ class ChatViewModel(
     /** Seconds remaining in the current auto-retry countdown (0 = not counting down). */
     private val _autoRetryCountdown = MutableStateFlow(0)
     val autoRetryCountdown: StateFlow<Int> = _autoRetryCountdown.asStateFlow()
+
+    /**
+     * [T-android-auto-retry-progress] Retry budget that scheduled the wait
+     * currently in flight (`-1` = the app's unlimited setting). The chat row
+     * needs it to tell "attempt 2 of 5" from "attempt 2"; it is copied from the
+     * very settings that fed `AgentRetryPolicy`, so the row cannot drift from
+     * the policy that produced it.
+     */
+    private val _autoRetryMaxAttempts = MutableStateFlow(0)
+    val autoRetryMaxAttempts: StateFlow<Int> = _autoRetryMaxAttempts.asStateFlow()
+
+    /**
+     * [T-android-auto-retry-progress] Clear every field the auto-retry banner
+     * reads. Idempotent and non-suspending, so it is safe from any exit path:
+     * backoff finished, attempt failed again, retries exhausted, turn
+     * cancelled. Without it a cancel landing inside the retry handler could
+     * strand a "retrying" row on a turn that is no longer running.
+     */
+    private fun resetAutoRetryState() {
+        if (_autoRetryAttempt.value != 0) _autoRetryAttempt.value = 0
+        if (_autoRetryCountdown.value != 0) _autoRetryCountdown.value = 0
+        if (_autoRetryMaxAttempts.value != 0) _autoRetryMaxAttempts.value = 0
+    }
 
     // [T-android-stale-streamjob-clears-isstreaming] @Volatile so cross-coroutine
     // reads (the orphaned previous streamJob's tail block running on a different
@@ -1251,53 +1967,387 @@ class ChatViewModel(
         )
         agentHistory.add(parentHistory)
         viewModelScope.launch {
-            val result = delegatedChildRunner.execute(
-                parentSessionId = parentSession,
-                request = request,
-                preferredEntry = _activeEntryId.value?.let { id ->
-                    providerRepository.config.value.modelEntries.firstOrNull { it.id == id }
-                },
-                parentModel = runtimeParentModelSnapshot(),
-            )
-            val childResult = result.getOrNull()
-            val output = childResult?.output ?: "Delegated child failed: ${result.exceptionOrNull()?.message ?: "unknown error"}"
-            val snapshot = childResult?.modelSnapshot
-            var assistantParts = "[{\"type\":\"text\",\"value\":${escapeJson(output)}}]"
-            childResult?.modelSnapshot?.let { snapshot ->
-                actualRequestMetadata(ModelRole.CHILD, snapshot.providerInstanceId)?.let { meta ->
-                    assistantParts = prependRequestMetadata(assistantParts, meta)
-                }
-            }
-            val persisted = withContext(Dispatchers.IO) {
-                chatRepository.appendMessage(
-                    parentSession,
-                    "assistant",
-                    assistantParts,
-                    modelSnapshot = snapshot,
-                    provenance = MessageProvenance.ASSISTANT,
-                )
-            }
-            withContext(Dispatchers.Main) {
-                _messages.value = _messages.value + ChatMessage(
-                    id = persisted.id,
-                    role = "assistant",
-                    content = output,
-                    provenance = MessageProvenance.ASSISTANT,
-                    error = if (result.isFailure) output else null,
-                    sourceDbIds = listOf(persisted.id),
-                )
-            }
-            agentHistory.add(
-                LLMMessage(
-                    role = LLMMessage.Role.ASSISTANT,
-                    content = output,
-                    contentParts = listOf(AgentContentPart.Text(output)),
-                    dbMessageId = persisted.id,
+            publishDelegatedChildOutcome(
+                parentSession = parentSession,
+                result = delegatedChildRunner.execute(
+                    parentSessionId = parentSession,
+                    request = request,
+                    preferredEntry = delegationPreferredEntry(),
+                    parentModel = runtimeParentModelSnapshot(),
+                    // request.md:138 — the dispatcher decides what the child may
+                    // see, and the runtime records that decision as a reference
+                    // before the child's first model call. The child reading it
+                    // back is the next atom; recording it here is what makes the
+                    // share durable rather than a promise in a prompt.
+                    onChildSessionReady = { childSessionId ->
+                        recordDelegatedCommunication(parentSession, childSessionId, request)
+                    },
                 ),
             )
         }
         return true
     }
+
+    /**
+     * Write the parent→child communication entry for one delegation, with the
+     * dispatcher's context share attached as a REFERENCE.
+     *
+     * Why a record here at all: the delegation's text reaches the child through
+     * [RuntimeChildRunner], so routing it through the gateway's mailbox would
+     * deliver it twice. The directory entry is the part that was missing — it is
+     * what makes "who dispatched what to whom, and what were they offered"
+     * queryable afterwards.
+     *
+     * Why the transcript is passed but never stored: [RuntimeContextAttachments.resolve]
+     * needs the sender's message count to size `--share=all` and to drop indices
+     * the conversation no longer has. It reads no text into the result, and
+     * [RuntimeContextAttachments.capsule] — the only string produced here from
+     * the share — is derived from the attachment alone. That is `request.md:138`'s
+     * requirement ("并不是以文字消息附加过去的") expressed as code rather than as a
+     * convention: an attachment's size does not grow with the conversation.
+     *
+     * Failures are logged and swallowed: the child's work is the point, and a
+     * record that could not be written must not fail the delegation.
+     */
+    private suspend fun recordDelegatedCommunication(
+        parentSessionId: String,
+        childSessionId: String,
+        request: RuntimeDelegationRequest,
+    ) {
+        val attachment = runCatching {
+            RuntimeContextAttachments.resolve(
+                request = request.contextShare,
+                conversationId = RuntimeConversationAddress.fromStableSessionId(parentSessionId),
+                transcript = _messages.value.map { it.content },
+            )
+        }.getOrElse { error ->
+            AppLogger.warning(TAG, "context share resolution failed: ${error.message}")
+            null
+        }
+        val summary = buildString {
+            attachment?.let { append(RuntimeContextAttachments.capsule(it)).append(" | ") }
+            append("delegated: ")
+            append(request.prompt.replace(Regex("\\s+"), " ").trim())
+        }.take(RuntimeCommunicationMetadata.MAX_SUMMARY_CHARS)
+        runCatching {
+            runtimeCoordinator.communicationGateway(communicationRepository).recordDelivered(
+                actorSessionId = parentSessionId,
+                targetSessionId = childSessionId,
+                summary = summary,
+                delivery = if (request.mode == DelegationMode.TEAM) {
+                    RuntimeDelivery.TEAM_PEER
+                } else {
+                    RuntimeDelivery.QUEUE
+                },
+                attachment = attachment,
+            )
+        }.onFailure { error ->
+            AppLogger.warning(TAG, "delegation communication record failed: ${error.message}")
+        }.onSuccess { result ->
+            if (!result.accepted && result is RuntimeCommunicationGateway.SendResult.Rejected) {
+                AppLogger.warning(TAG, "delegation communication record rejected: ${result.reason}")
+            }
+        }
+    }
+
+    /**
+     * [T-android-child-restart] The model entry the composer has selected, seen
+     * as a delegation preference. Read by both the composer's delegation path and
+     * the restart launcher, so a restart resolves its model the same way a fresh
+     * delegation does.
+     */
+    private fun delegationPreferredEntry(): com.openminis.app.data.model.ModelEntry? =
+        _activeEntryId.value?.let { id ->
+            providerRepository.config.value.modelEntries.firstOrNull { it.id == id }
+        }
+
+    /**
+     * [T-android-child-restart] The launch half of `restart_descendant`, injected
+     * into [portableToolExecutor].
+     *
+     * By the time this runs, `AgentToolExecutor.restartDescendant` has already
+     * re-armed the runtime node, so the work here is the child actually
+     * executing: run it again ON ITS OWN session (the reused id is what makes
+     * "reuse this child's context" true rather than a claim), land the outcome in
+     * the parent's transcript exactly as a fresh delegation would, and report
+     * `ok = false` for anything that did not really run — the executor turns that
+     * into a rollback, so a child that never started goes back to being marked as
+     * interrupted instead of looking alive.
+     *
+     * The prompt is neither taken from the argument JSON nor invented; see
+     * [restartedChildTaskPrompt].
+     */
+    private suspend fun launchRestartedChild(
+        parentSessionId: String,
+        childSessionId: String,
+        request: RuntimeDelegationRequest,
+    ): RestartedChildRun {
+        val prompt = restartedChildTaskPrompt(
+            fromNode = request.prompt,
+            fromTranscript = childSessionTaskText(childSessionId),
+        )
+        if (prompt == null) {
+            return RestartedChildRun(
+                ok = false,
+                childSessionId = childSessionId,
+                output = "Restart refused: the task this child was given could not be recovered " +
+                    "(its runtime node carries no task text and its own session has no opening " +
+                    "message). Re-running it on an invented task would be worse than leaving it " +
+                    "marked as abnormally interrupted.",
+            )
+        }
+        val result = delegatedChildRunner.execute(
+            parentSessionId = parentSessionId,
+            request = request.copy(prompt = prompt),
+            parentModel = runtimeParentModelSnapshot(),
+            existingChildSessionId = childSessionId,
+        )
+        publishDelegatedChildOutcome(parentSession = parentSessionId, result = result)
+        val childResult = result.getOrNull()
+        return RestartedChildRun(
+            ok = result.isSuccess,
+            childSessionId = childResult?.childSessionId ?: childSessionId,
+            output = childResult?.output
+                ?: "Restarted child did not run: ${result.exceptionOrNull()?.message ?: "unknown error"}",
+            endReason = childResult?.endReason?.name.orEmpty(),
+        )
+    }
+
+    /**
+     * The opening message of [childSessionId] — the task it was born with. Read
+     * from the transcript rather than from the runtime node; see
+     * [restartedChildTaskPrompt]. A failed read yields `null`, which makes the
+     * caller refuse instead of guessing.
+     */
+    private suspend fun childSessionTaskText(childSessionId: String): String? =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                chatRepository.firstMessagesForSessions(listOf(childSessionId))[childSessionId]
+            }.getOrNull()
+        }
+
+    /**
+     * [T-android-child-restart] Land one delegated child's outcome in the
+     * parent's transcript, and tell the main agent how it ended.
+     *
+     * Shared by the composer's delegation path and the restart launcher rather
+     * than copied: a restarted child has to be reported the way a freshly
+     * delegated one is — same assistant row, same abnormal-end
+     * `<system-reminder>` — and a second implementation of "what the parent is
+     * told" is how a restart would quietly come to describe itself differently
+     * from a delegation.
+     */
+    private suspend fun publishDelegatedChildOutcome(
+        parentSession: String,
+        result: Result<RuntimeChildExecutionResult>,
+    ) {
+        val childResult = result.getOrNull()
+        val output = childResult?.output ?: "Delegated child failed: ${result.exceptionOrNull()?.message ?: "unknown error"}"
+        val snapshot = childResult?.modelSnapshot
+        var assistantParts = "[{\"type\":\"text\",\"value\":${escapeJson(output)}}]"
+        childResult?.modelSnapshot?.let { snapshot ->
+            actualRequestMetadata(ModelRole.CHILD, snapshot.providerInstanceId)?.let { meta ->
+                assistantParts = prependRequestMetadata(assistantParts, meta)
+            }
+        }
+        val persisted = withContext(Dispatchers.IO) {
+            chatRepository.appendMessage(
+                parentSession,
+                "assistant",
+                assistantParts,
+                modelSnapshot = snapshot,
+                provenance = MessageProvenance.ASSISTANT,
+            )
+        }
+        withContext(Dispatchers.Main) {
+            _messages.value = _messages.value + ChatMessage(
+                id = persisted.id,
+                role = "assistant",
+                content = output,
+                provenance = MessageProvenance.ASSISTANT,
+                error = if (result.isFailure) output else null,
+                sourceDbIds = listOf(persisted.id),
+            )
+        }
+        agentHistory.add(
+            LLMMessage(
+                role = LLMMessage.Role.ASSISTANT,
+                content = output,
+                contentParts = listOf(AgentContentPart.Text(output)),
+                dbMessageId = persisted.id,
+            ),
+        )
+        // [T-android-child-agent-completion] Tell the MAIN agent how the child
+        // ended. Without this the abnormal end lived only in the runtime tree
+        // and in a stop report nobody reads: `runChildAttempt` returns
+        // Result.success for a child that never called the completion tool, so
+        // its possibly-truncated output reached the parent looking exactly like
+        // a clean result, and the parent had no basis on which to decide
+        // whether to restart it.
+        //
+        // It rides a USER row carrying `<system-reminder>`, which is the only
+        // channel that actually reaches the model: LLMMessage.Role has no
+        // SYSTEM member, so ChatMessage(role = "system") (appendSystemInfo)
+        // renders a card and is never sent to a provider. This mirrors
+        // resume()'s re-entry, and hasHumanTurnContent() already excludes
+        // `<system-reminder>` text from human-turn counting, so the injection
+        // cannot shift turn numbering or rewind anchors.
+        childResult?.takeIf { !it.completedNaturally }?.let { ended ->
+            val reminder = buildString {
+                append("<system-reminder>The delegated child agent finished WITHOUT calling the `")
+                append(ChildCompletionProtocol.TOOL_NAME)
+                append("` completion tool, so this run is recorded as an abnormal termination ")
+                append("(end_reason=").append(ended.endReason.name).append("). ")
+                append("Treat the reply above as possibly incomplete or truncated rather than as a ")
+                append("clean result: decide yourself whether the delegated task is actually ")
+                append("satisfied, and whether to restart the child, redo the work, or continue ")
+                append("from what it returned.</system-reminder>")
+            }
+            val reminderRow = withContext(Dispatchers.IO) {
+                chatRepository.appendMessage(
+                    parentSession,
+                    "user",
+                    """[{"type":"text","value":${escapeJson(reminder)}}]""",
+                    provenance = MessageProvenance.TOOL_INJECTION,
+                )
+            }
+            agentHistory.add(
+                LLMMessage(
+                    role = LLMMessage.Role.USER,
+                    content = reminder,
+                    contentParts = listOf(AgentContentPart.Text(reminder)),
+                    dbMessageId = reminderRow.id,
+                ),
+            )
+        }
+        // [T-android-parent-inbox-consumer] A delegated child has just settled, so
+        // this is one of the two moments a parent-side notification is guaranteed
+        // to exist — see surfaceRuntimeInbox().
+        surfaceRuntimeInbox()
+    }
+
+    /**
+     * [T-android-parent-inbox-consumer] Read this conversation's OWN runtime
+     * mailbox and show what the runtime put there.
+     *
+     * The runtime writes to a parent's inbox by itself — a stopped child
+     * (`SessionTreeRuntime.notifyParentOnStop`), and subtree deletions — through a
+     * channel that deliberately bypasses `send`'s authorization branch. Until now
+     * the only reader of those three lanes claimed as the CHILD
+     * (`RuntimeChildRunner`), so the parent's mailbox was written to and never
+     * opened: the user was never told a sub-agent had stopped, and the parent
+     * agent never saw it either.
+     *
+     * Called from the three points where an unread mailbox is most likely and
+     * where the chat is safe to append to:
+     *
+     *  1. after `loadSession()` finishes — reopening a conversation is exactly when
+     *     notifications accumulated while the app was closed become visible;
+     *  2. at the end of a parent run, next to `_isStreaming.value = false` — the
+     *     moment the turn is over and a `stopDescendant`-style stop performed
+     *     during it can be reported;
+     *  3. from `publishDelegatedChildOutcome` — the deterministic one for an
+     *     ordinary delegation, since the child settles before that call returns.
+     *
+     * De-duplication is [RuntimeInboxSurfacing]'s job, not this function's: the
+     * claim lease expires after ten minutes, so a long-lived conversation
+     * legitimately re-claims envelopes it already showed.
+     */
+    private suspend fun surfaceRuntimeInbox() {
+        val session = activeSessionId
+        if (session.isBlank()) return
+        try {
+            val drained = withContext(Dispatchers.IO) {
+                runCatching { runtimeCoordinator.drainInbox(session) }.getOrDefault(emptyList())
+            }
+            if (drained.isEmpty()) return
+            // Names are resolved before rendering so the card can say which
+            // sub-agent it is about; a conversation whose row is gone still
+            // renders, by id.
+            val names = withContext(Dispatchers.IO) {
+                runtimeInboxSurfacing.referencedNodeIds(drained).associateWith { nodeId ->
+                    runCatching { chatRepository.getSession(nodeId)?.title.orEmpty() }
+                        .getOrDefault("")
+                }
+            }
+            runtimeInboxDisplayNames = names
+            val notices = runtimeInboxSurfacing.noticesFor(drained)
+            if (notices.isEmpty()) return
+            withContext(Dispatchers.Main) {
+                for (notice in notices) {
+                    // "injection" is the system-layer glyph (Hub ≈ 「中枢层」), the
+                    // same one the <system-reminder> rows use: this row belongs to
+                    // the app's scheduling layer, not to the human and not to the
+                    // assistant. [stableId] is the envelope id, so N notifications
+                    // drained in the same millisecond stay N addressable rows.
+                    appendSystemInfo(notice.cardText, "injection", stableId = notice.envelopeId)
+                }
+            }
+            for (notice in notices) {
+                val reminder = notice.modelReminder ?: continue
+                appendRuntimeMailboxReminder(session, reminder)
+            }
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            throw cancelled
+        } catch (error: Throwable) {
+            // A mailbox read is a side errand of the turn/run it rides on; it must
+            // never be the reason a run's bookkeeping or a session load fails.
+            Log.w(TAG, "surfaceRuntimeInbox: runtime mailbox read failed", error)
+        }
+    }
+
+    /**
+     * [T-android-parent-inbox-consumer] Put one mailbox message into the model's
+     * context, the only way that reaches it: a `user` row carrying
+     * `<system-reminder>`, stamped [MessageProvenance.TOOL_INJECTION].
+     *
+     * `LLMMessage.Role` has no SYSTEM member, so a `system` row (what
+     * [appendSystemInfo] writes) is rendered for the user and never sent to a
+     * provider. `hasHumanTurnContent()` excludes `<system-reminder>` text, so the
+     * row cannot shift turn numbering or rewind anchors. Mirrors the injection in
+     * [publishDelegatedChildOutcome] rather than inventing a second mechanism.
+     */
+    private suspend fun appendRuntimeMailboxReminder(session: String, reminder: String) {
+        val row = withContext(Dispatchers.IO) {
+            chatRepository.appendMessage(
+                session,
+                "user",
+                """[{"type":"text","value":${escapeJson(reminder)}}]""",
+                provenance = MessageProvenance.TOOL_INJECTION,
+            )
+        }
+        agentHistory.add(
+            LLMMessage(
+                role = LLMMessage.Role.USER,
+                content = reminder,
+                contentParts = listOf(AgentContentPart.Text(reminder)),
+                dbMessageId = row.id,
+            ),
+        )
+    }
+
+    /**
+     * [T-android-parent-inbox-consumer] Renderer state for
+     * [surfaceRuntimeInbox], kept for the life of THIS ViewModel.
+     *
+     * Two things are deliberately instance-scoped rather than persisted:
+     *
+     *  - [runtimeInboxSurfacing] remembers which envelope ids have been shown.
+     *    `SessionTreeRuntime.claim`'s lease expires, so without this a
+     *    conversation open for more than ten minutes would render the same
+     *    notification again on the next run end. Since the card it renders is not
+     *    persisted either, "one instance" is exactly the window in which a card
+     *    can exist; a new process starts clean and re-surfaces what is still
+     *    claimable, which is the only way a notification survives a restart.
+     *  - [runtimeInboxDisplayNames] is the name lookup the renderer reads
+     *    synchronously, refreshed by [surfaceRuntimeInbox] because the underlying
+     *    read is a suspend DB call.
+     */
+    private val runtimeInboxSurfacing = RuntimeInboxSurfacing { nodeId ->
+        runtimeInboxDisplayNames[nodeId]
+    }
+
+    private var runtimeInboxDisplayNames: Map<String, String> = emptyMap()
 
     private var currentModel: LLMModel? = null
 
@@ -1392,7 +2442,7 @@ class ChatViewModel(
      * fixed list of definition objects, no I/O.
      */
     private val agentTools: List<AgentToolDefinition>
-        get() = AgentTools.makeAgentTools(
+        get() = mainAgentTools(
             // [T-android-vision-group / GH#182] The main model's own vision
             // capability. When false but a Vision Group is configured, read_image
             // is still exposed and routes through the group (see
@@ -1406,6 +2456,13 @@ class ChatViewModel(
                 providerRepository, context,
             ),
             memoryEnabled = _memoryEnabled.value,
+            goalActive = goalRuntime.snapshot.status == com.openminis.app.feature.runtime.GoalStatus.ACTIVE,
+            // [T-android-child-restart] `restart_descendant` is offered only when
+            // this session's runtime subtree actually holds something to restart.
+            // The actor id is what makes the question about THIS session rather
+            // than about the whole tree.
+            coordinator = runtimeCoordinator,
+            actorSessionId = activeSessionId,
         )
 
     /**
@@ -1873,6 +2930,17 @@ class ChatViewModel(
      * how much of the model's context window was consumed at the last turn.
      * @param loopCount number of agent loop iterations (approximated by
      * max(tool_use blocks, assistant message count), matching iOS).
+     * @param activeMillis how long this conversation actually ran, in millis —
+     * the union of its finished turn spans, NOT `now - createdAt`. The rule and
+     * its evidence live in
+     * [com.openminis.app.ui.chat.activeDurationMillis]; the short version is
+     * that an assistant row only reaches the DB once a turn's model call and its
+     * tools are done, so `[previous row, assistant row]` bounds one turn of real
+     * work while the idle gaps between turns are excluded. **null means "not
+     * known"**, which the panel renders as an em dash: when the message table
+     * cannot be read (safe mode) there is no measurement to report, and showing
+     * 0 would assert "it never ran" — contradicting the token totals sitting in
+     * the same panel, which stay readable.
      */
     data class SessionTokenStats(
         val input: Long,
@@ -1881,7 +2949,15 @@ class ChatViewModel(
         val cacheWrite: Long,
         val context: Int,
         val loopCount: Int,
-    )
+        val activeMillis: Long? = null,
+    ) {
+        /** Cache reads divided by uncached input plus cache reads; null means no denominator. */
+        val cacheHitRatePercent: Double?
+            get() {
+                val denominator = input + cacheRead
+                return if (denominator <= 0L) null else cacheRead.toDouble() * 100.0 / denominator
+            }
+    }
 
     data class ThinkingInfo(
         val supported: Boolean,
@@ -1930,7 +3006,29 @@ class ChatViewModel(
         val toolCalls = snapshot.filter { it.role == "assistant" }
             .sumOf { msg -> msg.toolBlocks.count { it.kind != "text" && it.kind != "info" } }
         val loops = maxOf(toolCalls, assistantCount)
-        return SessionTokenStats(input, output, cacheRead, cacheWrite, context, loops)
+        // Active runtime needs row TIMESTAMPS, which the in-memory snapshot above
+        // does not carry (ChatMessage has no createdAt). Read the persisted rows
+        // and reduce them with the pure rule in TokenUsageSheet; which role ends a
+        // turn is decided there, not here — see TURN_END_ROLE.
+        //
+        // Safe mode is why this is nullable: ChatRepository.loadMessages returns
+        // an empty list while it is active, and an empty list is indistinguishable
+        // from "this conversation never ran". Reporting null (~) keeps the panel
+        // from claiming a zero it did not measure.
+        val activeMillis = if (com.openminis.app.crash.CrashFrequencyDetector.isSafeMode()) {
+            null
+        } else {
+            activeDurationMillis(
+                chatRepository.loadMessages(sid).map { row ->
+                    ActiveTimeRow(createdAtMillis = row.createdAt, role = row.role)
+                },
+                // [T-android-token-runtime-process-clamp] Without this, a session
+                // whose process was killed mid-turn reports the entire downtime as
+                // work time (measured: "23 小时 0 分" after one overnight gap).
+                processStartMillis = currentProcessStartWallClockMillis(),
+            )
+        }
+        return SessionTokenStats(input, output, cacheRead, cacheWrite, context, loops, activeMillis)
     }
 
     // [T-android-split-chat] toggleMemorySheet / dismissMemorySheet moved to ChatViewModelUiStateExt.kt.
@@ -1939,33 +3037,13 @@ class ChatViewModel(
 
     /** Static catalogue of available slash commands, in display order.
      *  Subtitles are placeholders here — [filteredSlashCommands] always
-     *  rebuilds them with the current localized state. */
-    internal val availableSlashCommands: List<SlashCommand> = listOf(
-        SlashCommand(
-            id = "clear",
-            icon = Icons.Default.Delete,
-            title = "Clear",
-            subtitle = "",
-        ),
-        SlashCommand(
-            id = "compact",
-            icon = Icons.Default.Compress,
-            title = "Compact",
-            subtitle = "",
-        ),
-        SlashCommand(
-            id = "memory",
-            icon = Icons.Default.Psychology,
-            title = "Memory",
-            subtitle = "",
-        ),
-        SlashCommand(
-            id = "thinking",
-            icon = Icons.Default.Lightbulb,
-            title = "Thinking",
-            subtitle = "",
-        ),
-    )
+     *  rebuilds them with the current localized state.
+     *
+     *  [T-android-slash-goal-fork] Built by [defaultSlashCommandCatalog] (a plain
+     *  function, not a literal) so the picker's contents can be asserted in a JVM
+     *  test without constructing a ChatViewModel — a picker that quietly stops
+     *  listing a command is invisible to every other kind of test. */
+    internal val availableSlashCommands: List<SlashCommand> = defaultSlashCommandCatalog()
 
     // [T-android-split-chat] filteredSlashCommands / updateSlashMenuState /
     // showSlashMenuOverInput / dismissSlashMenu / slashMenuSetSelectedIndex moved
@@ -1997,12 +3075,13 @@ class ChatViewModel(
         // they're a typing aid. Fill the composer with the literal slash
         // command; the user then taps Send and the model handles the skill via
         // the existing SKILL.md fragment injection in runAgentLoop.
-        if (cmd.isSkill) {
-            AppLogger.info(TAG, "[Slash] tap skill id=${cmd.id} title=${cmd.title} → composer fill only")
+        val fillPrefix = cmd.fillText
+        if (fillPrefix != null) {
+            AppLogger.info(TAG, "[Slash] tap fill id=${cmd.id} → composer fill only")
             savedInputBeforeSlash = null
             _showSlashMenu.value = false
             _slashMenuSelectedIndex.value = -1
-            val prefix = "/${cmd.title} "
+            val prefix = fillPrefix
             // [T-android-slash-menu-align-ios-prepend] iOS parity: over-content
             // (saved != null) → PREPEND "/<skill> " to the original, so the
             // composer reads "/<skill> <original>" with the original as args,
@@ -2121,14 +3200,39 @@ class ChatViewModel(
      * `/` while a CJK keyboard layout is active. We treat them identically.
      */
     fun tryExecuteInputAsSlashCommand(text: String): Boolean {
+        // While a message is being edited the composer IS that message's edit buffer,
+        // and the send button means "push the edit back onto the message"
+        // (sendMessage → commitEditIfActive). BOTH send paths in ChatScreen (button/
+        // swipe and IME Enter) intercept slash commands BEFORE sendMessage, so without
+        // this guard a withdrawn queued message whose edit starts with "/" would have
+        // its send tap turned into "run a command" — leaving the message parked
+        // off-list in `withdrawnQueuedPrompts` and the edit still open. That is the one
+        // thing request.md:158 rules out ("不会进行一个真的发送，只是把编辑推回原位").
+        if (_editingMessageId.value != null) return false
         val trimmed = text.trim()
         if (trimmed.isEmpty()) return false
         val first = trimmed[0]
         if (first != '/' && first != '／') return false
+        when (val forkGoal = ForkGoalCommandParser.parse(trimmed)) {
+            is ForkGoalCommand.Fork -> {
+                forkCurrentSession(forkGoal.requestedName)
+                return true
+            }
+            is ForkGoalCommand.Goal -> {
+                val transition = goalRuntime.startGoal(GoalRequest(forkGoal.objective), System.currentTimeMillis())
+                if (transition.accepted) persistGoalSnapshot()
+                appendSystemInfo(
+                    if (transition.accepted) "Goal started: ${forkGoal.objective}" else "Goal rejected: ${transition.reason ?: "already active"}",
+                    if (transition.accepted) "info" else "error",
+                )
+                return true
+            }
+            null -> Unit
+        }
         if (RuntimeDelegationParser.isCommand(trimmed)) {
             if (RuntimeDelegationParser.parse(trimmed) == null) {
                 appendSystemInfo(
-                    "用法：/subagent <任务>，或 /team [--provider=… --model=… --note=…] <任务>",
+                    context.getString(R.string.chat_subagent_usage),
                     "info",
                 )
                 return true
@@ -2156,10 +3260,24 @@ class ChatViewModel(
      * Append a system-info block to the conversation. Not persisted — matches the
      * iOS `appendSystemInfo` behavior which surfaces a local notice in the chat
      * stream. Future work: wire real conversation compaction through the LLM.
+     *
+     * [stableId] is optional and defaults to null, which keeps every existing
+     * caller byte-identical. It exists for [surfaceRuntimeInbox]: one drain can
+     * produce several cards in the same millisecond, and the timestamped id would
+     * then hand two rows the SAME `ChatMessage.id`/`AssistantBlock.id`. The list
+     * survives that (`buildFlatChatItems.dedupe` suffixes a counter until keys are
+     * unique), but the rows stop being individually addressable, so a caller that
+     * already has a durable identity for what it is rendering passes it here.
      */
-    private fun appendSystemInfo(text: String, iconKind: String, payload: String? = null) {
+    private fun appendSystemInfo(
+        text: String,
+        iconKind: String,
+        payload: String? = null,
+        stableId: String? = null,
+    ) {
+        val rowId = if (stableId != null) "sysinfo_$stableId" else "sysinfo_${System.currentTimeMillis()}"
         val block = AssistantBlock(
-            id = "sysinfo_${System.currentTimeMillis()}",
+            id = rowId,
             kind = "info",
             content = text,
             toolName = iconKind,
@@ -2169,7 +3287,7 @@ class ChatViewModel(
             toolArgs = payload.orEmpty(),
         )
         _messages.value = _messages.value + ChatMessage(
-            id = "sysinfo_${System.currentTimeMillis()}",
+            id = rowId,
             role = "system",
             content = "",
             toolBlocks = listOf(block),
@@ -2511,10 +3629,32 @@ class ChatViewModel(
                     effectiveCompactionEntryId = compactionRequestEntry?.id,
                     modelGeneratedAt = System.currentTimeMillis(),
                 )
-                runCatching { chatRepository.dao.insertCompactMarker(marker) }
-                    .onFailure {
-                        Log.w(TAG, "Failed to persist compact marker: ${it.message}")
+                // [T-android-persistence-result-check] The marker is the ONLY
+                // durable record that a compaction happened — everything below
+                // (summary, cached marker, graying, the "N messages compacted"
+                // banner) is presentation. Persisting it must therefore gate that
+                // presentation. It used to be `runCatching { … }.onFailure { log }`
+                // and then the UI updated anyway, so a failed insert showed the
+                // user a compacted transcript with a divider and a summary,
+                // while a reload found no marker and the whole thing silently
+                // reverted — plus effectiveAgentHistory() would keep sending the
+                // full pre-compaction history while the UI claimed otherwise.
+                val markerPersisted = runCatching {
+                    chatRepository.dao.insertCompactMarker(marker)
+                }.onFailure {
+                    Log.w(TAG, "Failed to persist compact marker: ${it.message}")
+                }.isSuccess
+                if (!markerPersisted) {
+                    AppLogger.warning(
+                        TAG,
+                        "[Compact] marker insert failed for session=$sid — suppressing " +
+                            "compact UI so the transcript keeps matching the database",
+                    )
+                    withContext(Dispatchers.Main) {
+                        _error.value = "Couldn't save the compaction — nothing was changed."
                     }
+                    return@launch
+                }
                 _compactSummary.value = summary
                 // Keep the marker in memory so effectiveAgentHistory() can
                 // resolve the boundary on the very next outgoing turn.
@@ -2531,31 +3671,54 @@ class ChatViewModel(
                     // Those old dividers are stored as system messages with
                     // a "compact" iconKind in toolBlocks[0].toolName.
                     val cutoffId: String = lastCompactedDbId
-                    var passedCutoff = false   // anchor is guaranteed non-null in v2
-                    val cleaned = _messages.value
+                    val withoutOldDividers = _messages.value
                         .filterNot { msg ->
                             // Drop prior compact-divider rows; appendSystemInfo
                             // below will re-add the new one.
                             msg.role == "system" &&
                                 msg.toolBlocks.firstOrNull()?.toolName == "compact"
                         }
-                        .map { msg ->
+                    // [T-android-compact-boundary-dbid-resolution] Resolve the
+                    // anchor FIRST and gray nothing when it cannot be found.
+                    //
+                    // The `passedCutoff` walk below grays every bubble until it
+                    // sees the anchor. Any reason the anchor never matches — a
+                    // folded-away assistant row (the merge keeps only the LAST
+                    // row's id), a deleted row, a marker written by another
+                    // writer — therefore grayed the ENTIRE transcript including
+                    // the tail still live in the model's context, which reads as
+                    // "everything was compacted". Phase 2.5 already resolves the
+                    // same situation as "no graying" (`insertIdx <= 0`); this pass
+                    // must agree with it instead of guessing.
+                    val anchorIdxInUi = withoutOldDividers.indexOfLast { it.representsDbId(cutoffId) }
+                    var passedCutoff = false
+                    val cleaned = if (anchorIdxInUi < 0) {
+                        AppLogger.warning(
+                            TAG,
+                            "[Compact] anchor ${cutoffId.take(8)} has no UI bubble — skipping graying " +
+                                "(marker still persisted; the divider is still shown)",
+                        )
+                        withoutOldDividers
+                    } else {
+                        withoutOldDividers.map { msg ->
                             if (msg.role == "system") msg
                             else if (passedCutoff) msg
                             else {
                                 val grayed = if (msg.isCompactedHistory) msg
                                     else msg.copy(isCompactedHistory = true)
-                                if (msg.id == cutoffId) passedCutoff = true
+                                // Match through sourceDbIds too: the anchor is
+                                // often an assistant row folded into a later
+                                // merged bubble, whose `id` is only the last
+                                // row's id.
+                                if (msg.representsDbId(cutoffId)) passedCutoff = true
                                 grayed
                             }
                         }
+                    }
                     // T84: count UI bubbles in this pass's compacted range.
                     // Filters: role != system (dividers/notices don't count).
                     // Range: everything up to and including the cutoff row,
                     // since the kept-tail starts immediately after.
-                    // Falls back to "all non-system" when cutoffId is null
-                    // (compact-everything path), matching iOS dividerInsertIdx
-                    // == messages.count behavior.
                     //
                     // We deliberately do NOT exclude `isCompactedHistory` rows.
                     // Back-to-back compacts (or compact after restoring a prior
@@ -2564,12 +3727,13 @@ class ChatViewModel(
                     // even though `toCompact.size` was nonzero. The divider's
                     // count should reflect the size of THIS pass's range, not
                     // the delta of newly-grayed rows.
-                    val cutoffIdx = cleaned.indexOfLast { it.id == cutoffId }
-                    val compactedUICount = if (cutoffIdx < 0) {
-                        cleaned.count { it.role != "system" }
-                    } else {
-                        cleaned.take(cutoffIdx + 1).count { it.role != "system" }
-                    }
+                    //
+                    // With no resolvable anchor there is no UI range to measure,
+                    // so report what was actually compacted in agentHistory
+                    // rather than claiming every bubble was.
+                    val compactedUICount =
+                        if (anchorIdxInUi < 0) toCompact.size
+                        else cleaned.take(anchorIdxInUi + 1).count { it.role != "system" }
                     _messages.value = cleaned
                     AppLogger.info(TAG, "[Compact] divider: $compactedUICount UI bubbles compacted (history entries: ${toCompact.size})")
                     appendSystemInfo(
@@ -3334,6 +4498,15 @@ class ChatViewModel(
      * plain string join, NOT a further LLM call — see the comment at the join
      * for why the extra round-trip was removed. Both platforms must keep this
      * the same, or the summary a session carries differs by device.
+     *
+     * [T-android-retry-governs-title-and-compaction] This is the OUTER of
+     * compaction's two recovery layers, and the depth cap is NOT the retry
+     * limit: it is how many times the payload may be degraded (a different,
+     * smaller request each time). The retry limit — the user's automatic-retry
+     * setting — is applied INSIDE each leaf by `callCompactModelWithRetry`, to
+     * failures that repeating the same request can fix. Keep the layers
+     * separate; `compactionInnerRetryFailure` is the boundary and documents why
+     * an error belongs to one layer and not the other.
      */
     private suspend fun generateCompactSummaryWithSplitting(
         messages: List<LLMMessage>,
@@ -3420,6 +4593,23 @@ class ChatViewModel(
      * Single-shot LLM call that turns [conversationText] into a structured
      * summary. Throws on provider error so the splitter above can detect
      * context-too-large failures and retry with halved input.
+     *
+     * [T-android-retry-governs-title-and-compaction] The request is issued
+     * through `callCompactModelWithRetry`, which applies the user's
+     * automatic-retry setting (`-1` always, `0` disabled, `N>0` N retries) to
+     * failures that repeating the same request can fix. Compaction's two
+     * recovery layers stay distinct — see [compactionInnerRetryFailure]:
+     *
+     *  - INNER, here: the user's retry budget, for transient/5xx/rate-limit/
+     *    network failures. Same request again.
+     *  - OUTER, [generateCompactSummaryWithSplitting]: halve the input when the
+     *    failure is a function of request SIZE — a different, smaller request,
+     *    with its own depth bound. Not a retry, and not governed by the retry
+     *    setting.
+     *
+     * Do not merge them. Collapsing the two would either retry an over-long
+     * request forever (the inner loop cannot fix size) or lose the size
+     * degradation entirely (the outer loop cannot fix a 503).
      */
     private suspend fun generateCompactSummary(conversationText: String): String {
         // Wrap the transcript in explicit BEGIN/END framing so the model
@@ -3453,22 +4643,26 @@ class ChatViewModel(
         val contextWindow = model?.contextWindow ?: 128_000
         val estimatedInput = userMessage.length / 4
         val maxOut = maxOf(1024, minOf(8192, contextWindow - estimatedInput))
-        val response = provider.sendMessage(
-            messages = listOf(
-                LLMMessage(role = LLMMessage.Role.USER, content = userMessage)
-            ),
-            systemPrompt = providerRepository.compactionPrompt
-                ?.takeIf { it.isNotBlank() } ?: compactSummarySystemPrompt,
+        val response = callCompactModelWithRetry(
+            provider = provider,
+            userMessage = userMessage,
+            systemPrompt = effectiveCompactionSystemPrompt(providerRepository.compactionPrompt),
             maxTokens = maxOut,
-            // Mirror iOS AIChatViewModel.swift:12926 — null lets the
-            // provider/model use its default. gpt-5.x family rejects any
-            // temperature != 1 with HTTP 400, and Android
-            // OpenAIProvider.buildRequestBody omits the field entirely when
-            // temperature is null.
-            temperature = null,
-            imageParts = emptyList(),
-            tools = emptyList(),
-            thinkingLevel = ThinkingLevel.OFF,
+            // [T-android-retry-governs-title-and-compaction] Same settings →
+            // runner mapping as the agent loop and title generation: the retry
+            // slider governs compaction too, and `-1` keeps its always
+            // semantics. The wall-clock bound for the whole run
+            // (`compactTimeoutMsFor`, applied as `withTimeout` by the caller)
+            // is what stops an unbounded budget from hanging forever.
+            runner = agentRetryRunnerFromSettings(
+                AgentBehaviorSettingsPrefs(context).load(),
+                onRetry = { attempt, delayMillis, failure ->
+                    AppLogger.info(
+                        TAG,
+                        "[Compact] retry ${attempt + 1} in ${delayMillis}ms (${failure.code})",
+                    )
+                },
+            ),
         )
         return response.text
     }
@@ -3514,28 +4708,46 @@ class ChatViewModel(
     private fun isSegmentRetryableError(error: Throwable): Boolean =
         shouldSplitOnError(error)
 
+    /*
+     * [T-android-retry-governs-title-and-compaction] Do NOT fold
+     * isSegmentRetryableError into AgentRetryPolicy.isRetryable, and do not
+     * replace one with the other. They answer two different questions:
+     *
+     *   isSegmentRetryableError / shouldSplitOnError:
+     *       "would a SMALLER request plausibly succeed?"
+     *       Its "retry" is a re-issue with a halved payload — a different
+     *       request — so it deliberately says NO for 429/5xx/network (halving
+     *       cannot fix quota, an outage, or a request that never arrived) and
+     *       YES for unclassified failures (an over-length refusal usually
+     *       arrives untyped).
+     *
+     *   AgentRetryPolicy.isRetryable:
+     *       "would repeating the SAME request plausibly succeed?"
+     *       YES for 429/5xx/network/timeouts, NO for auth, quota and explicit
+     *       stop-retry signals.
+     *
+     * The two answers are close to opposite by construction. Merging them would
+     * either make compaction halve payloads on a 503 (multiplying the outage)
+     * or retry an over-long request verbatim (which cannot succeed at any
+     * budget). They compose instead: [compactionInnerRetryFailure] hands
+     * size-caused failures up to the halving layer and keeps transport
+     * failures in the retry loop.
+     */
+
     /**
-     * Match provider error text against the substring set iOS
-     * `isContextTooLargeError` used before T-compact-segment-retry-any-error.
+     * Match provider error text against the size-caused substring set.
      *
      * NO LONGER gates segment retry — [isSegmentRetryableError] does, for the
-     * reasons documented there. Retained only for user-facing wording, where
-     * guessing wrong costs a less specific message rather than a failed
-     * compaction.
+     * reasons documented there, and
+     * [ChatViewModel.Companion.compactionInnerRetryFailure] uses
+     * [ChatViewModel.Companion.isSizeCausedFailure] for the retry/halve
+     * decision. Retained for callers still asking the narrow question; the
+     * phrase list itself lives in exactly one place (the companion), so this
+     * and the retry decision can never drift apart.
      */
     @Suppress("unused")
-    private fun isContextTooLargeError(error: Throwable): Boolean {
-        val desc = (error.message ?: error.toString()).lowercase()
-        return desc.contains("too many tokens") ||
-            desc.contains("context length") ||
-            desc.contains("max_tokens") ||
-            desc.contains("content is too long") ||
-            desc.contains("exceeds the model") ||
-            desc.contains("request too large") ||
-            desc.contains("prompt is too long") ||
-            desc.contains("token limit") ||
-            desc.contains("context window")
-    }
+    private fun isContextTooLargeError(error: Throwable): Boolean =
+        isSizeCausedFailure(error)
 
     /**
      * Consult [ContextPolicy] before sending. Returns true to proceed. The
@@ -3550,7 +4762,11 @@ class ChatViewModel(
         // [T-context-window-live-read] Live window (entry re-resolved + group
         // contextLimitTokens folded in) — not the currentModel snapshot.
         val window = effectiveContextWindowTokens() ?: return PreSendContextAction.PROCEED
-        val policy = ContextPolicy.forContextWindow(window)
+        val policy = ContextPolicy.forContextWindow(
+            window,
+            compactHeadroomTokens = AgentBehaviorSettingsPrefs(context).load()
+                .compactThresholdTokens.takeIf { it > 0 }?.times(1_000),
+        )
         return when (policy.check(tokens, window)) {
             ContextPolicy.CheckResult.OK -> PreSendContextAction.PROCEED
 
@@ -3639,7 +4855,7 @@ class ChatViewModel(
     /** Dialog dismissed — restore the text to the composer so it isn't lost. */
     fun cancelCompactBeforeSend() {
         _showCompactBeforeSendPrompt.value = false
-        pendingSendText?.let { _inputText.value = it }
+        pendingSendText?.let { setInputText(it) }
         pendingSendText = null
     }
 
@@ -3681,7 +4897,11 @@ class ChatViewModel(
         val tokens = _lastTurnContextTokens.value
         if (tokens <= 0) return InLoopContextAction.PROCEED
         val window = effectiveContextWindowTokens() ?: return InLoopContextAction.PROCEED
-        val policy = ContextPolicy.forContextWindow(window)
+        val policy = ContextPolicy.forContextWindow(
+            window,
+            compactHeadroomTokens = AgentBehaviorSettingsPrefs(context).load()
+                .compactThresholdTokens.takeIf { it > 0 }?.times(1_000),
+        )
         return when (policy.check(tokens, window)) {
             ContextPolicy.CheckResult.OK -> InLoopContextAction.PROCEED
 
@@ -3763,30 +4983,15 @@ class ChatViewModel(
         }
 
     /**
-     * System prompt for the single-shot summarisation call. Matches iOS
-     * wording so cross-device summaries stay stylistically aligned.
+     * System prompt for the single-shot summarisation call, and the value the
+     * Settings editor shows as "the default" and restores on reset.
+     *
+     * The text itself lives in [COMPACTION_DEFAULT_SYSTEM_PROMPT]
+     * (TitlePromptLocale.kt) because the editor — not this ViewModel — is the
+     * other reader, and two copies of it is how the displayed default came to
+     * describe a prompt the model never actually received. Select the effective
+     * prompt with [effectiveCompactionSystemPrompt].
      */
-    private val compactSummarySystemPrompt: String = """
-        You are a context compaction engine. Your summary will REPLACE the original messages in the conversation context window. The agent will read your summary as past context, then proceed based on the user's NEXT message — your summary is background, not a standing work order. Write the summary in the same language the user used in the conversation.
-
-        MUST PRESERVE (never omit or shorten):
-        - All file paths, directory names, URLs, UUIDs, and identifiers — copy verbatim
-        - Commands executed and their outcomes (success/failure/output)
-        - What was requested and what was done (record as past events, not as ongoing goals)
-        - Key decisions made and their rationale
-        - Errors encountered and how they were resolved
-        - Important constraints, rules, or user preferences mentioned
-        - Any tool calls and their results that affect current state
-
-        STRUCTURE:
-        1. Start with a one-line description of what the conversation was about (use past tense — "User asked X, agent did Y", NOT "Goal: X").
-        2. Then a concise narrative of what happened, preserving technical details.
-        3. End with a "What had been done so far" section listing completed work — NOT a "todo" or "pending" list. Do not invent ongoing objectives or carry-over tasks from old turns; if the user wants to continue, they will say so in their next message.
-
-        PRIORITIZE recent context over older history — recent decisions and recent file/path references are most useful for continuity.
-
-        Do NOT translate or alter code snippets, file paths, identifiers, or error messages. Be concise but never lose information the agent needs.
-    """.trimIndent()
 
     // T203 part 2: these MUST be declared before `init { loadSession() }` below.
     // viewModelScope.launch defaults to Dispatchers.Main.immediate, which runs
@@ -3820,6 +5025,7 @@ class ChatViewModel(
 
     init {
         loadSession()
+        showPendingGoalContinuationNotice()
         // [T-session-paused-badge-active-false-positive] Drive the session-list
         // PAUSED badge directly off canResume — the authoritative "this session
         // is interrupted (tap Resume)" flag. This is the single chokepoint over
@@ -4506,6 +5712,22 @@ class ChatViewModel(
                         val isContinueReminder = parts.size == 1 &&
                             (parts.first() as? AgentContentPart.Text)?.text
                                 ?.contains("The user stopped the previous response") == true
+                        // [T-android-child-agent-completion] An app-authored
+                        // `<system-reminder>` row is not an unanswered HUMAN turn,
+                        // so it must not light the paused/Resume affordance on
+                        // reload. These rows are written by the app on the API's
+                        // `user` role (resume()'s re-entry, and the delegated-child
+                        // abnormal-end note), and MessagePartsCodec already treats
+                        // this exact prefix as "no human put content here".
+                        //
+                        // Kept separate from isContinueReminder on purpose:
+                        // resume()'s own reminder must KEEP reporting an
+                        // interruption (its turn really was cut off), and it still
+                        // does through that dedicated check.
+                        val isAppReminder = parts.size == 1 &&
+                            (parts.first() as? AgentContentPart.Text)?.text
+                                ?.trimStart()
+                                ?.startsWith(MessagePartsCodec.SYSTEM_REMINDER_PREFIX) == true
                         // Case D — a user turn with NO reply after it at all.
                         //
                         // How it is produced: send() persists the user row
@@ -4544,7 +5766,8 @@ class ChatViewModel(
                         // A cold start after a kill satisfies all three exactly
                         // because the process that was streaming no longer
                         // exists.
-                        val isUnansweredUserTurn = !allToolResults && !isContinueReminder
+                        val isUnansweredUserTurn =
+                            !allToolResults && !isContinueReminder && !isAppReminder
                         allToolResults || isContinueReminder || isUnansweredUserTurn
                     }
                     LLMMessage.Role.ASSISTANT -> {
@@ -4580,6 +5803,14 @@ class ChatViewModel(
                     Log.i(TAG, "loadSession: detected interrupted agent loop, canResume=true (lastRole=${lastEntry.role} shape=$shape)")
                 }
             }
+            // [T-android-parent-inbox-consumer] Session restore is the moment the
+            // runtime mailbox is most likely to hold something the user has never
+            // seen: a sub-agent that stopped while this conversation was closed (or
+            // while the process was dead) leaves a notification addressed to this
+            // conversation's runtime node, and nothing else would ever open it.
+            // Runs after `agentHistory` is rebuilt, so a message that has to reach
+            // the model lands on top of the restored history.
+            surfaceRuntimeInbox()
             } finally {
                 // T201: open the gate even on early `return@launch` (draft path,
                 // missing-session path) and on exception, so the init-time
@@ -4674,7 +5905,7 @@ class ChatViewModel(
         // the given dbId. Matches iOS uiIndexForAnchorRaw, which scans by
         // sourceSortOrder range; Android's equivalent is sourceDbIds.
         fun uiIdxForDbId(dbId: String): Int =
-            messages.indexOfLast { msg -> dbId in msg.sourceDbIds || msg.id == dbId }
+            messages.indexOfLast { msg -> msg.representsDbId(dbId) }
 
         if (firstKeptId == null) {
             // v2 OR v1 compactAll-shape — anchored by lcmId.
@@ -4715,7 +5946,7 @@ class ChatViewModel(
             // v1 compactBefore — anchored by firstKeptId. Divider BEFORE
             // the boundary; boundary is the first active message.
             val bIdx = messages.indexOfFirst { msg ->
-                firstKeptId in msg.sourceDbIds || msg.id == firstKeptId
+                msg.representsDbId(firstKeptId)
             }
             if (bIdx >= 0) {
                 insertIdx = bIdx
@@ -5006,9 +6237,13 @@ class ChatViewModel(
     /**
      * [T-newchat-default-model-fallback-android] Resolve and apply the default
      * model for a NEW chat when no default group produced a model. Fallback
-     * chain tiers 2→3 (tier 1, the default group, is handled by the caller
+     * chain tiers 1b→3 (tier 1, the default group, is handled by the caller
      * before this runs):
      *
+     *   1b) the explicitly configured **Primary Agent Model** — the Settings row
+     *      says it is used for main Agent tasks, and until
+     *      [ProviderRepository.newChatDefaultEntry] existed nothing on the chat
+     *      path read it, so the picker stored a value no request ever used.
      *   2) last-used model — the entry the user last actively selected / used,
      *      if it still exists, is visible, and its provider is enabled.
      *   3) newest provider's newest text-output model — the final catch-all so
@@ -5021,8 +6256,7 @@ class ChatViewModel(
      * which ignored both last-used and add-order — replaced by this chain.
      */
     private fun applyNewChatDefaultModel(): Boolean {
-        val entry = providerRepository.lastUsedVisibleEntry()
-            ?: providerRepository.newestProviderNewestTextEntry()
+        val entry = providerRepository.newChatDefaultEntry()
             ?: return false
         val instance = providerRepository.instance(entry.providerInstanceId) ?: return false
         currentModel = entry.model
@@ -5217,6 +6451,12 @@ class ChatViewModel(
     fun clearChat() {
         if (_isStreaming.value) cancelStream()
         val sid = activeSessionId
+        // [T-android-persistence-result-check] Snapshot the in-memory state the
+        // wipe is about to destroy. The UI is cleared optimistically below, so a
+        // failed DB delete used to leave the user staring at an empty chat that
+        // came back on the next reload (and a stale agentHistory disagreeing
+        // with both). On failure we put this snapshot back.
+        val messagesBeforeWipe = _messages.value
         // T-streaming-side-channel: ensure no stale stream delta survives a
         // session wipe; the messages list is about to be cleared, so any
         // pending key would be orphaned.
@@ -5250,9 +6490,36 @@ class ChatViewModel(
         // Persist: drop messages + compact markers. Files (workspace,
         // attachments, offloads) intentionally retained.
         viewModelScope.launch {
-            chatRepository.dao.deleteMessages(sid)
-            chatRepository.dao.deleteCompactMarkers(sid)
-            Log.i(TAG, "clearChat: session=$sid wiped (files preserved)")
+            // [T-android-persistence-result-check] Do NOT claim the wipe worked
+            // until the disk agrees. Messages and compact markers are two
+            // separate statements: if the first succeeds and the second throws,
+            // the session would be left half-wiped, so the failure has to be
+            // reported either way — and the in-memory state restored, since the
+            // rows it was cleared for are still there.
+            try {
+                chatRepository.dao.deleteMessages(sid)
+                chatRepository.dao.deleteCompactMarkers(sid)
+                Log.i(TAG, "clearChat: session=$sid wiped (files preserved)")
+            } catch (e: Exception) {
+                AppLogger.warning(
+                    TAG,
+                    "clearChat failed for session=$sid: ${e.javaClass.simpleName}: ${e.message} " +
+                        "— restoring in-memory state",
+                )
+                withContext(Dispatchers.Main) {
+                    _messages.value = messagesBeforeWipe
+                    _error.value = "Couldn't clear this chat — nothing was deleted."
+                }
+                // Rebuild the history from whatever actually survived, rather
+                // than leaving a cleared list paired with a populated disk.
+                runCatching {
+                    val remaining = chatRepository.loadMessages(sid)
+                    agentHistory.clear()
+                    for (entity in remaining) {
+                        agentHistory.add(entity.toLLMMessage())
+                    }
+                }
+            }
         }
     }
 
@@ -5399,9 +6666,12 @@ class ChatViewModel(
         // target row onward) and preserves the earlier turns.
         val precededByUserOnly = asstIdx == 0 || messages[asstIdx - 1].role != "assistant"
         if (!hasPrecedingContent && precededByUserOnly) {
+            // [T-android-human-turn-count-parity] Use the shared human-turn rule:
+            // an image-only turn has blank content but is still a human turn, and
+            // asking for text returned null here so the rerun refused to start.
             val userMsg = (asstIdx - 1 downTo 0).asSequence()
                 .map { messages[it] }
-                .firstOrNull { it.role == "user" && it.content.isNotBlank() }
+                .firstOrNull { it.countsAsHumanTurn() }
                 ?: return false
             Log.i(TAG, "rerunFromToolBlock degenerate → retryFromMessage(precedingUser) tuId=${targetToolUseId.take(12)}")
             retryFromMessage(userMsg.id)
@@ -5473,6 +6743,12 @@ class ChatViewModel(
                 val keptArr = org.json.JSONArray()
                 for (i in 0 until cutPartIdx) keptArr.put(srcArr.get(i))
 
+                // [T-android-persistence-result-check] Each write is verified
+                // before the UI is trimmed to match it. The cut and the parts
+                // rewrite are two steps; if either silently no-ops, the UI would
+                // show the block gone while the disk still had it, so the tool
+                // block came back on reload. Abort on the first failure and leave
+                // the transcript untouched.
                 if (cutPartIdx == 0) {
                     // Nothing precedes the target in its DB row — trimming would
                     // leave an empty assistant row. Drop the whole row instead
@@ -5493,7 +6769,20 @@ class ChatViewModel(
                         keptArr.toString(),
                         MessagePartsCodec.provenanceOf(row.partsJson),
                     )
-                    chatRepository.updateMessageParts(row.id, keptPartsJson)
+                    val updated = chatRepository.updateMessageParts(row.id, keptPartsJson)
+                    if (updated <= 0) {
+                        // The row vanished between the load and the write.
+                        // Trimmed UI plus an untouched row is exactly the drift
+                        // this check exists to prevent.
+                        Log.w(
+                            TAG,
+                            "rerunFromToolBlock: parts rewrite matched no row " +
+                                "(id=${row.id.take(8)}) — aborting without trimming the UI",
+                        )
+                        // `finally` below resets _isStreaming (streamLaunched is
+                        // still false), same as the anchor-not-found abort above.
+                        return@launch
+                    }
                     Log.i(TAG, "rerunFromToolBlock sub-message cut tuId=${targetToolUseId.take(12)} keepCount=${row.sortOrder + 1} partIdx=$cutPartIdx trimmedRow=${row.id.take(8)}")
                 }
 
@@ -5574,7 +6863,10 @@ class ChatViewModel(
         val message = messages[index]
         // [T-android-tool-autoscroll] Start-of-turn snap — see resume().
         _forceScrollToBottom.tryEmit(Unit)
-        if (message.role != "user" || message.content.isBlank()) return
+        // [T-android-human-turn-count-parity] An image-only turn has a BLANK
+        // content string (its content lives in imageUris / attachmentNames), so
+        // a text-only guard silently refused to retry it. Use the shared rule.
+        if (message.role != "user" || !message.countsAsHumanTurn()) return
 
         val initialProvider = currentProvider
         if (initialProvider == null) {
@@ -5635,30 +6927,22 @@ class ChatViewModel(
             // Find the DB sort_order cutoff for this user message.
             // UI visible user messages are the N-th user msg with actual text content.
             // Count which visible user message this is (0-based).
-            val visibleUserIndex = messages.subList(0, index + 1).count { it.role == "user" } - 1
+            // [T-android-human-turn-count-parity] Both sides now share ONE
+            // predicate (see MessagePartsCodec.hasHumanTurnContent). They used to
+            // differ: the UI counted every role=="user" row while the DB side
+            // additionally demanded a text part, so an image-only turn (which
+            // persists no text part) pushed the UI index past every match — the
+            // loop found nothing, left cutoffSortOrder==-1 and the DB truncation
+            // below was skipped entirely, keeping the history the user had just
+            // rewound past.
+            val visibleUserIndex = messages.subList(0, index + 1).count { it.countsAsHumanTurn() } - 1
             val dbMessages = chatRepository.loadMessages(sid)
-            // Walk DB rows, counting visible user messages (those with non-toolResult text)
+            // Walk DB rows, counting human turns with the shared predicate.
             var visibleUserCount = 0
             var cutoffSortOrder = -1
             for (entity in dbMessages) {
                 if (entity.role == "user") {
-                    // Check if this user message has visible text (not toolResult-only).
-                    // [T-ios-retry-anchor-synthetic-user] Synthetic user rows the
-                    // agent loop persists WITHOUT a UI bubble — resume()'s
-                    // stop-continue "<system-reminder>" message — must not count,
-                    // or the cutoff anchors one user message too early and the
-                    // retried bubble (plus the whole last turn) is silently
-                    // dropped from the rebuilt history (mirrors the iOS fix).
-                    val hasText = try {
-                        val arr = org.json.JSONArray(entity.partsJson)
-                        (0 until arr.length()).any { i ->
-                            val o = arr.getJSONObject(i)
-                            val v = o.optString("value", "")
-                            o.optString("type") == "text" && v.isNotBlank() &&
-                                !v.trimStart().startsWith("<system-reminder>")
-                        }
-                    } catch (_: Exception) { true }
-                    if (hasText) {
+                    if (MessagePartsCodec.hasHumanTurnContent(entity.partsJson)) {
                         if (visibleUserCount == visibleUserIndex) {
                             cutoffSortOrder = entity.sortOrder + 1
                             break
@@ -5667,14 +6951,61 @@ class ChatViewModel(
                     }
                 }
             }
-            if (cutoffSortOrder >= 0) {
-                chatRepository.deleteMessagesAfter(sid, cutoffSortOrder)
+            // [T-android-persistence-result-check] The rewind MUST be verified
+            // before anything downstream trusts it.
+            //
+            // This used to skip the DB cut silently when the cutoff could not be
+            // resolved (`if (cutoffSortOrder >= 0)`), then rebuild agentHistory
+            // from the UNCHANGED DB and start the rerun. Two visible failures
+            // followed: the model was handed the very turns the user had just
+            // rewound past, and every "deleted" message came back on the next
+            // reload — the UI said the history was trimmed while the disk still
+            // held it. BOTH paths now abort instead of continuing on a state we
+            // know is wrong.
+            if (cutoffSortOrder < 0) {
+                AppLogger.warning(
+                    TAG_STREAM,
+                    "retry aborted: no DB cutoff for visibleUserIndex=$visibleUserIndex " +
+                        "(sid=$activeSessionId) — UI restored, rerun not started",
+                )
+                withContext(Dispatchers.Main) {
+                    _messages.value = messages
+                    _error.value = "Couldn't locate that turn in history — nothing was changed."
+                    _isStreaming.value = false
+                }
+                return@launch
             }
+            val deletedRows = chatRepository.deleteMessagesAfter(sid, cutoffSortOrder)
+            AppLogger.info(
+                TAG_STREAM,
+                "retry DB cut: keepCount=$cutoffSortOrder deletedRows=$deletedRows (sid=$activeSessionId)",
+            )
 
             // Rebuild agentHistory from remaining DB messages
             agentHistory.clear()
             toolLoopDetector.reset()
             val remaining = chatRepository.loadMessages(sid)
+            // The cut must actually be reflected on disk before the model is
+            // allowed to run: if rows we believed deleted are still there, the
+            // rerun would be built on the old history. Verify by the row we
+            // anchored on — it must be the last surviving human turn.
+            val lastHuman = remaining.lastOrNull {
+                it.role == "user" && MessagePartsCodec.hasHumanTurnContent(it.partsJson)
+            }
+            if (lastHuman == null || lastHuman.sortOrder >= cutoffSortOrder) {
+                AppLogger.warning(
+                    TAG_STREAM,
+                    "retry aborted: DB cut not reflected (deletedRows=$deletedRows, " +
+                        "lastHumanSortOrder=${lastHuman?.sortOrder}, keepCount=$cutoffSortOrder, " +
+                        "sid=$activeSessionId) — UI restored, rerun not started",
+                )
+                withContext(Dispatchers.Main) {
+                    _messages.value = messages
+                    _error.value = "History couldn't be rewound — nothing was sent. Try again."
+                    _isStreaming.value = false
+                }
+                return@launch
+            }
             for (entity in remaining) {
                 agentHistory.add(entity.toLLMMessage())
             }
@@ -5750,8 +7081,32 @@ class ChatViewModel(
         viewModelScope.launch {
             val target = messages[index]
             val cutoffSortOrder = resolveDeleteCutoffSortOrder(sid, messages, index, target)
-            if (cutoffSortOrder >= 0) {
+            // [T-android-persistence-result-check] Verify the cut instead of
+            // assuming it. The UI was already truncated above, so a silent
+            // failure here means the user sees the messages gone while the disk
+            // still holds them — they reappear on the next reload, and the next
+            // turn is rebuilt from a history that still contains them.
+            if (cutoffSortOrder < 0) {
+                AppLogger.warning(
+                    TAG,
+                    "deleteFromMessage aborted: no cutoff for id=${messageId.take(8)} " +
+                        "(sid=$sid) — UI restored, nothing deleted",
+                )
+                withContext(Dispatchers.Main) {
+                    _messages.value = messages
+                    _error.value = "Couldn't locate that message in history — nothing was deleted."
+                }
+                return@launch
+            }
+            val deletedRows = try {
                 chatRepository.deleteMessagesAfter(sid, cutoffSortOrder)
+            } catch (e: Exception) {
+                AppLogger.warning(TAG, "deleteFromMessage DB delete failed: ${e.message}")
+                withContext(Dispatchers.Main) {
+                    _messages.value = messages
+                    _error.value = "Couldn't delete those messages — they're still here."
+                }
+                return@launch
             }
 
             // Rebuild agentHistory from what survived, so the next turn is
@@ -5759,14 +7114,42 @@ class ChatViewModel(
             agentHistory.clear()
             toolLoopDetector.reset()
             val remaining = chatRepository.loadMessages(sid)
+            // The truncation must be visible on disk. If the row we cut at is
+            // still there, the DB and the UI disagree — restore the UI rather
+            // than leaving the two permanently out of sync.
+            if (remaining.any { it.sortOrder >= cutoffSortOrder }) {
+                AppLogger.warning(
+                    TAG,
+                    "deleteFromMessage: cut not reflected (deletedRows=$deletedRows, " +
+                        "keepCount=$cutoffSortOrder, sid=$sid) — UI restored",
+                )
+                withContext(Dispatchers.Main) {
+                    _messages.value = messages
+                    _error.value = "Couldn't delete those messages — they're still here."
+                }
+                return@launch
+            }
             for (entity in remaining) {
                 agentHistory.add(entity.toLLMMessage())
             }
             // Refresh the session's last-message preview; otherwise the
             // session list keeps quoting a message that no longer exists.
             // An empty remainder clears it rather than leaving the stale text.
-            runCatching {
+            //
+            // [T-android-persistence-result-check] The deletion itself has
+            // already succeeded, so a failure here must NOT be surfaced as a
+            // deletion error (that would be a lie in the other direction). It
+            // must not be SILENT either: the list row then keeps quoting the
+            // deleted message with nothing in the log to explain it. Record it.
+            try {
                 chatRepository.updateSessionPreview(sid, remaining.lastOrNull()?.partsJson ?: "[]")
+            } catch (e: Exception) {
+                AppLogger.warning(
+                    TAG,
+                    "deleteFromMessage: messages deleted but the session preview could not be " +
+                        "refreshed (sid=$sid, ${e.javaClass.simpleName}: ${e.message}) — the " +
+                        "session list may keep quoting the deleted message until the next update",
+                )
             }
             AppLogger.info(
                 TAG,
@@ -5802,23 +7185,16 @@ class ChatViewModel(
         // ordinal — the last visible user message at or before `index`. What
         // differs is only whether the cut lands on that row or just after it,
         // resolved at the return below.
-        val visibleUserIndex = messages.subList(0, index + 1).count { it.role == "user" } - 1
+        val visibleUserIndex = messages.subList(0, index + 1).count { it.countsAsHumanTurn() } - 1
         // No user turn at or before the target (e.g. deleting from a leading
         // assistant/system row): everything goes.
         if (visibleUserIndex < 0) return 0
         var visibleUserCount = 0
         for (entity in dbMessages) {
             if (entity.role != "user") continue
-            val hasText = try {
-                val arr = org.json.JSONArray(entity.partsJson)
-                (0 until arr.length()).any { i ->
-                    val o = arr.getJSONObject(i)
-                    val v = o.optString("value", "")
-                    o.optString("type") == "text" && v.isNotBlank() &&
-                        !v.trimStart().startsWith("<system-reminder>")
-                }
-            } catch (_: Exception) { true }
-            if (!hasText) continue
+            // [T-android-human-turn-count-parity] Shared predicate with the UI
+            // count above — see MessagePartsCodec.hasHumanTurnContent.
+            if (!MessagePartsCodec.hasHumanTurnContent(entity.partsJson)) continue
             if (visibleUserCount == visibleUserIndex) {
                 // Target is that user message → cut AT it (removing it).
                 // Target is a later assistant reply → cut just AFTER it
@@ -5938,6 +7314,13 @@ class ChatViewModel(
             // XIN 2026-06-12 log (20:22:26 / 20:23:25).
             if (streamJob === coroutineContext[Job]) {
                 AppLogger.info(TAG_STREAM, "$label _isStreaming=false (about to set)")
+                // [T-android-auto-retry-progress] A cancel can land while the
+                // turn is inside its retry handler (between "attempt N
+                // scheduled" and "backoff wait entered"). Nothing else clears
+                // the row on that path, so take it down with the turn itself —
+                // and only for the current job, so an orphaned cancelled job
+                // cannot wipe the live turn's retry row.
+                resetAutoRetryState()
                 _isStreaming.value = false
             } else {
                 AppLogger.info(TAG_STREAM, "$label _isStreaming SKIPPED (stale job; current=${streamJob?.hashCode()} this=${coroutineContext[Job]?.hashCode()})")
@@ -6081,7 +7464,7 @@ class ChatViewModel(
                         isQueued = true,
                         queuedPromptId = updatedPrompt.id,
                         queuedDelivery = updatedPrompt.delivery,
-                        provenance = MessageProvenance.TOOL_INJECTION,
+                        provenance = MessageProvenance.MANUAL_USER,
                     )
                     synchronized(queuedPromptLock) {
                         queuedPromptLedger.restoreEdited(updatedPrompt.id)
@@ -6098,9 +7481,24 @@ class ChatViewModel(
                         delivery = updatedPrompt.delivery,
                     )
                 } else {
-                    val updated = chatRepository.replaceUserMessageInPlace(editingId, partsJson)
-                    if (!updated) throw IllegalStateException("user message row not found: $editingId")
-                    val visible = ChatMessage(
+                    // [T-android-persistence-result-check] Build the bubble from
+                    // what was PERSISTED, not from the draft we sent.
+                    //
+                    // `replaceUserMessageInPlace` caps oversized payloads, so an
+                    // edit that exceeded the cap showed the user their full text
+                    // while the row held the truncated version — the message
+                    // visibly shrank on the next reload. Re-reading the row and
+                    // running it through the SAME conversion a reload uses makes
+                    // "what you see" provably equal "what a relaunch shows",
+                    // instead of two builders that have to be kept in step.
+                    val persistedParts = chatRepository.replaceUserMessageInPlace(editingId, partsJson)
+                        ?: throw IllegalStateException("user message row not found: $editingId")
+                    val storedEntity = chatRepository.loadMessages(sid).firstOrNull { it.id == editingId }
+                    val visible = storedEntity?.let { entity ->
+                        listOf(entity).toChatMessages().firstOrNull()
+                    } ?: ChatMessage(
+                        // Row vanished between the write and the re-read; fall
+                        // back to the draft so the user still sees their edit.
                         id = editingId,
                         role = "user",
                         content = visibleText,
@@ -6111,10 +7509,11 @@ class ChatViewModel(
                     )
                     _messages.value = _messages.value.map { if (it.id == editingId) visible else it }
                     agentHistory.removeAll { it.dbMessageId == editingId }
-                    chatRepository.loadMessages(sid).firstOrNull { it.id == editingId }?.let {
-                        agentHistory.add(it.toLLMMessage())
-                    }
-                    chatRepository.updateSessionPreview(sid, partsJson)
+                    storedEntity?.let { agentHistory.add(it.toLLMMessage()) }
+                    // The preview must quote the persisted payload too — passing
+                    // the uncapped draft would make the session list disagree
+                    // with the message it is describing.
+                    chatRepository.updateSessionPreview(sid, persistedParts)
                     editAuditLog.record("EDIT_COMMIT_IN_PLACE", sid, editingId)
                 }
                 editDraftState.commitEditing()
@@ -6187,12 +7586,37 @@ class ChatViewModel(
             isQueued = true,
             queuedPromptId = prompt.id,
             queuedDelivery = prompt.delivery,
-            provenance = MessageProvenance.TOOL_INJECTION,
+            provenance = MessageProvenance.MANUAL_USER,
         )
         _messages.value = _messages.value + chatMsg
         clearAttachments()
         editAuditLog.record("QUEUE_ENQUEUED", activeSessionId, chatMsg.id, prompt.id, delivery)
         Log.i(TAG, "Enqueued ${delivery.name} prompt (${trimmed.length}ch, ${pendingAttachments.size} attachments), queue=${_promptQueue.value.size}")
+    }
+
+    /**
+     * Republish the queued bubbles' [ChatMessage.isQueued] flag from the ledger.
+     *
+     * `isQueued` is what the withdraw affordances hang off (撤回并编辑 / 撤回, and the
+     * red ✕ on the bubble), so it must mean exactly "still ENQUEUED — the model has
+     * not read it yet". Hand-setting it at each transition let a CLAIMED prompt keep
+     * the buttons: the tap then hit the ledger's refusal and the UI said nothing.
+     * The verdict comes from [QueuedPromptUiPolicy] only; nothing here re-derives it.
+     *
+     * Caller holds [queuedPromptLock], so the ledger read cannot interleave with a claim.
+     */
+    private fun mirrorQueuedWithdrawable(
+        messages: List<ChatMessage>,
+        promptIds: Set<String>,
+    ): List<ChatMessage> {
+        if (promptIds.isEmpty()) return messages
+        return messages.map { message ->
+            if (message.queuedPromptId == null || message.queuedPromptId !in promptIds) message
+            else {
+                val withdrawable = QueuedPromptUiPolicy.isWithdrawable(queuedPromptLedger, message.queuedPromptId)
+                if (message.isQueued == withdrawable) message else message.copy(isQueued = withdrawable)
+            }
+        }
     }
 
     private fun claimQueued(delivery: QueuedPromptDelivery): List<QueuedPrompt> = synchronized(queuedPromptLock) {
@@ -6202,6 +7626,9 @@ class ChatViewModel(
         if (claimed.isNotEmpty()) {
             val ids = claimed.mapTo(HashSet()) { it.id }
             _promptQueue.value = _promptQueue.value.filterNot { it.id in ids }
+            // Claimed == the model is reading it from here on: take the withdraw
+            // affordances down with the claim, in the same lock as the ledger write.
+            _messages.value = mirrorQueuedWithdrawable(_messages.value, ids)
         }
         claimed
     }
@@ -6213,10 +7640,9 @@ class ChatViewModel(
             if (restored.isNotEmpty()) {
                 val existing = _promptQueue.value.mapTo(HashSet()) { it.id }
                 _promptQueue.value = restored.filterNot { it.id in existing } + _promptQueue.value
+                // Rolled back to ENQUEUED, so the withdraw affordances come back with it.
                 val ids = restored.mapTo(HashSet()) { it.id }
-                _messages.value = _messages.value.map { message ->
-                    if (message.queuedPromptId in ids) message.copy(isQueued = true) else message
-                }
+                _messages.value = mirrorQueuedWithdrawable(_messages.value, ids)
             }
         }
     }
@@ -6226,9 +7652,9 @@ class ChatViewModel(
         synchronized(queuedPromptLock) {
             prompts.forEach { queuedPromptLedger.consume(it.id) }
             val ids = prompts.mapTo(HashSet()) { it.id }
-            _messages.value = _messages.value.map { message ->
-                if (message.queuedPromptId in ids) message.copy(isQueued = false, queuedPromptId = null)
-                else message
+            val unqueued = mirrorQueuedWithdrawable(_messages.value, ids)
+            _messages.value = unqueued.map { message ->
+                if (message.queuedPromptId in ids) message.copy(queuedPromptId = null) else message
             }
         }
     }
@@ -6378,11 +7804,18 @@ class ChatViewModel(
             prepared.attachedFilesXml,
             bodyPartsJson = queuedPaste?.partsJson,
         )
+        // [T-android-queued-prompt-is-human] A queued prompt is text the HUMAN
+        // typed — it is a manual user turn, not a synthetic injection. Tagging it
+        // TOOL_INJECTION made `isManualHumanUser()` false for every queued turn,
+        // so the 4-button human-message navigation walked straight past them and
+        // the app layer mis-classed them (R37's three message classes).
+        // TOOL_INJECTION stays reserved for rows the app synthesises without a
+        // human turn: tool results and `<system-reminder>` resume injections.
         val userEntity = chatRepository.appendMessage(
             sid,
             "user",
             userPartsJson,
-            provenance = MessageProvenance.TOOL_INJECTION,
+            provenance = MessageProvenance.MANUAL_USER,
         )
         agentHistory.add(
             LLMMessage(
@@ -6433,7 +7866,7 @@ class ChatViewModel(
                 imageUris = prepared.imageUris,
                 attachmentNames = prepared.attachmentNames,
                 attachmentUris = prepared.nonImageUris,
-                 provenance = MessageProvenance.TOOL_INJECTION,
+                 provenance = MessageProvenance.MANUAL_USER,
             )
             val nextAssistantMsg = ChatMessage(
                 id = newAssistantId,
@@ -6524,7 +7957,9 @@ class ChatViewModel(
                 prepared.attachedFilesXml,
                 bodyPartsJson = drainPaste?.partsJson,
             )
-            chatRepository.appendMessage(sid, "user", userPartsJson, provenance = MessageProvenance.TOOL_INJECTION)
+            // [T-android-queued-prompt-is-human] Drained queue text is the human's
+            // own prompt — a manual user turn (see injectQueuedPromptsAsNewTurn).
+            chatRepository.appendMessage(sid, "user", userPartsJson, provenance = MessageProvenance.MANUAL_USER)
 
             agentHistory.add(LLMMessage(
                 role = LLMMessage.Role.USER,
@@ -6610,7 +8045,10 @@ class ChatViewModel(
                 PreSendContextAction.PROCEED -> {}
                 PreSendContextAction.COMPACT_THEN_SEND -> {
                     pendingSendText = text
-                    _inputText.value = ""
+                    // clearInputTextForSend, not a bare field write: the draft model has to
+                    // keep matching the composer or `cancelCompactBeforeSend`'s restore
+                    // (and any later edit-mode round trip) works off a stale snapshot.
+                    clearInputTextForSend()
                     compactAndSendPending()
                     return
                 }
@@ -6618,7 +8056,7 @@ class ChatViewModel(
                     // Park the text on the VM (not the composer) so the dialog
                     // owns it; cancelCompactBeforeSend puts it back.
                     pendingSendText = text
-                    _inputText.value = ""
+                    clearInputTextForSend()
                     _showCompactBeforeSendPrompt.value = true
                     return
                 }
@@ -6643,6 +8081,7 @@ class ChatViewModel(
             return
         }
         var provider: LLMProvider = initialProvider
+        consumePendingGoalContinuation()
 
         _error.value = null
 
@@ -6874,6 +8313,20 @@ class ChatViewModel(
                 if (streamJob === coroutineContext[Job]) {
                     AppLogger.info(TAG_STREAM, "send _isStreaming=false (about to set)")
                     _isStreaming.value = false
+                    // [T-android-goal-auto-continuation] The run is over and the
+                    // active-stop state (if any) has already been written by the
+                    // `setInactive` above. This is the main trigger point for
+                    // `/goal`'s unattended auto-advance: without it the saved
+                    // continuation prompt was only ever consumed by the *next*
+                    // real user send, i.e. the mode could not advance itself at
+                    // all.
+                    //
+                    // A cancelled job (the user pressed stop) must not continue
+                    // the goal: that would restart the very run that was just
+                    // cancelled.
+                    if (coroutineContext[Job]?.isCancelled != true) {
+                        scheduleGoalAutoContinuation(fromGoalRun = false)
+                    }
                 } else {
                     AppLogger.info(TAG_STREAM, "send _isStreaming SKIPPED (stale job)")
                 }
@@ -6938,19 +8391,20 @@ class ChatViewModel(
         }
     }
 
-    /**
-     * Show a transient error on the last assistant message while keeping isStreaming=true
-     * so the "thinking" indicator and streaming UI stay intact during auto-retry countdowns.
-     * Mirrors iOS streamWithAutoRetry: `chatMessage?.error = desc` without dropping the loop.
+    /*
+     * [T-android-auto-retry-progress] The transient "your request failed, a
+     * retry is on its way" line used to live here, written onto the last
+     * assistant message's `error` field (which is what the red
+     * `InlineErrorBanner` renders) with hardcoded English text and no visible
+     * progress. It was removed in favour of `AutoRetryIndicator`, which is
+     * driven by `autoRetryAttempt` / `autoRetryCountdown` /
+     * `autoRetryMaxAttempts`, localized in `strings.xml`, and ticks once a
+     * second — so the wait is legible while it happens, and a Chinese session
+     * no longer reads English.
+     *
+     * The terminal path is unchanged: `setInlineError` still stamps the final,
+     * non-retryable failure (with its Retry action) onto the message.
      */
-    private fun setTransientInlineError(errorText: String) {
-        val msgs = _messages.value.toMutableList()
-        val lastAssistantIdx = msgs.indexOfLast { it.role == "assistant" }
-        if (lastAssistantIdx < 0) return
-        val msg = msgs[lastAssistantIdx]
-        msgs[lastAssistantIdx] = msg.copy(error = errorText)
-        _messages.value = msgs
-    }
 
     /** Clear any inline error on the last assistant message (used after successful retry). */
     private fun clearInlineError() {
@@ -8153,9 +9607,31 @@ class ChatViewModel(
                     // [_compactSummary] is prepended as a `<context-summary>`
                     // user message. Falls through to the raw agentHistory when
                     // no compact has happened, so the common path stays zero-copy.
+                    // [T-android-model-prompt-fragments] Both per-model-family
+                    // fragments (capability + agent behaviour) are composed HERE,
+                    // from the fragment-free `systemPrompt` base and the model of
+                    // the provider actually being called. This single site is
+                    // deliberately the only one, for two reasons:
+                    //  1. The base is fragment-free by construction, so
+                    //     recomposing each turn is idempotent — a fallback that
+                    //     swaps `currentProvider` (below) yields the NEW model's
+                    //     fragments, and never stacks a second copy or leaves the
+                    //     old model's hint in place. Before this, Android did
+                    //     neither: `systemPrompt` is a val parameter and was
+                    //     passed through untouched even after the provider swap,
+                    //     while `capabilityPromptFragment()` /
+                    //     `agentBehaviorPromptFragment()` had no production
+                    //     caller at all.
+                    //  2. `buildSystemPrompt()` owns the cache-stable head and
+                    //     its per-request "Runtime context" tail; composing at
+                    //     the request site appends AFTER all of it, so the head
+                    //     stays byte-stable and a model switch only changes the
+                    //     tail. Mirrors iOS AIChatViewModel.swift:4786-4793
+                    //     (first request) and :5266-5272 (after a switch).
+                    val requestSystemPrompt = systemPromptWithModelFragments(systemPrompt, currentProvider.model)
                     currentProvider.streamMessage(
                         applyRequestImageBudget(effectiveAgentHistory()),
-                        systemPrompt, dynamicMaxTokens(currentProvider, lastContextTokens),
+                        requestSystemPrompt, dynamicMaxTokens(currentProvider, lastContextTokens),
                         tools = agentTools,
                         thinkingLevel = if (currentModelSupportsReasoning) _thinkingLevel.value else ThinkingLevel.OFF,
                     ).collect { chunk ->
@@ -8528,10 +10004,7 @@ class ChatViewModel(
                     lastOtherToolInputMs = 0L
                     collectDone = true
                     // Stream completed without error — clear any lingering retry UI state.
-                    if (_autoRetryAttempt.value != 0 || _autoRetryCountdown.value != 0) {
-                        _autoRetryAttempt.value = 0
-                        _autoRetryCountdown.value = 0
-                    }
+                    resetAutoRetryState()
                     } finally {
                         // [T-STALL-DIAG] Always stop the first-chunk watchdog —
                         // success, error, or cancellation — so it can never
@@ -8555,28 +10028,14 @@ class ChatViewModel(
                         ?.toIntOrNull()
                     val is5xx = statusCode in 500..599
                     val retrySettings = AgentBehaviorSettingsPrefs(context).load()
-                    val retryPolicy = AgentRetryPolicy(
-                        AgentRuntimeConfig(
-                            maxAttempts = if (retrySettings.autoRetryEnabled) {
-                                retrySettings.maxRetryAttempts
-                            } else {
-                                0
-                            },
-                            initialRetryDelayMillis = 1_000L,
-                            maxRetryDelayMillis = 30_000L,
-                            backoffMultiplier = 1.2,
-                            jitterRatio = 0.2,
-                        ),
-                    ) { kotlin.random.Random.nextDouble(-1.0, 1.0) }
-                    val failure = RuntimeFailure(
-                        code = actual.javaClass.simpleName,
-                        message = actual.message ?: providerDetail.ifBlank { "provider failure" },
-                        retryable = actual is com.openminis.app.data.model.LLMError.NetworkError ||
-                            actual is com.openminis.app.data.model.LLMError.TransientError ||
-                            is5xx || isRateLimit,
-                        statusCode = statusCode,
-                        networkError = actual is com.openminis.app.data.model.LLMError.NetworkError,
-                    )
+                    // [T-android-retry-governs-title-and-compaction] ONE
+                    // settings → policy mapping, shared by all three governed
+                    // call sites (this loop, title generation, compaction).
+                    // Do not build a second AgentRuntimeConfig/policy by hand
+                    // here again: a second copy is free to drift, and then the
+                    // user's retry slider governs some paths and not others.
+                    val retryPolicy = agentRetryPolicyFromSettings(retrySettings)
+                    val failure = runtimeFailureFor(actual)
                     val retryDecision = retryPolicy.decide(retryAttempt + 1, failure)
                     // Auto-retry transient/network/rate-limit/status failures on the
                     // same provider before considering fallback. The policy also
@@ -8592,10 +10051,14 @@ class ChatViewModel(
                                 "in ${delayMillis}ms: $errDesc",
                         )
                         withContext(Dispatchers.Main) {
+                            // [T-android-auto-retry-progress] Publish the wait so
+                            // the chat can render it (localized, with a live
+                            // countdown). This replaces the old hardcoded
+                            // English line pushed onto the message's `error`
+                            // field, which read as a failure sticker rather
+                            // than "an attempt is on its way".
                             _autoRetryAttempt.value = retryAttempt
-                            setTransientInlineError(
-                                "$errDesc — retrying ($retryAttempt/${retrySettings.maxRetryAttempts})…",
-                            )
+                            _autoRetryMaxAttempts.value = retrySettings.maxRetryAttempts
                         }
                         try {
                             var remainingMillis = delayMillis
@@ -8607,7 +10070,10 @@ class ChatViewModel(
                                 remainingMillis -= slice
                             }
                         } finally {
-                            _autoRetryCountdown.value = 0
+                            // Wait over (or cancelled): the attempt about to
+                            // stream is ordinary streaming again, so take the
+                            // retry row down before `continue`.
+                            resetAutoRetryState()
                         }
                         // Clear inline error so the retry attempt can start cleanly.
                         withContext(Dispatchers.Main) {
@@ -8655,8 +10121,7 @@ class ChatViewModel(
                         continue  // retry on same provider
                     }
                     // Retries exhausted or non-retryable — proceed to fallback / throw.
-                    _autoRetryAttempt.value = 0
-                    _autoRetryCountdown.value = 0
+                    resetAutoRetryState()
                     // [T-android-timeout-while-running] Clear any transient
                     // inline error from the prior retry attempts before we
                     // either fall back (loop continues with a new provider)
@@ -8842,7 +10307,14 @@ class ChatViewModel(
                 }
                 val turnParts = buildTurnParts(allToolBlocks, turnStartBlockIndex, toolInputMap)
                 val blockMeta = allToolBlocks.filter { it.kind == "tool_use" }.associateBy { it.id }
-                persistAssistantTurn(turnParts, lastUsage, turnReasoningContent, blockMeta)
+                // [T-android-thinking-level-persist] `turnThinkingLevel` was
+                // captured when THIS bubble was created (see its KDoc below), so
+                // the row records the level that produced it even if the user
+                // moved the picker while the turn was still running.
+                persistAssistantTurn(
+                    turnParts, lastUsage, turnReasoningContent, blockMeta,
+                    thinkingLevel = turnThinkingLevel,
+                )
                 // [T-error-persist-android] Empty-response hint: the model ended a
                 // turn (finish=stop/end_turn) with no visible text anywhere in the
                 // reply and no tool blocks — the user just sees a blank bubble.
@@ -8850,8 +10322,20 @@ class ChatViewModel(
                 // compaction; otherwise suggest retry/switch. setInlineError
                 // attaches + persists onto the (empty) assistant row so the hint
                 // survives a reload too.
+                // [T-android-human-turn-count-parity] `hasVisibleContent` must
+                // predict what `buildTurnParts` will actually persist, and the two
+                // disagreed on a nameless tool_use: `buildTurnParts` SKIPS a
+                // tool_use whose `toolName` is blank, while this test counted
+                // every `kind == "tool_use"` block. A turn containing only such a
+                // block therefore looked like it had content, so the empty-reply
+                // hint / dropped-stream handling was skipped even though nothing
+                // was persisted — the user got a blank bubble with no explanation.
+                // Require a usable tool name, matching buildTurnParts exactly.
                 val hasVisibleContent = accumulatedText.isNotBlank() ||
-                    allToolBlocks.any { it.kind == "tool_use" || (it.kind == "text" && it.content.isNotBlank()) }
+                    allToolBlocks.any {
+                        (it.kind == "tool_use" && it.toolName.isNotBlank()) ||
+                            (it.kind == "text" && it.content.isNotBlank())
+                    }
 
                 // [T-android-silent-stream-drop] A turn's stopReason comes ONLY
                 // from the SSE terminal event, which always carries a concrete
@@ -9296,7 +10780,12 @@ class ChatViewModel(
             // assistant entry — compact-marker boundary resolution depends on it.
             val turnParts = buildTurnParts(allToolBlocks, turnStartBlockIndex, toolInputMap)
             val blockMeta = allToolBlocks.filter { it.kind == "tool_use" }.associateBy { it.id }
-            val assistantDbId = persistAssistantTurn(turnParts, lastUsage, turnReasoningContent, blockMeta)
+            // [T-android-thinking-level-persist] Same `turnThinkingLevel` the
+            // bubble was created with — see persistAssistantTurn's KDoc.
+            val assistantDbId = persistAssistantTurn(
+                turnParts, lastUsage, turnReasoningContent, blockMeta,
+                thinkingLevel = turnThinkingLevel,
+            )
             if (assistantDbId != null) {
                 val lastIdx = agentHistory.indexOfLast { it.role == LLMMessage.Role.ASSISTANT && it.dbMessageId == null }
                 if (lastIdx >= 0) {
@@ -9730,12 +11219,28 @@ class ChatViewModel(
             "browser_use" -> executeBrowserUseTool(argsJson)
             BrowserDevToolsTools.TOOL_NAME -> executeBrowserDevToolsTool(argsJson)
             "stop_descendant" -> executeStopDescendantTool(argsJson)
+            "communication_query" -> executeCommunicationQueryTool(argsJson)
+            "communication_detail" -> executeCommunicationDetailTool(argsJson)
+            "goal_complete" -> {
+                val transition = goalRuntime.onToolCall("goal_complete", System.currentTimeMillis())
+                if (transition.current.status == com.openminis.app.feature.runtime.GoalStatus.COMPLETED) {
+                    persistGoalSnapshot()
+                }
+                if (!transition.accepted || transition.current.status != com.openminis.app.feature.runtime.GoalStatus.COMPLETED) {
+                    ToolExecutionResult(transition.reason ?: "Goal is not active", false, toolTitle = toolTitle)
+                } else {
+                    ToolExecutionResult("Goal completed: ${transition.current.objective ?: ""}", true, toolTitle = toolTitle)
+                }
+            }
             "delete_subtree" -> executeDeleteSubtreeTool(argsJson)
-            "web_search" -> executeWebSearchTool(argsJson)
-            "web_fetch" -> executeWebFetchTool(argsJson)
             "memory_write" -> executeMemoryWriteTool(argsJson)
             "memory_get" -> executeMemoryGetTool(argsJson)
-            else -> ToolExecutionResult("Unknown tool: $name", false)
+            // [T-android-child-agent-tools] Tools whose only dependencies are a
+            // Context, the session id and the process-wide runtime coordinator
+            // live in [AgentToolExecutor] so a delegated child agent (which has
+            // no chat-UI scope) runs the exact same code instead of a copy.
+            else -> portableToolExecutor.execute(name, argsJson, activeSessionId, runtimeCoordinator)
+                ?: ToolExecutionResult("Unknown tool: $name", false)
         }
     }
 
@@ -10062,49 +11567,6 @@ class ChatViewModel(
         }
     }
 
-    private suspend fun executeWebSearchTool(argsJson: String): ToolExecutionResult {
-        val args = runCatching { JSONObject(argsJson) }.getOrNull()
-            ?: return ToolExecutionResult("{\"ok\":false,\"error\":{\"code\":\"INVALID_ARGUMENTS\",\"message\":\"Invalid JSON\"}}", false, toolTitle = "Search Web")
-        val query = args.optString("query", "").trim()
-        val title = args.optString("tool_title", "Search Web")
-        if (query.isBlank()) return ToolExecutionResult("{\"ok\":false,\"error\":{\"code\":\"INVALID_ARGUMENTS\",\"message\":\"query is required\"}}", false, toolTitle = title)
-        val prefs = AgentBehaviorSettingsPrefs(context).load()
-        val options = SearchOptions(
-            maxResults = args.optInt("max_results", prefs.webSearchMaxResults).coerceAtMost(prefs.webSearchMaxResults),
-            timeoutMs = args.optLong("timeout_ms", prefs.webRequestTimeoutMs).coerceAtMost(prefs.webRequestTimeoutMs),
-        ).normalized()
-        val result = PublicSearchService(listOf(DuckDuckGoHtmlAdapter())).search(query, options)
-        val json = JSONObject().put("ok", result.failures.isEmpty() || result.items.isNotEmpty())
-            .put("query", result.query)
-            .put("results", JSONArray().apply {
-                result.items.forEach { item -> put(JSONObject()
-                    .put("title", item.title).put("url", item.url)
-                    .put("snippet", item.snippet ?: JSONObject.NULL).put("source", item.source)) }
-            })
-            .put("failures", JSONArray().apply {
-                result.failures.forEach { failure -> put(JSONObject().put("source", failure.source).put("detail", failure.detail)) }
-            })
-        return ToolExecutionResult(json.toString(), result.items.isNotEmpty(), toolTitle = title)
-    }
-
-    private suspend fun executeWebFetchTool(argsJson: String): ToolExecutionResult {
-        val args = runCatching { JSONObject(argsJson) }.getOrNull()
-            ?: return ToolExecutionResult("{\"ok\":false,\"error\":{\"code\":\"INVALID_ARGUMENTS\",\"message\":\"Invalid JSON\"}}", false, toolTitle = "Fetch Web")
-        val url = args.optString("url", "").trim()
-        val title = args.optString("tool_title", "Fetch Web")
-        if (url.isBlank()) return ToolExecutionResult("{\"ok\":false,\"error\":{\"code\":\"INVALID_ARGUMENTS\",\"message\":\"url is required\"}}", false, toolTitle = title)
-        val prefs = AgentBehaviorSettingsPrefs(context).load()
-        val timeout = args.optLong("timeout_ms", prefs.webRequestTimeoutMs).coerceAtMost(prefs.webRequestTimeoutMs)
-        val maxBytes = args.optInt("max_bytes", PublicWebFetcher.DEFAULT_MAX_BYTES).coerceAtMost(PublicWebFetcher.DEFAULT_MAX_BYTES)
-        return when (val result = PublicWebFetcher().fetch(url, WebFetchOptions(timeoutMs = timeout, maxBytes = maxBytes))) {
-            is WebFetchResult.Success -> ToolExecutionResult(JSONObject()
-                .put("ok", true).put("url", result.url).put("content", result.body).toString(), true, toolTitle = title)
-            is WebFetchResult.Failure -> ToolExecutionResult(JSONObject()
-                .put("ok", false).put("url", result.url)
-                .put("error", JSONObject().put("code", result.reason.name).put("message", result.detail)).toString(), false, toolTitle = title)
-        }
-    }
-
     private suspend fun executeStopDescendantTool(argsJson: String): ToolExecutionResult {
         val args = runCatching { JSONObject(argsJson) }.getOrNull()
             ?: return ToolExecutionResult("{\"ok\":false,\"error\":\"invalid arguments\"}", false, toolTitle = "Stop Descendant")
@@ -10134,6 +11596,24 @@ class ChatViewModel(
                 toolTitle = title,
             )
         }
+        // [T-android-stop-descendant-cancel] The receipt above is a STATE
+        // transition; what request.md:250 defines as "stopped" is that the target's
+        // own coroutine stops. Until this call nothing did that: `stopDescendant`
+        // relabelled the node STOP_REQUESTED — a terminal-looking state — and the
+        // delegated child kept calling its provider and appending to its transcript
+        // while the parent was told it had stopped.
+        //
+        // The ids come from the receipt (the tree's own answer to "which nodes were
+        // marked") plus the target session id, because the coordinator resolves a
+        // session to its runtime node and a caller holding only the session id must
+        // not silently miss. Cancellation is dispatched, not awaited: the child
+        // unwinds on its own context and the direct parent is told it settled
+        // through the runtime's stop notification.
+        val cancelDispatched = if (receipt.accepted) {
+            SessionActivityTracker.cancelChildSessions(receipt.affectedNodeIds + targetSessionId)
+        } else {
+            emptyList()
+        }
         val json = JSONObject()
             .put("ok", receipt.accepted)
             .put("type", receipt.type.name)
@@ -10145,11 +11625,58 @@ class ChatViewModel(
             .put("state_before", receipt.stateBefore?.name ?: JSONObject.NULL)
             .put("state_after", receipt.stateAfter?.name ?: JSONObject.NULL)
             .put("affected_node_ids", org.json.JSONArray(receipt.affectedNodeIds))
+            .put("cancel_dispatched_node_ids", org.json.JSONArray(cancelDispatched))
             .put("audit_event_id", receipt.eventId ?: JSONObject.NULL)
             .put("reason", receipt.reason ?: JSONObject.NULL)
         return ToolExecutionResult(json.toString(), receipt.accepted, toolTitle = title)
     }
 
+    private suspend fun executeCommunicationQueryTool(argsJson: String): ToolExecutionResult {
+        val args = runCatching { JSONObject(argsJson) }.getOrNull()
+            ?: return ToolExecutionResult("{\"ok\":false,\"error\":\"invalid arguments\"}", false, toolTitle = "Communication Query")
+        val title = args.optString("tool_title", "Communication Query")
+        val query = runCatching {
+            RuntimeCommunicationQuery(
+                summaryContains = args.optString("summary_contains").takeIf { it.isNotBlank() },
+                direction = args.optString("direction").takeIf { it.isNotBlank() }?.let { RuntimeCommunicationDirection.valueOf(it.uppercase()) },
+                state = args.optString("state").takeIf { it.isNotBlank() }?.let { RuntimeCommunicationState.valueOf(it.uppercase()) },
+                limit = args.optInt("limit", 20),
+                resultBudgetChars = args.optInt("result_budget_chars", 16_000),
+                cursor = args.optString("cursor").takeIf { it.isNotBlank() }?.let(::RuntimeCommunicationCursor),
+            )
+        }.getOrElse { error ->
+            return ToolExecutionResult(JSONObject().put("ok", false).put("error", error.message ?: "invalid query").toString(), false, toolTitle = title)
+        }
+        return when (val result = runtimeCoordinator.queryCommunication(communicationRepository, activeSessionId, query)) {
+            is RuntimeCommunicationQueryResult.Rejected -> ToolExecutionResult(JSONObject().put("ok", false).put("reason", result.reason.name).toString(), false, toolTitle = title)
+            is RuntimeCommunicationQueryResult.Accepted -> {
+                val page = result.page
+                val json = JSONObject().put("ok", true).put("total", page.totalMatchingRecords)
+                    .put("next_cursor", page.nextCursor?.token ?: JSONObject.NULL)
+                    .put("records", JSONArray().apply {
+                        page.records.forEach { record ->
+                            put(JSONObject().put("record_id", record.recordId).put("sender", record.sender.sessionId)
+                                .put("receiver", record.receiver.sessionId).put("direction", record.direction.name)
+                                .put("state", record.state.name).put("summary", record.summary)
+                                .put("timestamp", record.timestampMillis))
+                        }
+                    })
+                ToolExecutionResult(json.toString(), true, toolTitle = title)
+            }
+        }
+    }
+
+    private suspend fun executeCommunicationDetailTool(argsJson: String): ToolExecutionResult {
+        val args = runCatching { JSONObject(argsJson) }.getOrNull()
+            ?: return ToolExecutionResult("{\"ok\":false,\"error\":\"invalid arguments\"}", false, toolTitle = "Communication Detail")
+        val title = args.optString("tool_title", "Communication Detail")
+        val recordId = args.optString("record_id").trim()
+        if (recordId.isBlank()) return ToolExecutionResult("{\"ok\":false,\"error\":\"record_id is required\"}", false, toolTitle = title)
+        return when (val result = runtimeCoordinator.communicationDetail(communicationRepository, activeSessionId, RuntimeCommunicationDetailRequest(recordId))) {
+            is RuntimeCommunicationDetailResult.Rejected -> ToolExecutionResult(JSONObject().put("ok", false).put("reason", result.reason.name).toString(), false, toolTitle = title)
+            is RuntimeCommunicationDetailResult.Accepted -> ToolExecutionResult(JSONObject().put("ok", true).put("record_id", recordId).put("metadata_only", true).toString(), true, toolTitle = title)
+        }
+    }
     private suspend fun executeDeleteSubtreeTool(argsJson: String): ToolExecutionResult {
         val args = runCatching { JSONObject(argsJson) }.getOrNull()
             ?: return ToolExecutionResult("{\"success\":false,\"result\":\"REJECTED\",\"reason\":\"invalid arguments\"}", false, toolTitle = "Delete Subtree")
@@ -10207,17 +11734,23 @@ class ChatViewModel(
             val denied = BrowserDevToolsTools.Result(BrowserDevToolsTools.Status.DENIED, "browser session is not authorized")
             return ToolExecutionResult(denied.toJson(), false, toolTitle = title)
         }
-        val target = browserTabPool.resolveDevToolsTarget(session, request.tabId, request.pageId)
-        if (target == null) {
+        val scope = BrowserDevToolsTools.Scope(session, request.tabId, request.pageId)
+        // [T-browser-devtools-holds-tab] Run the diagnostic while the tab is
+        // held active. Previously this resolved the target and then executed
+        // with no hold at all, so the idle evictor could destroy the WebView
+        // mid-script (script_debug may run up to 60s) — the requirement forbids
+        // sleeping a tab the model is running scripts against.
+        val result = browserTabPool.withDevToolsTarget(session, request.tabId, request.pageId) {
+            it.executeDevTools(request, scope)
+        }
+        if (result == null) {
             val denied = BrowserDevToolsTools.Result(
                 BrowserDevToolsTools.Status.DENIED,
                 "browser tab/page scope is not authorized",
-                BrowserDevToolsTools.Scope(session, request.tabId, request.pageId),
+                scope,
             )
             return ToolExecutionResult(denied.toJson(), false, toolTitle = title)
         }
-        val scope = BrowserDevToolsTools.Scope(session, request.tabId, request.pageId)
-        val result = target.executeDevTools(request, scope)
         return ToolExecutionResult(result.toJson(), result.status == BrowserDevToolsTools.Status.OK, toolTitle = title)
     }
 
@@ -10355,7 +11888,10 @@ class ChatViewModel(
             isWrite = true,
             preview = content.lines().firstOrNull { it.isNotBlank() }?.take(100) ?: "",
             output = result.output,
-            writtenContent = content,
+            // Only claim written content when the write actually succeeded;
+            // otherwise the panel would show what we merely TRIED to store.
+            writtenContent = content.takeIf { result.success },
+            succeeded = result.success,
         )
         return ToolExecutionResult(result.output, result.success, toolTitle = result.toolTitle)
     }
@@ -10482,11 +12018,12 @@ class ChatViewModel(
             // when a fresh streaming event arrives, the banner is stale —
             // the model is producing again, by construction the prior
             // transient timeout / retry / fallback has been resolved.
-            // Clear it in the same mutation. setTransientInlineError /
-            // setInlineError are the only paths that write `error`; the
-            // terminal path (setInlineError) sets isStreaming=false on the
-            // same message in the same emit, so it cannot reach this
-            // branch and the clear is safe.
+            // Clear it in the same mutation. `setInlineError` (terminal) is now
+            // the only path that writes `error` — the per-attempt transient
+            // write moved to the auto-retry row
+            // [T-android-auto-retry-progress]; the terminal path sets
+            // isStreaming=false on the same message in the same emit, so it
+            // cannot reach this branch and the clear is safe.
             //
             // 𝙓𝙄𝙉 TG36302 (0.10): user saw a red "timeout / retry" banner
             // glued to the bottom of the conversation while the agent
@@ -10693,6 +12230,16 @@ class ChatViewModel(
         usage: LLMUsage?,
         reasoningContent: String? = null,
         toolBlockMeta: Map<String, AssistantBlock> = emptyMap(),
+        // [T-android-thinking-level-persist] The level the TURN was produced at,
+        // supplied by the caller that owns the turn — NOT read from
+        // `_thinkingLevel.value` here. This function can be called after the
+        // user has already moved the picker (an in-flight turn, a queued
+        // follow-up, a resume after restart), and a snapshot taken at write
+        // time must record the level that produced the content, not the level
+        // selected when the row happened to be written. Default null keeps this
+        // honest for callers that genuinely have no turn level: NULL means "not
+        // recorded", and the UI shows no capsule rather than a guessed one.
+        thinkingLevel: ThinkingLevel? = null,
     ): String? {
         if (parts.isEmpty()) return null
         var partsJson = buildAssistantPartsJson(parts, toolBlockMeta)
@@ -10709,6 +12256,7 @@ class ChatViewModel(
             // the session row — see currentModelSnapshot().
             modelSnapshot = currentModelSnapshot(),
             provenance = MessageProvenance.ASSISTANT,
+            thinkingLevel = thinkingLevel,
         )
         return entity.id
     }
@@ -10932,7 +12480,7 @@ CLI tools at /usr/local/bin with the `android-` prefix give you access to Androi
 - android-a11y-cli — drive system UI (read screen, tap, type, swipe, scroll) via the Android AccessibilityService when enabled. Run with no args (or --help) for the subcommand list.
 - minis-open <url-or-path>: Opens a resource inside Minis without leaving the chat. Accepts http/https URLs (→ built-in WebKit preview) and chat-resource file paths under /var/minis/** (→ built-in file preview, routed by extension: images to the image viewer, .md to markdown preview, .html to HTML preview, .pdf/office docs to QuickLook, audio/video to the media player, else share sheet). Examples: minis-open https://example.com, minis-open /var/minis/workspace/report.md, minis-open /var/minis/attachments/chart.png. Prefer this over android-open for anything that can be previewed in-app so the user doesn't lose conversation context. Use android-open for non-web schemes (tel:, mailto:, geo:, intent:, etc.) or when the user explicitly wants the system handler.
 - minis-sessions-cli: Manage chat sessions. `list` recent or by date range, `search --keywords` cross-session, `messages --id` to read, `send` to create/continue a session, `retry` to re-run, `status` to check, `open` to navigate the app UI. Run --help for full options.
-- minis-model-use: Invoke other LLM models pre-configured by the user. Use `minis-model-use list` to see them (includes each model's modality capabilities like image_output, audio_output, etc.), `minis-model-use search <query>` to filter by name/provider. `minis-model-use run --model <id_or_name>` sends an OpenAI-compatible messages request; pass input via --input <json_file> or stdin, output goes to stdout or --output <path>. The OpenAI shape is the PRIMARY input for every model and modality; standard params are auto-converted to the underlying provider, so do not hand-write provider-native bodies as the primary input. For provider-specific extras the standard schema doesn't model (web-search plugins, image-to-image fields, TTS/video or other custom endpoints), escape hatches exist for OpenAI-compatible providers (they error or are ignored on Anthropic/Gemini models): `extra_body` (object merged verbatim into the request body), a custom `endpoint` path, and a top-level `passthrough` envelope for fully verbatim requests with RAW (unparsed) responses. Results may carry `warnings` (fields that were ignored/downgraded and why) and `applied_extras` (which extras actually took effect) — read them to self-correct. Run --help for the full contract before using these. Models may support multimodal output (image generation, TTS/audio, video) — check the modalities field in list output. For image_output models, pass generation params in the input JSON: top-level `n`/`size`/`quality`/`prompt` (OpenAI /images/generations style) or `generation_config.{aspect_ratio,image_size,number_of_images,person_generation}` (Gemini). Run with --help for full usage.
+- minis-model-use: Invoke other LLM models pre-configured by the user. Use `minis-model-use list` to see them. Each entry carries the details needed to choose a model for a job: modality capabilities (image_output, audio_output, etc.), `supports_tools` / `supports_reasoning` / `reasoning_effort_values`, and the user's own guidance in `subagent_note` — when that field is present (`subagent_note_source` = "user") treat it as the PREFERRED advice on when to use that model, while the capability fields remain authoritative for what it can actually do. When no note was written (`subagent_note_source` = "capabilities") go by the model name and those same capability fields, `minis-model-use search <query>` to filter by name/provider. `minis-model-use run --model <id_or_name>` sends an OpenAI-compatible messages request; pass input via --input <json_file> or stdin, output goes to stdout or --output <path>. The OpenAI shape is the PRIMARY input for every model and modality; standard params are auto-converted to the underlying provider, so do not hand-write provider-native bodies as the primary input. For provider-specific extras the standard schema doesn't model (web-search plugins, image-to-image fields, TTS/video or other custom endpoints), escape hatches exist for OpenAI-compatible providers (they error or are ignored on Anthropic/Gemini models): `extra_body` (object merged verbatim into the request body), a custom `endpoint` path, and a top-level `passthrough` envelope for fully verbatim requests with RAW (unparsed) responses. Results may carry `warnings` (fields that were ignored/downgraded and why) and `applied_extras` (which extras actually took effect) — read them to self-correct. Run --help for the full contract before using these. Models may support multimodal output (image generation, TTS/audio, video) — check the modalities field in list output. For image_output models, pass generation params in the input JSON: top-level `n`/`size`/`quality`/`prompt` (OpenAI /images/generations style) or `generation_config.{aspect_ratio,image_size,number_of_images,person_generation}` (Gemini). Run with --help for full usage.
 - minis-config: Read or change Minis settings programmatically. Run `minis-config --help` for subcommands and `minis-config topic-help <topic>` for details on a specific area. For array-valued fields (e.g. `models`, `groups`, `envvars`, `defaults.agentLoopEntries`) the `get` subcommand accepts `--filter <keywords>` (whitespace-AND, case-insensitive substring match against each element's JSON) and `--page <N> --page-size <N>` (default 20, max 100) — use these instead of dumping the full list when you only need a subset, and check the response's `pagination` / `agent_hint` fields for the next-page command. Every write triggers an in-app confirmation sheet and is logged to a revertable audit (1000-entry rolling log). After a successful change the response includes a `user_message` field — relay it (or paraphrase) so the user knows how to review or revert via Settings → Logs → Config Changes. If the call returns `permission_denied`, the user has disabled minis-config in [Settings → Permissions](minis://settings/permissions); relay that message and don't retry. You CAN add new providers and write their `apiKey` (literal string OR a `${'$'}${'$'}ENV_VAR` reference to copy from an env var at write time), but `get` never echoes API keys / OAuth tokens / env var values back — those reads return `permission_denied` by design. OAuth tokens and env var values are not settable via this tool; for an env var, point the user at [Set ENV_NAME](minis://settings/environments?create_key=ENV_NAME&create_value=) so they enter the value themselves.
 - minis-scheduled: Create and manage scheduled tasks — prompts that run automatically at a chosen time. `minis-scheduled create --time HH:MM --prompt "..." [--label L] [--repeat once|daily|weekdays|custom --days mon,tue,...] [--target new|follow-up|rerun --session <id> --message <id>] [--model <modelId>] [--start YYYY-MM-DD] [--end YYYY-MM-DD]` schedules it; `list` shows existing tasks (with nextTriggerMs and run history), `delete --id <taskId>`, `enable`/`disable --id <taskId>`, and `run --id <taskId>` fires one immediately. Target modes: `new` runs the prompt in a fresh chat; `follow-up` appends the prompt to an existing chat (--session); `rerun` re-runs an existing chat (--session) from a chosen user message (--message). Use this when the user asks to "remind me / do X every morning / run this later / schedule a task". Run --help for full usage.
 Interactive terminal: minis://open_terminal opens a terminal for tasks that require interactive stdin (passwords, ssh, TUI apps like htop/vi). Write it as a Markdown link in your response — the app opens it when tapped. The optional init_command parameter pre-fills (NOT executes) a command; it MUST be fully percent-encoded (spaces → %20, & → %26, | → %7C, etc.). Only use this for genuinely interactive sessions — for everything else, use shell_execute. Examples: [Open Terminal](minis://open_terminal), [Login to SSH](minis://open_terminal?init_command=ssh%20user%40host).
@@ -11008,6 +12556,26 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
             append("- Current date: ").append(dateStr).append(" (").append(tzId).append(")\n")
             append("- Device language: ").append(lang).append("\n")
             append("- minis-model-use models available: ").append(modelUseCount)
+            // [T-android-conversation-id-query] request.md:136's 「提示词工程」:
+            // the model has to be TOLD that a `minis-conv-` id is this app's own
+            // conversation id and that it can be taken to the runtime to read that
+            // conversation. Placed at the tail with the rest of the per-request
+            // runtime context, so the cache-stable head above is untouched (the
+            // id is static for a session, but keeping every injected block out of
+            // the head keeps the ordering rule in one piece).
+            //
+            // `activeSessionId` falls back to the `__new__…` draft key before the
+            // first message creates a row, and that key is a pending-navigation
+            // marker rather than a conversation id — handing the model a prefixed
+            // draft key would teach it an id no tool could ever resolve. A blank id
+            // makes the injection describe the format without claiming an own id,
+            // which is the honest state of a conversation that does not exist yet.
+            append("\n\n")
+            append(
+                ConversationIdProtocol.systemInstruction(
+                    activeSessionId.takeIf { !it.startsWith("__new__") } ?: "",
+                ),
+            )
         }
     }
 
@@ -11030,7 +12598,10 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
             isWrite = true,
             preview = content.lines().firstOrNull { it.isNotBlank() }?.take(100) ?: "",
             output = result.output,
-            writtenContent = content,
+            // Only claim written content when the write actually succeeded;
+            // otherwise the panel would show what we merely TRIED to store.
+            writtenContent = content.takeIf { result.success },
+            succeeded = result.success,
         )
         return result
     }
@@ -11552,7 +13123,18 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
         entry: com.openminis.app.data.model.ModelEntry?,
         provider: LLMProvider? = currentProvider,
     ): ActualModelRequestSnapshot? {
-        entry?.let { actual ->
+        // Only an entry that AGREES with the provider that answered may stand as
+        // the attribution. `capture` takes whatever entry it is handed, so a
+        // stale or mismatched entry silently recorded a model that never ran —
+        // the same defect class as a setting that is written but never read, one
+        // layer down: an entry that is RECORDED but never used.
+        val agreeingEntry = entry?.takeIf { candidate ->
+            titleAttributionMatches(
+                entryModelId = candidate.model.id,
+                servedModelId = provider?.model?.id,
+            )
+        }
+        agreeingEntry?.let { actual ->
             val instance = providerRepository.instance(actual.providerInstanceId)
             if (instance != null) return ActualModelRequestSnapshot.capture(ModelRole.TITLE, actual, instance.providerType.name)
         }
@@ -11566,11 +13148,57 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
 
     private var titleGenerationInFlight = false
     private var titleGenerationAttempts = 0
+
+    /**
+     * Set once a dispatch has spent the user's whole automatic-retry budget (or
+     * the policy refused to retry the failure at all). No further dispatch can
+     * be afforded after that, so the first-message fallback takes over. This is
+     * what keeps the OUTER dispatch count from multiplying with the retries
+     * INSIDE a dispatch: the user's value bounds total title-generation model
+     * calls for the session, it is not a per-dispatch fresh allowance.
+     */
+    private var titleAttemptsExhausted = false
+
+    /** Renders [retryBudgetTotalAttempts]'s unbounded sentinel readably in logs. */
+    private fun formatAttemptLimit(limit: Int): String =
+        if (limit == Int.MAX_VALUE) "unlimited" else limit.toString()
     private var compactionRequestEntry: com.openminis.app.data.model.ModelEntry? = null
     private var compactionRequestModel: LLMModel? = null
     private var compactionRequestProviderTypeRaw: String? = null
     private var compactionRequestProviderInstanceId: String? = null
-    private val TITLE_MAX_ATTEMPTS = 3
+    /**
+     * How many title-generation dispatches one session may make before the
+     * first-message fallback takes over.
+     *
+     * [T-android-retry-governs-title-and-compaction] This is DERIVED from the
+     * user's automatic-retry setting — it used to be a hardcoded `3`, which
+     * meant moving the retry slider in Settings changed nothing for title
+     * generation. `-1` (always) has no give-up point; `0` (disabled) allows a
+     * single dispatch; `N>0` allows the first try plus N retries.
+     *
+     * This count is the OUTER bound (one dispatch per conversation turn); the
+     * retries INSIDE a dispatch are performed by `AgentRetryRunner` from the
+     * same setting.
+     *
+     * How the two bounds compose, stated precisely because an earlier version
+     * of this comment overclaimed it:
+     *  - Every path that ends a dispatch WITHOUT a usable title sets
+     *    [titleAttemptsExhausted] (see the three sites in
+     *    [generateSessionTitleIfNeeded]), which ends the outer loop too.
+     *  - The single exception is "the model answered but the answer carried no
+     *    parseable title, and more dispatches are affordable" — there the outer
+     *    count is the only bound, and each such dispatch gets a fresh INNER
+     *    budget. So the compounded worst case is (N+1) dispatches × (N+1) calls
+     *    for that one shape, not N+1 calls.
+     *  - Irrelevant in the shipped default (`-1`, always): `attemptLimit` is
+     *    [Int.MAX_VALUE], so `moreDispatchesAffordable` is false and the same
+     *    flag collapses the outer loop to a single dispatch, whose call count
+     *    is bounded by [TITLE_GEN_TIMEOUT_MS] instead.
+     */
+    private val titleMaxAttempts: Int
+        get() = retryBudgetTotalAttempts(
+            AgentBehaviorSettingsPrefs(context).load().effectiveMaxRetryAttempts,
+        )
 
     // [T-android-auto-grouping-injection] Bounds on the group list folded into
     // the title-generation prompt. 30 groups × ~140 chars keeps the segment
@@ -11582,19 +13210,36 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
     private val GROUP_DESC_MAX = 100
 
     private fun generateSessionTitleIfNeeded() {
+        // Cleared at every entry, so the value inside a dispatch can only be the
+        // provider THIS dispatch resolved — or null. It used to be write-only
+        // (assigned at the dispatch, never reset) while the give-up path read it
+        // for attribution, which let a provider from an EARLIER dispatch be
+        // recorded against a title it had nothing to do with. That reader is
+        // gone now; this reset keeps the field from regrowing the same hazard.
+        titleRequestProvider = null
+        // [T-android-retry-governs-title-and-compaction] Resolve the attempt
+        // limit ONCE per dispatch. It comes from the user's automatic-retry
+        // setting (via titleMaxAttempts), which is also what
+        // callTitleModelWithRetry's runner re-reads for the retries INSIDE this
+        // dispatch: one setting, one authority.
+        val attemptLimit = titleMaxAttempts
         // [T-android-titlegen-diag-logging] Unified "TitleGen" trail across
         // every path of this function — XIN 40454 reported sessions silently
         // staying "New Chat" and the failure paths were under-logged.
         // Logging only; no logic change.
         AppLogger.info(
             "TitleGen",
-            "enter session=${realSessionId.ifEmpty { sessionId }} attempts=$titleGenerationAttempts/$TITLE_MAX_ATTEMPTS " +
+            "enter session=${realSessionId.ifEmpty { sessionId }} attempts=$titleGenerationAttempts/${formatAttemptLimit(attemptLimit)} " +
                 "inFlight=$titleGenerationInFlight currentTitle='${_sessionTitle.value.take(200)}'",
         )
-        if (titleGenerationInFlight || titleGenerationAttempts >= TITLE_MAX_ATTEMPTS) {
+        if (titleGenerationInFlight || titleAttemptsExhausted || titleGenerationAttempts >= attemptLimit) {
             AppLogger.info(
                 "TitleGen",
-                "skip guard=${if (titleGenerationInFlight) "inFlight" else "max-attempts ($titleGenerationAttempts/$TITLE_MAX_ATTEMPTS)"}",
+                "skip guard=${when {
+                    titleGenerationInFlight -> "inFlight"
+                    titleAttemptsExhausted -> "retry-budget-spent"
+                    else -> "max-attempts ($titleGenerationAttempts/${formatAttemptLimit(attemptLimit)})"
+                }}",
             )
             return
         }
@@ -11604,15 +13249,32 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
             return
         }
         // Prefer a dedicated sub-model (cheap, non-OAuth) — mirrors iOS resolveSubEntry.
-        // Falls back to the primary provider if no sub-group is configured.
+        // Falls back to the session's OWN current model if no sub is configured.
         // [T-title-gen-fallback-first-message-android] If no provider can be
         // resolved at all, the session would silently stay "New Chat". Log the
         // reason and fall back to the first user message as the title.
         val subProvider = resolveTitleProvider()
+        // Attribute the model that will ACTUALLY answer. `resolveTitleProvider`
+        // records the entry it resolved, but only when it got far enough to
+        // return a provider — so a failure after it set the field would
+        // otherwise leave an entry behind that never served anything.
+        val resolvedSubEntryId = if (subProvider != null) titleRequestEntry?.id else null
         if (subProvider == null) {
-            titleRequestEntry = resolveRoleEntry(providerRepository.config.value.primaryModelEntryId)
             AppLogger.info("TitleGen", "resolveTitleProvider=null — falling back to currentProvider")
         }
+        // The fallback provider below is `currentProvider`, which is built from
+        // the session's active entry. Naming the Primary Agent Model setting here
+        // recorded the WRONG model: `titleSnapshot` prefers an entry over the
+        // provider it is handed, so the session row named a model that never ran
+        // while the current model answered. When neither id resolves, the entry
+        // stays null and [titleSnapshot] reports the provider's own model, which
+        // is the honest answer to "what actually produced this title".
+        titleRequestEntry = resolveRoleEntry(
+            titleAttributionEntryId(
+                resolvedSubEntryId = resolvedSubEntryId,
+                activeEntryId = _activeEntryId.value,
+            ),
+        )
         val provider = subProvider ?: currentProvider
         if (provider == null) {
             AppLogger.warning("TitleGen", "no provider available (sub + current both null) — fallback-to-first-message path")
@@ -11632,14 +13294,22 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
         // truncated to 200 chars. This lets the title adapt when the topic
         // shifts later in a long session, instead of only seeing the opener.
         val msgs = _messages.value
-        val userMessages = msgs.filter { it.role == "user" }
-        val firstUser = userMessages.firstOrNull()
-        if (firstUser == null) {
-            AppLogger.warning("TitleGen", "skip guard=no-user-message (nothing to summarize)")
+        // [T-android-human-turn-count-parity] Only HUMAN turns, and only ones with
+        // usable text. `filter { role == "user" }` used to pick up synthetic rows
+        // (tool results, the `<system-reminder>` resume entry) written with the
+        // API's `user` role, so the summary could be built from harness plumbing
+        // instead of the user's words; and a blank-content opening turn (an
+        // image-only message) produced an empty `User:` line.
+        val humanTurnTexts = msgs.filter { it.countsAsHumanTurn() }
+            .map { it.content }
+            .filter { it.isNotBlank() }
+        val firstUserText = humanTurnTexts.firstOrNull()
+        if (firstUserText == null) {
+            AppLogger.warning("TitleGen", "skip guard=no-human-turn-text (nothing to summarize)")
             titleGenerationInFlight = false
             return
         }
-        val userText = firstUser.content.take(200)
+        val userText = firstUserText.take(200)
         // First/last assistant *text* message — skip tool-only capsules whose
         // content is blank so the summary carries real assistant prose.
         val assistantTextMessages = msgs.filter { it.role == "assistant" && it.content.isNotBlank() }
@@ -11647,8 +13317,8 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
         // Only append the last pair when there is more than one user turn (i.e.
         // the first and last user messages differ) — avoids duplicating the
         // opener when the session is a single exchange.
-        val hasMultipleUserTurns = userMessages.size > 1
-        val lastUserText = if (hasMultipleUserTurns) userMessages.lastOrNull()?.content?.take(200) ?: "" else ""
+        val hasMultipleUserTurns = humanTurnTexts.size > 1
+        val lastUserText = if (hasMultipleUserTurns) humanTurnTexts.last().take(200) else ""
         val lastAssistantText = if (hasMultipleUserTurns) assistantTextMessages.lastOrNull()?.content?.take(200) ?: "" else ""
 
         viewModelScope.launch(Dispatchers.IO) {
@@ -11741,8 +13411,11 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
                 // Code prefix block at the provider layer (and strips a
                 // caller-supplied one), so no caller-side prepend is needed — the
                 // previous manual prefix branch here was redundant.
-                val effectiveSystemPrompt = providerRepository.titlePrompt
-                    ?.takeIf { it.isNotBlank() } ?: TITLE_GEN_SYSTEM_PROMPT
+                // The user's own edit when they made one (request.md:246), else
+                // the shared default. One selector, shared with the manual
+                // Regenerate path, so an edited prompt cannot reach one path and
+                // not the other.
+                val effectiveSystemPrompt = effectiveTitleSystemPrompt(providerRepository.titlePrompt)
 
                 AppLogger.info(
                     "TitleGen",
@@ -11759,17 +13432,56 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
                 // default), keep the T334 budget bump so it can finish thinking
                 // and still emit the JSON. Unified with regenerateTitle's ladder.
                 val titleMaxTokens = if (provider.model.supportsReasoning == true) 2048 else 100
-                val response = provider.sendMessage(
-                    messages = listOf(LLMMessage(role = LLMMessage.Role.USER, content = prompt)),
+                // [T-android-retry-governs-title-and-compaction] Title
+                // generation is governed by the user's automatic-retry setting
+                // exactly like the agent main loop: the same settings→policy
+                // mapping, the same `-1` = always semantics, and the same
+                // "auto-retry off means 0" fold. This call used to go straight
+                // to the provider, so the retry slider had no effect on it.
+                val titleRetrySettings = AgentBehaviorSettingsPrefs(context).load()
+                val titleRetry = agentRetryRunnerFromSettings(
+                    titleRetrySettings,
+                    onRetry = { attempt, delayMillis, failure ->
+                        AppLogger.info(
+                            "TitleGen",
+                            "retry ${attempt + 1} after ${delayMillis}ms " +
+                                "(user setting: autoRetry=${titleRetrySettings.autoRetryEnabled}, " +
+                                "maxRetryAttempts=${titleRetrySettings.maxRetryAttempts}; ${failure.code})",
+                        )
+                    },
+                )
+                val response = generateTitleUnderDeadline(
+                    provider = provider,
+                    prompt = prompt,
                     systemPrompt = effectiveSystemPrompt,
                     maxTokens = titleMaxTokens,
-                    // Mirror iOS AIChatViewModel.swift:11244 — pass null so
-                    // gpt-5.x family doesn't reject the request (only
-                    // temperature=1 allowed there). buildRequestBody omits
-                    // the field when null.
-                    temperature = null,
-                    thinkingLevel = ThinkingLevel.OFF,
+                    runner = titleRetry,
+                    // [T-android-retry-governs-title-and-compaction] The user's
+                    // retry budget may be `-1` (always); this wall clock is what
+                    // keeps that finite. Observable on purpose — a deadline that
+                    // abandons the request silently would just be a new way for
+                    // title generation to vanish.
+                    onDeadline = { timeoutMs ->
+                        val settings = titleRetrySettings
+                        AppLogger.warning(
+                            "TitleGen",
+                            "outcome=deadline-exceeded after ${timeoutMs}ms " +
+                                "session=${(realSessionId.ifEmpty { sessionId }).take(8)} " +
+                                "(user setting: autoRetry=${settings.autoRetryEnabled}, " +
+                                "maxRetryAttempts=${settings.maxRetryAttempts}) — " +
+                                "abandoning this dispatch and falling back to the first-message title",
+                        )
+                    },
                 )
+                if (response == null) {
+                    // The wall clock fired: route to the SAME first-message
+                    // fallback every other give-up path uses, so the user still
+                    // gets a title instead of a session stuck on "New Chat".
+                    titleAttemptsExhausted = true
+                    applyFallbackTitleFromFirstMessage(
+                        "title generation exceeded its ${TITLE_GEN_TIMEOUT_MS}ms wall clock",
+                    )
+                } else {
 
                 AppLogger.info(
                     "TitleGen",
@@ -11849,29 +13561,50 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
                     // final attempt, fall back to the first user message.
                     AppLogger.warning(
                         "TitleGen",
-                        "outcome=no-title attempt=$titleGenerationAttempts/$TITLE_MAX_ATTEMPTS " +
+                        "outcome=no-title attempt=$titleGenerationAttempts/${formatAttemptLimit(attemptLimit)} " +
                             "(empty / unparseable response) stopReason=${response.stopReason} " +
                             "textLen=${response.text.length}",
                     )
-                    if (titleGenerationAttempts >= TITLE_MAX_ATTEMPTS) {
-                        AppLogger.warning("TitleGen", "outcome=gave-up ($titleGenerationAttempts/$TITLE_MAX_ATTEMPTS) — applying first-message fallback title")
+                    // [T-android-retry-governs-title-and-compaction] An
+                    // unusable response is NOT a retryable failure: the model
+                    // answered, it just could not title this conversation. So
+                    // fall back as soon as no further dispatch is affordable —
+                    // and under `-1` (always) that is now, because "always"
+                    // describes failures worth retrying, not a licence to leave
+                    // the session on "New Chat" indefinitely.
+                    val moreDispatchesAffordable = attemptLimit != Int.MAX_VALUE &&
+                        titleGenerationAttempts < attemptLimit
+                    if (!moreDispatchesAffordable) {
+                        titleAttemptsExhausted = true
+                        AppLogger.warning("TitleGen", "outcome=gave-up ($titleGenerationAttempts/${formatAttemptLimit(attemptLimit)}) — applying first-message fallback title")
                         applyFallbackTitleFromFirstMessage("empty/unparseable title response")
                     }
                 }
+                }
+            } catch (cancellation: CancellationException) {
+                // Cancellation is not a provider failure: it must not be
+                // classified, logged as one, or answered with a fallback here.
+                // The `finally` below owns the cancelled-scope fallback.
+                throw cancellation
             } catch (e: Exception) {
                 // [T-title-gen-fallback-first-message-android] Request error /
                 // timeout / provider failure. Log the concrete cause (was
-                // already logged, kept) and fall back to the first user message
-                // on the final attempt.
+                // already logged, kept) and fall back to the first user message.
+                //
+                // [T-android-retry-governs-title-and-compaction] Reaching this
+                // catch means the dispatch is out of moves: callTitleModelWithRetry
+                // has already spent the user's whole automatic-retry budget, or
+                // the policy refused to retry this failure at all. End the outer
+                // dispatch loop too and fall back now — otherwise the outer cap
+                // would hand out a fresh budget on every later turn.
                 AppLogger.warning(
                     "TitleGen",
-                    "outcome=exception attempt=$titleGenerationAttempts/$TITLE_MAX_ATTEMPTS " +
+                    "outcome=exception attempt=$titleGenerationAttempts/${formatAttemptLimit(attemptLimit)} " +
                         "${e.javaClass.simpleName}: ${e.message?.take(200)}",
                 )
-                if (titleGenerationAttempts >= TITLE_MAX_ATTEMPTS) {
-                    AppLogger.warning("TitleGen", "outcome=gave-up ($titleGenerationAttempts/$TITLE_MAX_ATTEMPTS) — applying first-message fallback title")
-                    applyFallbackTitleFromFirstMessage("request failed: ${e.message?.take(200)}")
-                }
+                titleAttemptsExhausted = true
+                AppLogger.warning("TitleGen", "outcome=gave-up ($titleGenerationAttempts/${formatAttemptLimit(attemptLimit)}) — applying first-message fallback title")
+                applyFallbackTitleFromFirstMessage("request failed: ${e.message?.take(200)}")
             } finally {
                 titleGenerationInFlight = false
                 // [GH#210] Cancellation used to be the one exit that produced
@@ -11893,7 +13626,7 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
                 if (!isActive) {
                     AppLogger.warning(
                         "TitleGen",
-                        "outcome=cancelled attempt=$titleGenerationAttempts/$TITLE_MAX_ATTEMPTS " +
+                        "outcome=cancelled attempt=$titleGenerationAttempts/${formatAttemptLimit(attemptLimit)} " +
                             "session=${(realSessionId.ifEmpty { sessionId }).take(8)} " +
                             "reason=scope-cancelled — applying first-message fallback",
                     )
@@ -11932,7 +13665,18 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
             )
             return
         }
-        val raw = _messages.value.firstOrNull { it.role == "user" }?.content
+        // [T-android-human-turn-count-parity] Pick the first HUMAN turn that
+        // actually carries text. `firstOrNull { role == "user" }` was the fifth
+        // place in this file to define "human turn" differently: it accepted any
+        // role=="user" bubble regardless of authorship, and then gave up when
+        // that bubble's content was blank. An image-only opening turn has blank
+        // content, so the fallback reported "first-user-message-empty-after-
+        // cleanup" and the session stayed titled "New Chat" even though later
+        // turns had plenty of text to name it after.
+        val raw = _messages.value.asSequence()
+            .filter { it.countsAsHumanTurn() }
+            .map { it.content }
+            .firstOrNull { it.isNotBlank() }
         var text = raw ?: ""
         // Drop the <user-attached-files> XML the composer appends so the title
         // reflects what the user actually typed, not the attachment manifest.
@@ -11957,15 +13701,16 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
             return
         }
         val fallbackTitle = if (cleaned.length > 30) cleaned.take(30).trimEnd() + "…" else cleaned
-                    val snapshot = titleSnapshot(titleRequestEntry, titleRequestProvider)
-                    if (snapshot != null) {
-                        chatRepository.updateSessionTitleAndCategoryWithModelSnapshot(
-                            sidForCheck, fallbackTitle, null, snapshot.entryId, snapshot.modelId,
-                            snapshot.displayName, snapshot.providerTypeRaw, System.currentTimeMillis(),
-                        )
-                    } else {
-                        chatRepository.updateSessionTitle(sidForCheck, fallbackTitle)
-                    }
+        // NO model attribution here, on purpose. This title is DERIVED from the
+        // user's own words by truncation — no model produced it — and a session
+        // row naming a model that never ran is worse than naming none. The stale
+        // `titleRequestProvider` this used to hand to `titleSnapshot` is only ever
+        // assigned (never cleared), so it could even be left over from an EARLIER
+        // request: the attribution was wrong twice over. Same defect class as the
+        // guard inside `titleSnapshot`; that guard fixed the success path, this is
+        // the give-up path, which never had one. `updateSessionTitle` is the
+        // honest writer for a derived title.
+        chatRepository.updateSessionTitle(sidForCheck, fallbackTitle)
         withContext(Dispatchers.Main) {
             _sessionTitle.value = fallbackTitle
         }
@@ -12396,6 +14141,13 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
                     "assistant",
                     partsJson,
                     provenance = MessageProvenance.ASSISTANT,
+                    // [T-android-thinking-level-persist] A stopped turn still
+                    // produced this text, so its row records the level it was
+                    // produced at. `last` is the live bubble whose level was
+                    // captured when the bubble was created (turnThinkingLevel) —
+                    // reading `_thinkingLevel.value` here would stamp an
+                    // already-running turn with a level chosen after the fact.
+                    thinkingLevel = last.thinkingLevel,
                 )
             }
             // [T-android-group-pause-badge-restamp] A LIVE interruption just
@@ -12448,7 +14200,39 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
      * Clears [_canResume] on entry so repeated taps don't stack.
      */
     fun resume() {
-        if (_isStreaming.value || !_canResume.value) return
+        resumeRun(phase = "resume", requireCanResume = true)
+    }
+
+    /**
+     * [T-android-goal-auto-continuation] The body of [resume], shared with
+     * `/goal`'s unattended auto-continuation.
+     *
+     * The goal path has to re-enter the agent loop the *same* way a human resume
+     * does — same provider resolution from `currentProvider`, same fallback list,
+     * same system prompt, same concurrency slot and [SessionActivityTracker]
+     * lifecycle — so it calls this instead of assembling a second request path.
+     * The three differences are parameters, not a fork in the code:
+     *
+     *  - [phase] labels the log lines, so a goal-driven run and a human-driven one
+     *    are distinguishable after the fact;
+     *  - [requireCanResume] is `false` for the goal path: a goal continuation must
+     *    not depend on the "tap Continue" banner being up — a goal stop and an
+     *    interrupted-tail banner are different states, and the abnormal stop that
+     *    needs continuing need not have set the banner at all;
+     *  - [markStreamErrorOnFailure] records the failure as an error for this
+     *    session when the continuation itself fails. The `resume` path does not do
+     *    that (unchanged), but the goal path must: the completion listener only
+     *    re-arms a goal on an *error* completion, so a continuation whose failure
+     *    went unmarked would leave the goal ACTIVE with nothing left to continue
+     *    it.
+     */
+    private fun resumeRun(
+        phase: String,
+        requireCanResume: Boolean,
+        markStreamErrorOnFailure: Boolean = false,
+    ) {
+        if (_isStreaming.value) return
+        if (requireCanResume && !_canResume.value) return
         val provider = currentProvider ?: run {
             _error.value = "No provider configured"
             return
@@ -12460,7 +14244,7 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
         // row). Clear it now so a successful resume doesn't merge-resurrect the
         // turn-limit banner on the next reload.
         clearPersistedLastAssistantError()
-        AppLogger.info(TAG, "▶️ resume: continuing partial assistant message (no new header emitted)")
+        AppLogger.info(TAG, "▶️ $phase: continuing partial assistant message (no new header emitted)")
         // [T-android-tool-autoscroll] Start-of-turn snap. The thinking
         // placeholder is the only visible delta until the model's first
         // token, and the auto-follow tuple won't advance until content
@@ -12505,13 +14289,13 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
                     else "$prefix\n\n${baseSystemPrompt ?: ""}"
                 } else baseSystemPrompt
 
-            AppLogger.info(TAG_STREAM, "resume _isStreaming=true (sid=$activeSessionId)")
+            AppLogger.info(TAG_STREAM, "$phase _isStreaming=true (sid=$activeSessionId)")
             _isStreaming.value = true
             streamJob = launch(Dispatchers.IO) {
-                AppLogger.info(TAG_STREAM, "resume streamJob ENTER sid=$activeSessionId")
+                AppLogger.info(TAG_STREAM, "$phase streamJob ENTER sid=$activeSessionId")
                 try {
                     SessionConcurrencyManager.acquireSlot(activeSessionId)
-                    AppLogger.debug(TAG_STREAM, "resume streamJob slot acquired")
+                    AppLogger.debug(TAG_STREAM, "$phase streamJob slot acquired")
                     SessionActivityTracker.setActive(activeSessionId, onStop = { cancelStream() })
                     val activeFallbackStrategy = run {
                         val groupId = _selectedGroupId.value
@@ -12521,25 +14305,29 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
                     }
                     val fallbackProviders = buildFallbackProviders(provider)
                     try {
-                        AppLogger.info(TAG_STREAM, "resume runAgentLoop CALL")
+                        AppLogger.info(TAG_STREAM, "$phase runAgentLoop CALL")
                         runAgentLoop(
                             provider = provider,
                             systemPrompt = systemPrompt,
                             fallbackProviders = fallbackProviders,
                             fallbackStrategy = activeFallbackStrategy,
                         )
-                        AppLogger.info(TAG_STREAM, "resume runAgentLoop RETURN normal")
+                        AppLogger.info(TAG_STREAM, "$phase runAgentLoop RETURN normal")
                         drainQueuedPrompts(provider, systemPrompt, fallbackProviders, activeFallbackStrategy)
-                        AppLogger.info(TAG_STREAM, "resume drainQueuedPrompts RETURN")
+                        AppLogger.info(TAG_STREAM, "$phase drainQueuedPrompts RETURN")
                     } catch (e: CancellationException) {
-                        AppLogger.info(TAG_STREAM, "resume runAgentLoop CANCELLED")
-                        Log.d(TAG, "Agent loop cancelled (resume)")
+                        AppLogger.info(TAG_STREAM, "$phase runAgentLoop CANCELLED")
+                        Log.d(TAG, "Agent loop cancelled ($phase)")
                     } catch (e: Exception) {
-                        AppLogger.error(TAG_STREAM, "resume runAgentLoop EXCEPTION ${e.javaClass.simpleName}: ${e.message}")
-                        Log.e(TAG, "Agent loop error (resume)", e)
+                        AppLogger.error(TAG_STREAM, "$phase runAgentLoop EXCEPTION ${e.javaClass.simpleName}: ${e.message}")
+                        Log.e(TAG, "Agent loop error ($phase)", e)
                         setInlineError(e.message ?: "Unknown error")
+                        // [T-android-goal-auto-continuation] See
+                        // [resumeRun]'s `markStreamErrorOnFailure`. Without this
+                        // the goal path would lose its re-arm signal.
+                        if (markStreamErrorOnFailure) SessionActivityTracker.markStreamError(activeSessionId)
                     } finally {
-                        AppLogger.info(TAG_STREAM, "resume streamJob FINALLY enter")
+                        AppLogger.info(TAG_STREAM, "$phase streamJob FINALLY enter")
                         // [T-android-overlay-reply-status-34599] Surface
                         // the assistant's most recent reply text to the
                         // overlay BEFORE setInactive so the post-completion
@@ -12550,20 +14338,41 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
                         publishOverlayReplyExcerpt(activeSessionId)
                         SessionActivityTracker.setInactive(activeSessionId)
                         SessionConcurrencyManager.releaseSlot(activeSessionId)
-                        AppLogger.info(TAG_STREAM, "resume streamJob FINALLY exit")
+                        AppLogger.info(TAG_STREAM, "$phase streamJob FINALLY exit")
                     }
                 } catch (e: CancellationException) {
-                    AppLogger.info(TAG_STREAM, "resume streamJob CANCELLED waiting for slot")
-                    Log.d(TAG, "Cancelled while waiting for concurrency slot (resume)")
+                    AppLogger.info(TAG_STREAM, "$phase streamJob CANCELLED waiting for slot")
+                    Log.d(TAG, "Cancelled while waiting for concurrency slot ($phase)")
                 }
                 // [T-android-stale-streamjob-clears-isstreaming] guard.
                 if (streamJob === coroutineContext[Job]) {
-                    AppLogger.info(TAG_STREAM, "resume _isStreaming=false (about to set)")
+                    AppLogger.info(TAG_STREAM, "$phase _isStreaming=false (about to set)")
                     _isStreaming.value = false
+                    // [T-android-goal-auto-continuation] The run is over and the
+                    // active-stop state (if any) is already on disk — the
+                    // `setInactive` above ran the completion listener that writes
+                    // it. This is the trigger point for "continue without a human
+                    // typing": see [scheduleGoalAutoContinuation]. It sits inside
+                    // the stale-job guard so a superseded job cannot start a run
+                    // for a turn nobody is waiting for, and it is skipped for a
+                    // cancelled job so a user who pressed stop is not overridden
+                    // by an automatic restart of the same goal.
+                    if (coroutineContext[Job]?.isCancelled != true) {
+                        scheduleGoalAutoContinuation(fromGoalRun = phase == GOAL_CONTINUATION_PHASE)
+                        // [T-android-parent-inbox-consumer] The parent's turn is
+                        // over, which is exactly when a runtime-written
+                        // notification has no other chance to be read: a child
+                        // stopped by a tool during this run (`stopDescendant`), or
+                        // one that settled while nothing was draining. Placed
+                        // inside the non-cancelled branch, not after it: a
+                        // cancelled job must not run this, and this must not be
+                        // able to skip the bookkeeping below it.
+                        surfaceRuntimeInbox()
+                    }
                 } else {
-                    AppLogger.info(TAG_STREAM, "resume _isStreaming SKIPPED (stale job)")
+                    AppLogger.info(TAG_STREAM, "$phase _isStreaming SKIPPED (stale job)")
                 }
-                AppLogger.info(TAG_STREAM, "resume streamJob EXIT")
+                AppLogger.info(TAG_STREAM, "$phase streamJob EXIT")
             }
         }
     }
@@ -12871,11 +14680,56 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
                     "${entity.partsJson.length} bytes)"
             }
 
-            // Skip user messages with no visible content (toolResult-only internal messages,
-            // or messages that were entirely a system-reminder). A user message that is
-            // *only* an image attachment (no caption) still has visible content and must
-            // not be skipped — restoredImageUris carries it.
-            if (entity.role == "user" && text.isBlank() && restoredImageUris.isEmpty()) return@mapNotNull null
+            // [T-android-r37-system-row] A row the app synthesised on the USER
+            // role — the `<system-reminder>` re-entries from resume() and from
+            // the delegated-child abnormal-end report — carries its injected
+            // text here, verbatim, for DISPLAY ONLY. It is read straight from
+            // the persisted parts (never from `text`, which the loop above has
+            // already stripped) so the neutral system row can show exactly the
+            // bytes the model received.
+            //
+            // `content` still stays empty and `countsAsHumanTurn()` still says
+            // false: injectable plumbing must not become a human turn and shift
+            // the retry / delete / rewind anchors.
+            val injectedSystemText = if (
+                entity.role == "user" && provenance in APP_SYSTEM_PROVENANCES
+            ) {
+                verbatimTextPartsOf(entity.partsJson)
+            } else {
+                null
+            }
+
+            // Skip user messages with no visible content (toolResult-only internal
+            // messages, or messages that were entirely a system-reminder).
+            //
+            // [T-android-human-turn-count-parity] This is the SIXTH place that
+            // decides what a human turn is, so it uses the same `isHumanTurnShape`
+            // rule as retry / delete / navigation. It previously tested
+            // `text.isBlank() && restoredImageUris.isEmpty()` — image URIs only —
+            // so a message consisting of a non-image attachment with no caption
+            // was dropped from the transcript entirely. `sendMessage` explicitly
+            // allows that send (`trimmed.isBlank() && _attachments.value.isEmpty()`
+            // is the reject condition), so the user's file went to the model while
+            // their bubble vanished. Attachments (image or file) are visible
+            // content: the bubble renders a chip for each.
+            //
+            // [T-android-r37-system-row] A reminder-only row used to be dropped
+            // here — its `text` is empty once the reminder is stripped — which
+            // made every app injection INVISIBLE in the app layer. R37 requires
+            // the opposite: such a row must appear as a neutral system row with
+            // the injected text behind a tap. Only rows that really carry
+            // injected text are kept; a toolResult-only row still has nothing to
+            // display and is still dropped by this same test.
+            if (entity.role == "user" &&
+                injectedSystemText == null &&
+                !isHumanTurnShape(
+                    role = "user",
+                    text = text,
+                    attachmentCount = restoredImageUris.size + restoredFileNames.size,
+                )
+            ) {
+                return@mapNotNull null
+            }
             // Skip assistant messages that became empty after stripping system-reminders
             // and have no tool / thinking blocks to fall back on — would otherwise
             // render as a phantom blank assistant bubble.
@@ -12891,6 +14745,9 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
                 attachmentUris = restoredAttachmentUris,
                 toolBlocks = blocks,
                 provenance = provenance,
+                // [T-android-r37-system-row] Verbatim injected text for the
+                // neutral system row (null for every ordinary row).
+                injectedSystemText = injectedSystemText,
                 sourceDbIds = listOf(entity.id),
                 // [T-error-persist-android] Restore the persisted terminal error
                 // so the inline error banner + Retry button survive a reload.
@@ -12899,6 +14756,16 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
                 // legacy/other-writer "" row.
                 error = entity.errorInfo?.takeIf { it.isNotBlank() },
             )
+                // [T-android-thinking-level-persist] Restore the per-message
+                // attribution snapshot (provider · model · thinking level) this
+                // row was written with. Without this the four persisted columns
+                // never reach the UI model at all: the header fell back to the
+                // Soul name ("Minis") and the level capsule could never render,
+                // because `assistantHeaderSnapshot` is built from exactly these
+                // fields and every DB-restored row left them null. The
+                // in-memory case only ever looked right because a live bubble is
+                // constructed with the values already in hand.
+                .withPersistedAttribution(entity)
         }.let { messages ->
             // Merge consecutive assistant messages into one:
             // agent loop persists each turn separately, but UI should show them as a single message.
@@ -12936,6 +14803,19 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
                         // to the LAST assistant row of the turn, so the later row
                         // (`msg`) wins; fall back to `prev` if only it carried one.
                         error = msg.error ?: prev.error,
+                        // [T-android-thinking-level-persist] A user turn that
+                        // ran tools persists SEVERAL assistant rows, and the
+                        // merge drops every field it does not name — so the
+                        // attribution has to be carried across explicitly or the
+                        // whole turn loses it (the merged row keeps `prev`'s
+                        // values, and `prev` is only the first row). Same
+                        // precedence as `error`: a row that has no recorded
+                        // snapshot (a tool-result-side row, a pre-v14 row) must
+                        // not blank out the one that does.
+                        modelDisplayName = msg.modelDisplayName ?: prev.modelDisplayName,
+                        providerType = msg.providerType ?: prev.providerType,
+                        providerInstanceId = msg.providerInstanceId ?: prev.providerInstanceId,
+                        thinkingLevel = msg.thinkingLevel ?: prev.thinkingLevel,
                     )
                 } else {
                     merged.add(msg)
@@ -13183,3 +15063,183 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
         }
     }
 }
+
+/**
+ * [T-android-thinking-level-persist] Decode a persisted `messages.thinking_level`
+ * back into a level, keeping "not recorded" distinct from any real level.
+ *
+ * NULL/blank means the row predates the column (or was written by a path that
+ * has no turn level to record), and that must stay NULL rather than collapse to
+ * a default: the header renders a level capsule only when a level is present, so
+ * a fabricated default would put a capsule on every historical message claiming
+ * a level nobody ever chose.
+ *
+ * Deliberately NOT `ThinkingLevel.decoded(raw)` on its own: `decoded` clamps any
+ * unrecognised token to XHIGH (a deliberate choice for a *config* value that
+ * must never throw), but applied to a blank stored string it would turn "not
+ * recorded" into "XHigh". A token written by a NEWER build still goes through
+ * `decoded`, which is exactly what that clamp is for.
+ *
+ * Split out as a top-level function so the read path is exercised by the JVM
+ * tests instead of being mirrored there — see MessageThinkingLevelPersistenceTest.
+ */
+internal fun persistedThinkingLevel(raw: String?): ThinkingLevel? {
+    val token = raw?.trim().orEmpty()
+    if (token.isEmpty()) return null
+    return ThinkingLevel.decoded(token)
+}
+
+/**
+ * [T-android-thinking-level-persist] Copy a DB row's persisted attribution
+ * snapshot onto the UI model.
+ *
+ * This is the read half of the fix: `MessageEntity` has carried
+ * `model_display_name` / `provider_type` / `provider_instance_id` since
+ * MIGRATION_11_12 and `thinking_level` since MIGRATION_13_14, but nothing ever
+ * copied them into `ChatMessage`, so `assistantHeaderSnapshot` (which is built
+ * from exactly these fields) was null for every row restored from disk. The
+ * header then rendered the Soul name and the level capsule could not render at
+ * all — the live path only looked right because a freshly created bubble is
+ * constructed with these values in hand.
+ *
+ * Top-level (not a private member on the ViewModel) so production code and the
+ * tests call the SAME function; a JVM test cannot instantiate the ViewModel.
+ */
+internal fun ChatMessage.withPersistedAttribution(row: MessageEntity): ChatMessage =
+    copy(
+        modelDisplayName = row.modelDisplayName,
+        providerType = row.providerType,
+        providerInstanceId = row.providerInstanceId,
+        thinkingLevel = persistedThinkingLevel(row.thinkingLevel),
+    )
+
+/**
+ * [T-android-child-restart] The task text a restarted child is re-run on.
+ *
+ * `RuntimeSessionNode.task` is the field the runtime tree offers, but it is NOT
+ * the delegated prompt: `SessionTreeRuntime.createChild` defaults `task` to
+ * `model.note`, and `RuntimeSessionCoordinator.delegate` fills that note from the
+ * composer's `--note=` option — so for a `/subagent …` command without `--note`
+ * the node's task is empty, and the parent would restart a child with no idea
+ * what it was asked to do. The child's OWN opening transcript row is the text it
+ * was actually delegated with: `RuntimeChildRunner` writes the prompt as the
+ * session's first message before the model is called and never rewrites it, so it
+ * survives interruption, a restart and app death.
+ *
+ * Hence the transcript wins, the node's task is the fallback, and `null` means
+ * there is nothing to re-run: the caller refuses rather than fabricating a task,
+ * because a child re-run on an invented task would spend the parent's time on
+ * work nobody asked for while the tool reported a successful restart.
+ *
+ * Top-level (not a private member on the ViewModel) so production code and the
+ * tests call the SAME function; a JVM test cannot instantiate the ViewModel.
+ */
+internal fun restartedChildTaskPrompt(fromNode: String?, fromTranscript: String?): String? =
+    fromTranscript?.trim()?.takeIf { it.isNotBlank() }
+        ?: fromNode?.trim()?.takeIf { it.isNotBlank() }
+
+/**
+ * [T-android-child-restart] The main agent's tool table, composed.
+ *
+ * Extracted from `ChatViewModel.agentTools` for one reason: the restart half of
+ * the requirement needs a decision made HERE — whether a model may even see
+ * `restart_descendant` — and a decision a JVM test cannot observe is a decision
+ * nobody can keep honest. The function therefore PASSES the criterion through
+ * (below); the extraction is what lets `MainAgentToolsRestartAvailabilityTest`
+ * assert on the tool table itself instead of on a comment.
+ *
+ * Why the argument is threaded rather than left to the default:
+ * `AgentTools.makeAgentTools` fills the table from `restartAvailable`, whose
+ * default is `false`, so OMITTING it is not a no-op — it hides a fully
+ * implemented and wired capability from every model turn, silently. That
+ * happened here once: the runtime transition, the authorization, the executor
+ * branch and the launcher were all finished and wired, and the model still never
+ * saw the name, because this call site did not pass the flag. That is the defect
+ * family this whole feature is about ("built, and nothing in production calls
+ * it"), and it is now pinned by a test that reads the table.
+ *
+ * The criterion is neither a constant nor a setting: `restart_descendant` is
+ * offered exactly when this session's runtime subtree holds a descendant the
+ * tree says can be restarted ([RuntimeSessionCoordinator.hasRestartableDescendant]).
+ * With nothing to restart the tool is absent, so the model cannot burn turns on
+ * it; the moment an interrupted child exists, the next recomputation of this
+ * table includes it and the parent can act.
+ *
+ * Top-level (not a private member on the ViewModel) so production and the tests
+ * call the SAME function — the same reason `withPersistedAttribution` and
+ * `restartedChildTaskPrompt` above are top-level.
+ */
+internal fun mainAgentTools(
+    supportsImageInput: Boolean,
+    visionGroupConfigured: Boolean,
+    memoryEnabled: Boolean,
+    goalActive: Boolean,
+    coordinator: RuntimeSessionCoordinator?,
+    actorSessionId: String,
+): List<AgentToolDefinition> = AgentTools.makeAgentTools(
+    supportsImageInput = supportsImageInput,
+    visionGroupConfigured = visionGroupConfigured,
+    memoryEnabled = memoryEnabled,
+    goalActive = goalActive,
+    // A null coordinator means the runtime tree is not open at all, which is
+    // "nothing known to restart" — not an invitation to offer the tool.
+    restartAvailable = coordinator != null && coordinator.hasRestartableDescendant(actorSessionId),
+)
+
+/**
+ * [T-android-slash-goal-fork] The built-in slash commands, in display order.
+ *
+ * Subtitles are placeholders: [ChatViewModel.filteredSlashCommands] rebuilds
+ * them from the current localized state on every open.
+ */
+internal fun defaultSlashCommandCatalog(): List<SlashCommand> = listOf(
+        SlashCommand(
+            id = "clear",
+            icon = Icons.Default.Delete,
+            title = "Clear",
+            subtitle = "",
+        ),
+        SlashCommand(
+            id = "compact",
+            icon = Icons.Default.Compress,
+            title = "Compact",
+            subtitle = "",
+        ),
+        SlashCommand(
+            id = "memory",
+            icon = Icons.Default.Psychology,
+            title = "Memory",
+            subtitle = "",
+        ),
+        SlashCommand(
+            id = "thinking",
+            icon = Icons.Default.Lightbulb,
+            title = "Thinking",
+            subtitle = "",
+        ),
+        // [T-android-slash-goal-fork] `/goal` and `/fork` were fully implemented
+        // and reachable by typing them out, but absent from this list — the only
+        // place the user discovers commands. The requirement describes the
+        // picker as the primary path ("回车=点击联想项"), so commands missing here
+        // are effectively undiscoverable.
+        //
+        // Both FILL the composer rather than executing: they take an argument
+        // (the objective / the new session's name), so a tap that fired them
+        // immediately would either fail or act on nothing. Their `fillText` is
+        // explicit because `/fork` must stay lowercase and match the parser in
+        // ForkGoalCommandParser, which cannot be derived from the display title.
+        SlashCommand(
+            id = "fork",
+            icon = Icons.Default.CallSplit,
+            title = "Fork",
+            subtitle = "",
+            fillText = SlashCommandWords.FORK + " ",
+        ),
+        SlashCommand(
+            id = "goal",
+            icon = Icons.Default.Flag,
+            title = "Goal",
+            subtitle = "",
+            fillText = SlashCommandWords.GOAL + " ",
+        ),
+    )

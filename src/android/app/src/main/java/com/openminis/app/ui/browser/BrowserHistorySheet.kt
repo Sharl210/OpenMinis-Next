@@ -1,5 +1,6 @@
 package com.openminis.app.ui.browser
 
+import android.widget.Toast
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -17,6 +18,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Error
 import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.StarBorder
@@ -37,6 +39,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -64,6 +67,7 @@ fun BrowserHistorySheet(
     initialBookmarks: Boolean = false,
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    val context = LocalContext.current
     var searchQuery by remember { mutableStateOf("") }
     var showClearConfirm by remember { mutableStateOf(false) }
     var showBookmarks by remember { mutableStateOf(initialBookmarks) }
@@ -75,6 +79,19 @@ fun BrowserHistorySheet(
     }
     val bookmarks: List<BrowserHistoryStore.Bookmark> = remember(searchQuery, refreshKey) {
         historyStore.searchBookmarks(searchQuery)
+    }
+    // An empty list and an unreadable file are different facts. Without this the
+    // sheet showed "No browsing history" / "No bookmarks saved" over a read
+    // failure, which reads as "everything is gone".
+    val libraryLoadFailed = historyStore.loadStatus.failed
+    val onWriteFailure: (BrowserHistoryStore.WriteOutcome<*>) -> Unit = { outcome ->
+        if (outcome.failed) {
+            Toast.makeText(
+                context,
+                context.getString(R.string.browser_library_write_failed),
+                Toast.LENGTH_SHORT,
+            ).show()
+        }
     }
 
     ModalBottomSheet(onDismissRequest = onDismiss, sheetState = sheetState) {
@@ -119,6 +136,28 @@ fun BrowserHistorySheet(
                 }
                 MinisTextButton(onClick = onDismiss) {
                     Text(stringResource(R.string.browser_history_done))
+                }
+            }
+
+            if (libraryLoadFailed) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Icon(
+                        Icons.Default.Error,
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp),
+                        tint = MaterialTheme.colorScheme.error,
+                    )
+                    Text(
+                        text = stringResource(R.string.browser_library_load_failed),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
                 }
             }
 
@@ -179,7 +218,7 @@ fun BrowserHistorySheet(
                                 }
                                 IconButton(
                                     onClick = {
-                                        historyStore.removeBookmark(entry.id)
+                                        onWriteFailure(historyStore.removeBookmark(entry.id))
                                         refreshKey++
                                     },
                                     modifier = Modifier.size(48.dp),
@@ -249,7 +288,7 @@ fun BrowserHistorySheet(
                                 }
                                 IconButton(
                                     onClick = {
-                                        historyStore.deleteHistory(entry.id)
+                                        onWriteFailure(historyStore.deleteHistory(entry.id))
                                         refreshKey++
                                     },
                                     modifier = Modifier.size(48.dp),
@@ -282,7 +321,7 @@ fun BrowserHistorySheet(
             text = { Text(stringResource(R.string.browser_history_clear_dialog_message)) },
             confirmButton = {
                 MinisTextButton(onClick = {
-                    historyStore.clear()
+                    onWriteFailure(historyStore.clear())
                     refreshKey++
                     showClearConfirm = false
                 }) {

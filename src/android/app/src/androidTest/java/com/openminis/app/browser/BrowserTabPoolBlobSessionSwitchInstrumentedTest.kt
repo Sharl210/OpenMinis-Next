@@ -48,13 +48,29 @@ class BrowserTabPoolBlobSessionSwitchInstrumentedTest {
         val bStarted = CountDownLatch(1)
         val releaseB = CountDownLatch(1)
         pool.blobDownloadWriter = { file, bytes ->
-            if (file.parentFile?.parentFile?.name == "blob-switch-a") {
+            // [T-android-browser-download-dir] Identify the session by the FILE
+            // NAME the pool chose, not by walking up the directory tree.
+            //
+            // This used to test `file.parentFile?.parentFile?.name`, i.e. it
+            // assumed the depth `<session>/workspace/<file>`. When downloads
+            // moved one level deeper into `workspace/downloads/`, that guess
+            // started matching the OTHER branch, so session A's write released
+            // session B's latch and the test failed with a bare AssertionError —
+            // reporting a product bug that did not exist. A depth-based guess
+            // about an implementation detail is not a thing to assert on.
+            if (file.name == "a.txt") {
                 aStarted.countDown()
                 assertTrue(releaseA.await(5, TimeUnit.SECONDS))
             } else {
                 bStarted.countDown()
                 assertTrue(releaseB.await(5, TimeUnit.SECONDS))
             }
+            // Pin the layout itself where it is actually decided.
+            assertEquals(
+                "browser downloads must land in the dedicated subdirectory",
+                "downloads",
+                file.parentFile?.name,
+            )
             file.writeBytes(bytes)
         }
 
@@ -66,12 +82,43 @@ class BrowserTabPoolBlobSessionSwitchInstrumentedTest {
         assertEquals("b.txt", pool.activeDownload.value?.filename)
 
         releaseA.countDown()
-        awaitState(filesDir, "blob-switch-a", "a.txt", "COMPLETED", 6L)
+        // [T-android-cross-session-download-settle] A's download must end
+        // CANCELLED, not COMPLETED.
+        //
+        // `setSession` destroys every tab and cancels the previous session's
+        // in-flight downloads (BrowserTabPool.kt:270-276), which is the product
+        // contract: a browser session's tabs — and the downloads they started —
+        // do not survive a session switch. Asserting COMPLETED here contradicted
+        // that contract, so it could only ever pass by racing the cancellation;
+        // it timed out instead.
+        //
+        // The state must also be RECORDED. `updateDownloadEntry` resolves the
+        // target session through `downloadBindings[id]`, so cancelling while the
+        // binding was already removed left A's persisted entry stuck at
+        // DOWNLOADING forever. `setSession` now settles before dropping the
+        // binding.
+        awaitState(filesDir, "blob-switch-a", "a.txt", "FAILED", 0L)
+        assertEquals(
+            "the cancelled download must not be left claiming to be in progress",
+            "FAILED",
+            downloadStateOf(filesDir, "blob-switch-a", "a.txt"),
+        )
         assertFalse(File(filesDir, "browser_tabs/blob-switch-b.downloads.json").readText().contains("a.txt"))
         assertEquals("b.txt", pool.activeDownload.value?.filename)
 
         releaseB.countDown()
         awaitState(filesDir, "blob-switch-b", "b.txt", "COMPLETED", 6L)
+    }
+
+    /** Raw recorded state for `filename` in `session`, or null when absent. */
+    private fun downloadStateOf(root: File, session: String, filename: String): String? {
+        val file = File(root, "browser_tabs/$session.downloads.json")
+        if (!file.isFile) return null
+        val rows = JSONObject(file.readText()).optJSONArray("downloads") ?: return null
+        return (0 until rows.length())
+            .map { rows.getJSONObject(it) }
+            .firstOrNull { it.optString("filename") == filename }
+            ?.optString("state")
     }
 
     private suspend fun awaitState(root: File, session: String, filename: String, expected: String, expectedBytes: Long) {

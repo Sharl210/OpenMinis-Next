@@ -106,6 +106,14 @@ data class RuntimeCommunicationReplyRoute(
 /**
  * Metadata-only communication record. It intentionally has no payload,
  * transcript, attachment, or media-byte field.
+ *
+ * [attachedContext] does not weaken that rule: it is a REFERENCE to messages in
+ * the sender's own conversation (a locator plus indices), not the messages, and
+ * [RuntimeContextAttachment] has no text field to put them in. It exists because
+ * the dispatcher may choose what the receiver is offered
+ * (`plans/ULW-2026-09-25-01/request.md:138`), and the record is where that
+ * choice is durably written down so the receiver can pull exactly as much as its
+ * own context window can afford.
  */
 data class RuntimeCommunicationMetadata(
     val recordId: String = UUID.randomUUID().toString(),
@@ -120,6 +128,7 @@ data class RuntimeCommunicationMetadata(
     val senderCapabilityVersion: RuntimeCapabilitySnapshotVersion,
     val receiverCapabilityVersion: RuntimeCapabilitySnapshotVersion,
     val directoryPolicy: RuntimeCommunicationDirectoryPolicy,
+    val attachedContext: RuntimeContextAttachment? = null,
 ) {
     init {
         require(recordId.isNotBlank()) { "recordId must not be blank" }
@@ -231,59 +240,44 @@ class RuntimeCommunicationDirectory(
     fun find(recordId: String): RuntimeCommunicationMetadata? = records[recordId]
 
     @Synchronized
+    fun allRecords(): List<RuntimeCommunicationMetadata> = records.values.toList()
+
+    @Synchronized
+    fun size(): Int = records.size
+
+    @Synchronized
+    fun replaceAll(values: List<RuntimeCommunicationMetadata>) {
+        records.clear()
+        values.forEach { records[it.recordId] = it }
+        revision++
+    }
+    @Synchronized
     fun query(query: RuntimeCommunicationQuery): RuntimeCommunicationQueryResult {
         if (query.limit !in 1..maxPageLimit) {
-            return RuntimeCommunicationQueryResult.Rejected(
-                RuntimeCommunicationQueryRejection.PAGE_LIMIT_EXCEEDED,
-            )
+            return RuntimeCommunicationQueryResult.Rejected(RuntimeCommunicationQueryRejection.PAGE_LIMIT_EXCEEDED)
         }
         if (query.resultBudgetChars !in 1..maxResultBudgetChars) {
-            return RuntimeCommunicationQueryResult.Rejected(
-                RuntimeCommunicationQueryRejection.RESULT_BUDGET_EXCEEDED,
-            )
+            return RuntimeCommunicationQueryResult.Rejected(RuntimeCommunicationQueryRejection.RESULT_BUDGET_EXCEEDED)
         }
         val offset = decodeOffset(query.cursor) ?: if (query.cursor == null) 0 else {
-            return RuntimeCommunicationQueryResult.Rejected(
-                RuntimeCommunicationQueryRejection.INVALID_CURSOR,
-            )
+            return RuntimeCommunicationQueryResult.Rejected(RuntimeCommunicationQueryRejection.INVALID_CURSOR)
         }
         val matching = records.values.filter { record ->
-            (query.address == null ||
-                record.sender.address == query.address || record.receiver.address == query.address) &&
-                (query.peerSessionId == null ||
-                    record.sender.sessionId == query.peerSessionId ||
-                    record.receiver.sessionId == query.peerSessionId) &&
-                (query.summaryContains == null ||
-                    record.summary.contains(query.summaryContains, ignoreCase = true)) &&
+            (query.address == null || record.sender.address == query.address || record.receiver.address == query.address) &&
+                (query.peerSessionId == null || record.sender.sessionId == query.peerSessionId || record.receiver.sessionId == query.peerSessionId) &&
+                (query.summaryContains == null || record.summary.contains(query.summaryContains, ignoreCase = true)) &&
                 (query.direction == null || record.direction == query.direction) &&
                 (query.state == null || record.state == query.state) &&
                 (query.directoryPolicy == null || record.directoryPolicy == query.directoryPolicy)
         }
-        if (offset > matching.size) {
-            return RuntimeCommunicationQueryResult.Rejected(
-                RuntimeCommunicationQueryRejection.INVALID_CURSOR,
-            )
-        }
+        if (offset > matching.size) return RuntimeCommunicationQueryResult.Rejected(RuntimeCommunicationQueryRejection.INVALID_CURSOR)
         val pageRecords = matching.drop(offset).take(query.limit)
-        val estimate = pageRecords.sumOf(::estimateChars)
-        if (estimate > query.resultBudgetChars) {
-            return RuntimeCommunicationQueryResult.Rejected(
-                RuntimeCommunicationQueryRejection.RESULT_BUDGET_EXCEEDED,
-            )
+        if (pageRecords.sumOf(::estimateChars) > query.resultBudgetChars) {
+            return RuntimeCommunicationQueryResult.Rejected(RuntimeCommunicationQueryRejection.RESULT_BUDGET_EXCEEDED)
         }
         val end = offset + pageRecords.size
-        val next = if (end < matching.size) {
-            RuntimeCommunicationCursor("v$revision-$end")
-        } else {
-            null
-        }
-        return RuntimeCommunicationQueryResult.Accepted(
-            RuntimeCommunicationMetadataPage(
-                records = pageRecords,
-                nextCursor = next,
-                totalMatchingRecords = matching.size,
-            ),
-        )
+        val next = if (end < matching.size) RuntimeCommunicationCursor("v$revision-$end") else null
+        return RuntimeCommunicationQueryResult.Accepted(RuntimeCommunicationMetadataPage(pageRecords, next, matching.size))
     }
 
     @Synchronized

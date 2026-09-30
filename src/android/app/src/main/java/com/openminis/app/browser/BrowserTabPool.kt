@@ -26,14 +26,53 @@ import java.util.Date
 import java.util.concurrent.ConcurrentHashMap
 
 /**
- * Manages up to 10 browser tabs for the agent, mirroring iOS BrowserTabPool.
+ * [T-android-browser-download-dir] The dedicated directory for browser
+ * downloads, as a child of the session workspace root.
+ *
+ * The requirement asks for a place that "专门存放从浏览器下载的东西" rather than
+ * mixing them into the general workspace, while the agent must still be able to
+ * read them later (that is why it stays under the workspace root and not in
+ * `/var/minis/browser`, which holds `fetch` output and screenshots).
+ *
+ * Top-level and pure on purpose: it takes a `File?` and returns a `File?`, so a
+ * JVM test can pin the layout without a Context, a WebView or a fake filesystem.
+ * The metadata binding still points at the WORKSPACE ROOT (not this
+ * subdirectory), which is what keeps `destinationRelativePath` — now
+ * `downloads/<name>` — inside the existing traversal guard.
+ */
+internal fun browserDownloadDir(workspace: File?): File? = workspace?.let {
+    File(it, "downloads").apply { mkdirs() }
+}
+
+/**
+ * Manages the agent's browser tabs, mirroring iOS BrowserTabPool. The ceiling is
+ * [MAX_TABS] (currently 20); this line used to hardcode "10" and stayed behind
+ * when the constant was raised, so the file described a limit it no longer
+ * enforced. Refer to the constant instead of restating the number.
  * All tabs share the same cookie store by default on Android.
  */
 class BrowserTabPool(private val context: Context) {
 
     companion object {
         private const val TAG = "BrowserTabPool"
-        const val MAX_TABS = 10
+
+        /**
+         * Maximum concurrently creatable tabs.
+         *
+         * Raised 10 → 20 to match the product requirement ("把浏览器的最大允许
+         * 创建的页面上限，改为 20 个"). The pool previously capped at 10 and the
+         * sheet showed "N/10"; the 11th acquire failed with "Maximum 10 tabs
+         * reached". Tabs are page-backed WebViews and the pool already reclaims
+         * them via idle sleep + eviction, so a higher ceiling is a capacity
+         * question the pool is designed to answer, not a reason to cap below
+         * what was asked for.
+         */
+        const val MAX_TABS = 20
+        /**
+         * Bounded so a long session cannot accumulate sleeping records forever.
+         * Oldest are dropped first (see `evictIdleTabs`).
+         */
+        const val MAX_SLEEPING_TABS = 50
         internal fun canCreateTab(currentCount: Int): Boolean = currentCount < MAX_TABS
         private const val IDLE_CHECK_INTERVAL_MS = 60_000L  // 60 seconds
         /** Default idle timeout — matches iOS BrowserTabPool.idleTimeout (15 minutes). */
@@ -144,6 +183,41 @@ class BrowserTabPool(private val context: Context) {
     /** Whether any tab is currently executing an agent action. */
     val isAgentBusy: Boolean get() = _tabs.value.any { it.inUse }
 
+    /**
+     * Tab the user currently has on screen, or null while the browser panel is
+     * closed. Set by the UI, read by the idle evictor.
+     *
+     * [T-browser-user-viewing-tab] The requirement names this condition
+     * explicitly: a page sleeps only when "模型也不用执行，我们也没有打开去看"
+     * — the model isn't executing AND we haven't opened it to look. The evictor
+     * previously consulted only `inUse`, which nothing on the UI side ever set,
+     * so the tab a user was reading was destroyed under them (and, because the
+     * evicted tab's saved URL is keyed by a runtime id the pool never reuses, it
+     * never came back). "Being looked at" is now a first-class input to
+     * eviction instead of an accident of which tab happened to be busy.
+     */
+    private val _userViewingTabId = MutableStateFlow<Int?>(null)
+    val userViewingTabId: StateFlow<Int?> = _userViewingTabId.asStateFlow()
+
+    /** UI: the panel is showing [tabId], or pass null when it is dismissed. */
+    fun setUserViewing(tabId: Int?) {
+        _userViewingTabId.value = tabId
+    }
+
+    /**
+     * Refresh one tab's activity timestamp for a user-driven operation
+     * (typing a URL, back/forward, reload, selecting a tab chip, page touch).
+     *
+     * The requirement's "页面本身没有任何…操作" is about activity in general, not
+     * only agent activity, so user actions have to count as activity too —
+     * otherwise a page a user is actively driving looks idle to the evictor.
+     */
+    fun touchTab(tabId: Int) {
+        _tabs.value.firstOrNull { it.id == tabId }?.let {
+            it.lastActivityDate = Date()
+        }
+    }
+
     /** Currently selected tab's manager, or the first tab's if none selected — mirrors iOS activeManager. */
     val activeManager: BrowserUseManager?
         get() {
@@ -164,6 +238,22 @@ class BrowserTabPool(private val context: Context) {
     private val persistedPageIds = mutableMapOf<Int, String>()
     private val savedTitles = mutableMapOf<Int, String>()
     private val persistedTabRecords = mutableMapOf<Int, BrowserTabRecord>()
+
+    /**
+     * Pages the idle evictor has put to sleep, newest first.
+     *
+     * [T-browser-sleeping-tabs-visible] Sleep must be *visible and reversible*,
+     * otherwise "休眠" is just a silent close. Before this, an evicted tab was
+     * dropped from [tabs] with its metadata filed under its runtime id — and
+     * because `nextTabId` is monotonic and never reused inside a process, no
+     * later `createTab` could ever match that id again. The page was therefore
+     * unreachable for the rest of the session while its record kept being
+     * rewritten to disk on every `saveState()`: invisible, unrecoverable, and
+     * slowly accumulating. A user watching tabs disappear had no way to tell
+     * what happened or get their page back.
+     */
+    private val _sleepingTabs = MutableStateFlow<List<BrowserTabRecord>>(emptyList())
+    val sleepingTabs: StateFlow<List<BrowserTabRecord>> = _sleepingTabs.asStateFlow()
 
     /**
      * Global custom viewport. `0` means "use the UA profile default".
@@ -256,6 +346,43 @@ class BrowserTabPool(private val context: Context) {
 
     fun setSession(sessionId: String) {
         synchronized(downloadMetadataLock) {
+            if (this.sessionId == sessionId) return
+            _tabs.value.forEach { destroyTab(it) }
+            _tabs.value = emptyList()
+            _selectedTabId.value = 0
+            savedURLs.clear()
+            persistedPageIds.clear()
+            savedTitles.clear()
+            persistedTabRecords.clear()
+            _sleepingTabs.value = emptyList()
+            _sessionViewportWidth.value = 0
+            _sessionViewportHeight.value = 0
+            _activeDownload.value = null
+            // [T-android-cross-session-download-settle] Cancel the previous
+            // session's in-flight downloads AND record that cancellation in the
+            // OwNING session's metadata, in that order.
+            //
+            // Cancelling alone was not enough. `updateDownloadEntry` resolves the
+            // session to write to THROUGH `downloadBindings[id]` and returns
+            // early when the binding is gone — but the old code dropped the
+            // binding immediately, so when the cancelled coroutine's
+            // CancellationException handler later ran `settleDownload(...)` there
+            // was nothing to resolve and the write was silently skipped. The
+            // entry therefore stayed DOWNLOADING in that session's
+            // `*.downloads.json` FOREVER (persisted at registerDownload time)
+            // while its partial file had been deleted — a phantom in-progress
+            // download that could never finish and kept counting toward the
+            // download badge. Settling first, while the binding still resolves,
+            // records the truthful terminal state; the coroutine's own handler
+            // then becomes a harmless no-op.
+            val abandonedIds = downloadBindings.entries
+                .filter { it.value.sessionId != sessionId }
+                .map { it.key }
+                .toList()
+            for (id in abandonedIds) {
+                downloadJobs.remove(id)?.cancel()
+                settleDownload(id, DownloadState.FAILED, reason = "Cancelled")
+            }
             this.sessionId = sessionId
             loadSavedState()
             loadDownloadMetadataLocked()
@@ -405,9 +532,34 @@ class BrowserTabPool(private val context: Context) {
         persistDownloadMetadata(force = true)
     }
 
-    private fun registerDownload(dest: File, totalBytes: Long, sourceUrl: String? = null): Long {
+    // [T-browser-download-attribution] `tabId`/`pageId` are recorded at
+    // registration time, the same moment the entry is first persisted.
+    //
+    // The requirement lists 标签页 among the fields the download centre must
+    // record. The fields and their persistence already existed; nothing ever
+    // filled them, so every download was permanently unattributed and a
+    // multi-tab download could not be traced to the page that started it.
+    private fun registerDownload(
+        dest: File,
+        totalBytes: Long,
+        sourceUrl: String? = null,
+        tabId: Int? = null,
+        pageId: String? = null,
+    ): Long {
         val boundSession = sessionId ?: return -1L
-        val workspace = dest.parentFile ?: return -1L
+        // [T-android-browser-download-dir] The metadata root is the SESSION
+        // WORKSPACE ROOT, never the download's own parent directory.
+        //
+        // This read `dest.parentFile`, which was correct only while downloads sat
+        // directly in the workspace root. Moving them to `workspace/downloads/`
+        // silently turned that into the subdirectory itself, so `relativePath`
+        // dropped the prefix and stored `report.pdf` where the periodic flush
+        // stored `downloads/report.pdf` — two different paths for one download,
+        // depending on which write landed last. The loader resolves against the
+        // workspace ROOT, so the `report.pdf` form pointed after a restart at
+        // `workspace/report.pdf`: a file that does not exist. The download would
+        // have looked lost. Both paths now derive it from the same place.
+        val workspace = sessionWorkspaceDir() ?: return -1L
         val id = nextDownloadId.getAndIncrement()
         val entry = DownloadEntry(
             id = id,
@@ -419,6 +571,8 @@ class BrowserTabPool(private val context: Context) {
             startedAt = System.currentTimeMillis(),
             sessionId = boundSession,
             sourceUrl = sourceUrl,
+            tabId = tabId,
+            pageId = pageId,
         )
         synchronized(downloadMetadataLock) {
             downloadBindings[id] = DownloadBinding(
@@ -540,15 +694,17 @@ class BrowserTabPool(private val context: Context) {
         contentDisposition: String?,
         mimeType: String?,
         contentLength: Long,
+        tabId: Int? = null,
+        pageId: String? = null,
     ) {
-        val dir = sessionWorkspaceDir() ?: run {
+        val dir = browserDownloadDir(sessionWorkspaceDir()) ?: run {
             Log.w(TAG, "download rejected: no session bound to pool")
             return
         }
         val name = android.webkit.URLUtil.guessFileName(url, contentDisposition, mimeType)
         val dest = uniqueFile(dir, name)
         onDownloadEvent?.invoke("Downloading ${middleTruncated(dest.name)}…")
-        val id = registerDownload(dest, contentLength, sourceUrl = url)
+        val id = registerDownload(dest, contentLength, sourceUrl = url, tabId = tabId, pageId = pageId)
         val job = downloadScope.launch {
             try {
                 val conn = java.net.URL(url).openConnection() as java.net.HttpURLConnection
@@ -596,8 +752,15 @@ class BrowserTabPool(private val context: Context) {
     }
 
     /** Persist decoded blob: bytes (from the JS bridge) into the workspace. */
-    internal fun saveBlobDownload(data: ByteArray, filename: String, mimeType: String?) {
-        val dir = sessionWorkspaceDir() ?: run {
+    internal fun saveBlobDownload(
+        data: ByteArray,
+        filename: String,
+        mimeType: String?,
+        sourceUrl: String? = null,
+        tabId: Int? = null,
+        pageId: String? = null,
+    ) {
+        val dir = browserDownloadDir(sessionWorkspaceDir()) ?: run {
             Log.w(TAG, "blob download rejected: no session bound to pool")
             return
         }
@@ -610,7 +773,7 @@ class BrowserTabPool(private val context: Context) {
             }
         }
         val dest = uniqueFile(dir, name)
-        val id = registerDownload(dest, data.size.toLong())
+        val id = registerDownload(dest, data.size.toLong(), sourceUrl = sourceUrl, tabId = tabId, pageId = pageId)
         val job = downloadScope.launch {
             try {
                 blobDownloadWriter(dest, data)
@@ -642,9 +805,20 @@ class BrowserTabPool(private val context: Context) {
     }
 
     /** Route a manager's download callbacks into this pool's workspace saver. */
-    private fun wireDownloadHandlers(manager: BrowserUseManager) {
-        manager.onDownloadStart = { url, ua, cd, mime, len -> startUrlDownload(url, ua, cd, mime, len) }
-        manager.onBlobDownloadData = { data, name, mime -> saveBlobDownload(data, name, mime) }
+    // [T-browser-download-attribution] The tab identity is captured here, at
+    // wiring time, because the WebView-level download callbacks carry no tab
+    // context of their own — by the time bytes arrive the pool only sees a URL.
+    private fun wireDownloadHandlers(manager: BrowserUseManager, tabId: Int, pageId: String) {
+        manager.onDownloadStart = { url, ua, cd, mime, len ->
+            startUrlDownload(url, ua, cd, mime, len, tabId = tabId, pageId = pageId)
+        }
+        manager.onBlobDownloadData = { data, name, mime ->
+            // A blob:/data: download has no URL of its own — the data is minted
+            // by the page. Record the page it came from as the source so the
+            // entry is still traceable.
+            val pageUrl = manager.currentURL.value.takeIf { it.isNotBlank() }
+            saveBlobDownload(data, name, mime, sourceUrl = pageUrl, tabId = tabId, pageId = pageId)
+        }
     }
 
     // -- Agent Execution --
@@ -664,15 +838,47 @@ class BrowserTabPool(private val context: Context) {
      *   `BrowserTabPool.execute(action:singleTab:)`. Explicit tab_id always
      *   routes to that tab regardless of this flag.
      */
-    /** Resolve a DevTools target only when all three identities match the live pool. */
-    suspend fun resolveDevToolsTarget(
+    /**
+     * Resolve a DevTools target only when all three identities match the live
+     * pool, and run [block] while holding that tab active.
+     *
+     * [T-browser-devtools-holds-tab] Holding the tab is the point. DevTools
+     * diagnostics reach the WebView through a path that never set `inUse` or
+     * refreshed activity, so the idle evictor could `destroy()` the WebView in
+     * the middle of a script — `script_debug` may legitimately run for up to
+     * `MAX_SCRIPT_TIMEOUT_MS` (60s), far longer than the eviction tick. The
+     * requirement is explicit that a tab the model is running scripts against
+     * must not sleep, so this reuses the same `inUse` flag `browser_use` uses:
+     * one answer to "is this tab busy", not two.
+     *
+     * The hold is armed and released on the Main dispatcher (matching
+     * `acquireTab`), but [block] itself runs on the caller's dispatcher so a
+     * long script cannot block the UI thread.
+     */
+    suspend fun <T> withDevToolsTarget(
         requestedSessionId: String,
         tabId: Int,
         pageId: String,
-    ): BrowserUseManager? = withContext(Dispatchers.Main) {
-        val expectedSession = sessionId?.trim().orEmpty()
-        if (expectedSession.isBlank() || requestedSessionId.trim() != expectedSession) return@withContext null
-        _tabs.value.firstOrNull { it.id == tabId && it.pageId == pageId.trim() }?.manager
+        block: suspend (BrowserUseManager) -> T,
+    ): T? {
+        val tab = withContext(Dispatchers.Main) {
+            val expectedSession = sessionId?.trim().orEmpty()
+            if (expectedSession.isBlank() || requestedSessionId.trim() != expectedSession) {
+                return@withContext null
+            }
+            _tabs.value.firstOrNull { it.id == tabId && it.pageId == pageId.trim() }?.also {
+                it.inUse = true
+                it.lastActivityDate = Date()
+            }
+        } ?: return null
+        try {
+            return block(tab.manager)
+        } finally {
+            withContext(Dispatchers.Main) {
+                tab.inUse = false
+                tab.lastActivityDate = Date()
+            }
+        }
     }
 
     suspend fun execute(
@@ -684,6 +890,8 @@ class BrowserTabPool(private val context: Context) {
             BrowserAction.NEW_TAB -> newTab(input.url)
             BrowserAction.CLOSE_TAB -> closeTab(input.tabId)
             BrowserAction.LIST_TABS -> listTabs()
+            BrowserAction.LIST_DOWNLOADS -> listDownloads()
+            BrowserAction.RESTORE_TAB -> restoreTabAction(input.pageId)
             BrowserAction.SET_VIEWPORT -> handleSetViewport(input)
             BrowserAction.GET_HISTORY -> getHistory(input.query)
             BrowserAction.LIST_BOOKMARKS,
@@ -704,6 +912,8 @@ class BrowserTabPool(private val context: Context) {
             BrowserAction.CLEAR_FAVORITES -> clearBookmarks()
             BrowserAction.OPEN_BOOKMARK,
             BrowserAction.OPEN_FAVORITE -> openBookmark(input, singleTab)
+            BrowserAction.TOGGLE_BOOKMARK -> toggleBookmark(input)
+            BrowserAction.IS_BOOKMARKED -> isBookmarkedAction(input)
             else -> {
                 // [T-browser-use-per-tab-serial-android] Serialize per explicit
                 // tab id. Only an explicit tab_id that names an EXISTING tab can
@@ -964,7 +1174,13 @@ class BrowserTabPool(private val context: Context) {
         tab
     }
 
-    private fun createTab(tabs: MutableList<Tab>, url: String? = null): Tab? {
+    /**
+     * @param pageId keep a page's identity across a sleep/wake cycle. Callers
+     *   restoring a slept page pass the original id so the restored tab IS that
+     *   page (important for `browser_devtools` scope checks and for the page id
+     *   the user quotes); fresh tabs pass null and get a new identity.
+     */
+    private fun createTab(tabs: MutableList<Tab>, url: String? = null, pageId: String? = null): Tab? {
         if (!canCreateTab(tabs.size)) return null
 
         val id = nextTabId++
@@ -989,19 +1205,27 @@ class BrowserTabPool(private val context: Context) {
         // Setup window.open / close handlers
         manager.onNewWindow = { resultMsg -> handleNewWindow(resultMsg) }
         manager.onCloseWindow = { handleCloseWindow(manager) }
-        wireDownloadHandlers(manager)
+        // Resolve the page id BEFORE wiring downloads so the handlers can
+        // attribute entries to this page (see registerDownload).
+        val resolvedPageId = pageId ?: persistedPageIds.remove(id) ?: java.util.UUID.randomUUID().toString()
+        wireDownloadHandlers(manager, id, resolvedPageId)
 
-        val tab = Tab(id = id, pageId = persistedPageIds.remove(id) ?: java.util.UUID.randomUUID().toString(), manager = manager)
+        val tab = Tab(id = id, pageId = resolvedPageId, manager = manager)
         tabs.add(tab)
         _tabs.value = tabs.toList()
 
-        // Load saved URL or provided URL. When neither is supplied the tab
-        // is marked `needsInitialBlankPage` so the caller (acquireTab /
-        // newTab / handleNewWindow) can issue a blank-page load once we're
-        // back in a suspend context — a fresh tab with no page loaded
-        // reports WebView's hardcoded 980px fallback, hiding the session
-        // viewport override until the first real navigation.
-        val loadUrl = url ?: savedURLs.remove(id)
+        // Load the requested URL only. A fresh tab is genuinely fresh.
+        //
+        // [T-browser-sleeping-tabs-visible] This used to fall back to
+        // `savedURLs.remove(id)`, i.e. "whatever URL was last filed under this
+        // runtime id". Inside a process that could never match (ids are not
+        // reused), but after a restart `nextTabId` starts from 0 again while
+        // `savedURLs` was just repopulated from disk — so the Nth tab a user
+        // opened inherited the Nth stale record. A brand-new blank tab could
+        // silently load a page abandoned long ago, and bind its page id to it.
+        // Restoring a slept page is now an explicit act (`restoreSleepingTab`,
+        // addressed by page id) instead of a side effect of numbering luck.
+        val loadUrl = url
         if (loadUrl != null) {
             manager.loadURL(loadUrl)
         } else {
@@ -1010,6 +1234,40 @@ class BrowserTabPool(private val context: Context) {
 
         Log.i(TAG, "Created tab $id (total: ${tabs.size})")
         return tab
+    }
+
+    /**
+     * [T-browser-sleeping-tabs-visible] Bring a slept page back: creates a tab
+     * that keeps the page's identity and reloads its URL, then drops the
+     * sleeping record.
+     *
+     * Addressed by page id because that is the identity the requirement tells
+     * users to quote ("标题前显示稳定页 ID") — the runtime handle a live tab
+     * happens to carry is not an address.
+     *
+     * Returns null when the page was never slept or the tab ceiling is reached;
+     * the sleeping record is preserved on failure so the page is not lost by a
+     * failed attempt to reopen it.
+     */
+    suspend fun restoreSleepingTab(pageId: String): Tab? = withContext(Dispatchers.Main) {
+        val record = _sleepingTabs.value.firstOrNull { it.pageId == pageId } ?: return@withContext null
+        val currentTabs = _tabs.value.toMutableList()
+        if (!canCreateTab(currentTabs.size)) return@withContext null
+        // Keep the page id stable across the sleep/wake cycle: a restored page
+        // must be the SAME page to the user and to `browser_devtools` scope
+        // checks, not a new one that merely happens to load the same URL.
+        val tab = createTab(currentTabs, record.url.ifBlank { null }, pageId = record.pageId)
+            ?: return@withContext null
+        _selectedTabId.value = tab.id
+        _sleepingTabs.value = _sleepingTabs.value.filterNot { it.pageId == pageId }
+        saveState()
+        tab
+    }
+
+    /** Drop a slept page without reopening it. */
+    fun forgetSleepingTab(pageId: String) {
+        _sleepingTabs.value = _sleepingTabs.value.filterNot { it.pageId == pageId }
+        saveState()
     }
 
     // -- Tab Management Actions --
@@ -1055,17 +1313,54 @@ class BrowserTabPool(private val context: Context) {
         BrowserActionResult(text = "Closed tab $id")
     }
 
+    /**
+     * [T-browser-download-handle] The agent-facing view of this session's
+     * download centre: newest first, one line per entry, with everything the
+     * requirement asks to be recorded (source, tab/page, size, state, error)
+     * plus the path it landed on so the agent can actually use the file.
+     */
+    private fun listDownloads(): BrowserActionResult {
+        val entries = downloads.value
+        if (entries.isEmpty()) return BrowserActionResult(text = "No downloads in this session")
+        // Formatting is a pure function so the agent-facing shape can be tested
+        // without a live WebView (see formatDownloadEntryLine).
+        return BrowserActionResult(text = entries.joinToString("\n") { formatDownloadEntryLine(it) })
+    }
+
+    /** [T-browser-sleeping-tabs-visible] Reopen a slept page by its page id. */
+    private suspend fun restoreTabAction(pageId: String?): BrowserActionResult {
+        val id = pageId?.trim().orEmpty()
+        if (id.isBlank()) return BrowserActionResult.error("restore_tab requires page_id")
+        // Accept the short id that `list_tabs` shows, as well as the full one.
+        val record = _sleepingTabs.value.firstOrNull { it.pageId == id }
+            ?: _sleepingTabs.value.firstOrNull { it.pageId.startsWith(id) }
+            ?: return BrowserActionResult.error(
+                "No sleeping page matches '$id'. Use list_tabs to see sleeping page ids."
+            )
+        val restored = restoreSleepingTab(record.pageId)
+            ?: return BrowserActionResult.error(
+                "Cannot restore page ${record.pageId.take(8)}: tab limit reached ($MAX_TABS)"
+            )
+        return BrowserActionResult(text = "Restored page ${restored.pageId.take(8)} (tab ${restored.id})")
+    }
+
     private fun listTabs(): BrowserActionResult {
-        val lines = _tabs.value.map { tab ->
+        val live = _tabs.value.map { tab ->
             val marker = if (tab.id == _selectedTabId.value) "*" else " "
             val title = tab.manager.pageTitle.value.ifEmpty { "(blank)" }
             val url = tab.manager.currentURL.value.ifEmpty { "about:blank" }
             "$marker Tab ${tab.id}: $title — $url"
         }
-        return if (lines.isEmpty()) {
-            BrowserActionResult(text = "No open tabs")
-        } else {
-            BrowserActionResult(text = lines.joinToString("\n"))
+        // [T-browser-sleeping-tabs-visible] List slept pages too. Otherwise the
+        // page the user asked about is simply absent from the only inventory
+        // the agent has — it could not tell "this page was never opened" from
+        // "this page went to sleep", and neither could the user.
+        val asleep = _sleepingTabs.value.map { formatSleepingTabLine(it) }
+        return when {
+            live.isEmpty() && asleep.isEmpty() -> BrowserActionResult(text = "No open tabs")
+            asleep.isEmpty() -> BrowserActionResult(text = live.joinToString("\n"))
+            live.isEmpty() -> BrowserActionResult(text = asleep.joinToString("\n"))
+            else -> BrowserActionResult(text = (live + asleep).joinToString("\n"))
         }
     }
 
@@ -1092,9 +1387,10 @@ class BrowserTabPool(private val context: Context) {
         manager.applyViewport(vpW, vpH)
         manager.onNewWindow = { msg -> handleNewWindow(msg) }
         manager.onCloseWindow = { handleCloseWindow(manager) }
-        wireDownloadHandlers(manager)
+        val resolvedPageId = java.util.UUID.randomUUID().toString()
+        wireDownloadHandlers(manager, id, resolvedPageId)
 
-        val tab = Tab(id = id, pageId = java.util.UUID.randomUUID().toString(), manager = manager)
+        val tab = Tab(id = id, pageId = resolvedPageId, manager = manager)
         currentTabs.add(tab)
         _tabs.value = currentTabs
         _selectedTabId.value = id
@@ -1111,8 +1407,10 @@ class BrowserTabPool(private val context: Context) {
         val currentTabs = _tabs.value.toMutableList()
         val idx = currentTabs.indexOfFirst { it.manager === manager }
         if (idx >= 0) {
-            val closedId = currentTabs[idx].id
+            val closedTab = currentTabs[idx]
+            val closedId = closedTab.id
             currentTabs.removeAt(idx)
+            destroyTab(closedTab)
             _tabs.value = currentTabs
             if (_selectedTabId.value == closedId && currentTabs.isNotEmpty()) {
                 _selectedTabId.value = currentTabs.first().id
@@ -1127,6 +1425,9 @@ class BrowserTabPool(private val context: Context) {
     fun selectTab(id: Int) {
         if (_tabs.value.any { it.id == id }) {
             _selectedTabId.value = id
+            // Selecting a tab chip is a user operation on that page, so it has
+            // to count as activity — see touchTab.
+            touchTab(id)
         }
     }
 
@@ -1149,7 +1450,9 @@ class BrowserTabPool(private val context: Context) {
         val currentTabs = _tabs.value.toMutableList()
         val idx = currentTabs.indexOfFirst { it.id == tabId }
         if (idx < 0) return@withContext
+        val closedTab = currentTabs[idx]
         currentTabs.removeAt(idx)
+        destroyTab(closedTab)
         _tabs.value = currentTabs
         if (_selectedTabId.value == tabId && currentTabs.isNotEmpty()) {
             _selectedTabId.value = currentTabs.first().id
@@ -1225,7 +1528,25 @@ class BrowserTabPool(private val context: Context) {
 
     private fun historyStore(): BrowserHistoryStore = BrowserHistoryStore.getInstance(context)
 
+    /**
+     * [T-browser-library-honest-read] A library that could not be read is not an
+     * empty library. Without this, an unreadable `browser_history.json` made
+     * `get_history` / `list_bookmarks` answer "No browsing history" / "No
+     * bookmarks", which both the agent and the user read as "your saved items
+     * are gone" instead of "the read failed".
+     */
+    private fun libraryReadFailure(): BrowserActionResult? {
+        val status = historyStore().loadStatus
+        if (!status.failed) return null
+        val preserved = status.preservedCopy?.let { " The unreadable file was kept as $it." }.orEmpty()
+        return BrowserActionResult.error(
+            "Browser library could not be read (${status.error}). Saved history and bookmarks are NOT " +
+                "empty, they just could not be loaded.$preserved",
+        )
+    }
+
     private fun getHistory(query: String?): BrowserActionResult {
+        libraryReadFailure()?.let { return it }
         val entries = if (query.isNullOrBlank()) historyStore().getEntries() else historyStore().search(query)
         if (entries.isEmpty()) return BrowserActionResult(text = "No browsing history")
         val text = entries.joinToString("\n") { entry ->
@@ -1235,6 +1556,7 @@ class BrowserTabPool(private val context: Context) {
     }
 
     private fun listBookmarks(query: String?): BrowserActionResult {
+        libraryReadFailure()?.let { return it }
         val entries = if (query.isNullOrBlank()) historyStore().getBookmarks() else historyStore().searchBookmarks(query)
         if (entries.isEmpty()) return BrowserActionResult(text = "No bookmarks")
         val text = entries.joinToString("\n") { entry ->
@@ -1247,56 +1569,105 @@ class BrowserTabPool(private val context: Context) {
         val url = input.url?.trim().takeUnless { it.isNullOrEmpty() }
             ?: activeManager?.currentURL?.value?.takeUnless { it.isBlank() || it == "about:blank" }
         if (url == null) return BrowserActionResult.error("add_bookmark requires 'url' or an open page")
-        val bookmark = historyStore().addBookmark(
+        val outcome = historyStore().addBookmark(
             url,
             input.title?.takeIf { it.isNotBlank() } ?: activeManager?.pageTitle?.value.orEmpty(),
-        ) ?: return BrowserActionResult.error("invalid bookmark URL")
+        )
+        val bookmark = outcome.value ?: return BrowserActionResult.error(
+            if (outcome.persisted) "invalid bookmark URL"
+            else "Bookmark not saved: ${outcome.error}",
+        )
         return BrowserActionResult(text = "Bookmarked ${bookmark.url} (id: ${bookmark.id})")
     }
 
+    /**
+     * [T-browser-star-parity] The toolbar star is one button that both saves and
+     * un-saves, and lights up to show which. An agent asked to "tap the star"
+     * previously had to list bookmarks and decide the direction itself, and it
+     * could not read the current state of that star at all. Both operations were
+     * already implemented in `BrowserHistoryStore`; this only exposes them, so
+     * the agent's model of the button matches the button.
+     */
+    private fun toggleBookmark(input: BrowserActionInput): BrowserActionResult {
+        val url = input.url?.trim().takeUnless { it.isNullOrEmpty() }
+            ?: activeManager?.currentURL?.value?.takeUnless { it.isBlank() || it == "about:blank" }
+            ?: return BrowserActionResult.error("toggle_bookmark requires 'url' or an open page")
+        val outcome = historyStore().toggleBookmark(
+            url,
+            input.title?.takeIf { it.isNotBlank() } ?: activeManager?.pageTitle?.value.orEmpty(),
+        )
+        if (outcome.failed) return BrowserActionResult.error("Bookmark not toggled: ${outcome.error}")
+        if (!outcome.value) return BrowserActionResult(text = "Bookmark removed: $url")
+        val bookmark = historyStore().findBookmark(url)
+        return BrowserActionResult(text = "Bookmarked ${bookmark?.url ?: url} (id: ${bookmark?.id ?: "?"})")
+    }
+
+    private fun isBookmarkedAction(input: BrowserActionInput): BrowserActionResult {
+        libraryReadFailure()?.let { return it }
+        val url = input.url?.trim().takeUnless { it.isNullOrEmpty() }
+            ?: activeManager?.currentURL?.value?.takeUnless { it.isBlank() || it == "about:blank" }
+            ?: return BrowserActionResult.error("is_bookmarked requires 'url' or an open page")
+        val bookmark = historyStore().findBookmark(url)
+        return BrowserActionResult(
+            text = if (bookmark != null) "Bookmarked: ${bookmark.url} (id: ${bookmark.id})"
+            else "Not bookmarked: $url",
+        )
+    }
+
     private fun removeBookmark(input: BrowserActionInput): BrowserActionResult {
+        libraryReadFailure()?.let { return it }
         val key = input.itemId ?: input.url?.trim()?.takeIf { it.isNotEmpty() }
             ?: activeManager?.currentURL?.value?.takeUnless { it.isBlank() || it == "about:blank" }
         if (key == null) return BrowserActionResult.error("remove_bookmark requires 'item_id' or 'url'")
-        val removed = if (historyStore().findBookmark(key)?.id == key) {
-            historyStore().removeBookmark(key)
+        val store = historyStore()
+        val outcome = if (store.findBookmark(key)?.id == key) {
+            store.removeBookmark(key)
         } else {
-            historyStore().removeBookmarkForUrl(key)
+            store.removeBookmarkForUrl(key)
         }
-        return if (removed) BrowserActionResult(text = "Bookmark removed: $key")
+        if (outcome.failed) return BrowserActionResult.error("Bookmark not removed: ${outcome.error}")
+        return if (outcome.value) BrowserActionResult(text = "Bookmark removed: $key")
         else BrowserActionResult.error("Bookmark not found: $key")
     }
 
     private fun deleteHistory(input: BrowserActionInput): BrowserActionResult {
+        libraryReadFailure()?.let { return it }
         val key = input.itemId ?: input.url?.trim()?.takeIf { it.isNotEmpty() }
             ?: return BrowserActionResult.error("delete_history requires 'item_id' or 'url'")
-        val deleted = if (historyStore().getEntries().any { it.id == key }) {
-            historyStore().deleteHistory(key)
+        val store = historyStore()
+        val outcome = if (store.getEntries().any { it.id == key }) {
+            store.deleteHistory(key)
         } else {
-            historyStore().deleteHistoryForUrl(key)
+            store.deleteHistoryForUrl(key)
         }
-        return if (deleted) BrowserActionResult(text = "History deleted: $key")
+        if (outcome.failed) return BrowserActionResult.error("History entry not deleted: ${outcome.error}")
+        return if (outcome.value) BrowserActionResult(text = "History deleted: $key")
         else BrowserActionResult.error("History entry not found: $key")
     }
 
     private fun clearHistory(): BrowserActionResult {
-        historyStore().clear()
-        return BrowserActionResult(text = "Browsing history cleared")
+        val outcome = historyStore().clear()
+        if (outcome.failed) return BrowserActionResult.error("History not cleared: ${outcome.error}")
+        return BrowserActionResult(text = "Browsing history cleared (${outcome.value} entries)")
     }
 
     private fun deleteBookmark(input: BrowserActionInput): BrowserActionResult {
+        libraryReadFailure()?.let { return it }
         val key = input.itemId ?: input.url?.trim()?.takeIf { it.isNotEmpty() }
             ?: return BrowserActionResult.error("delete_bookmark requires 'item_id' or 'url'")
-        val bookmark = historyStore().findBookmark(key)
-        val deleted = if (bookmark != null) historyStore().removeBookmark(bookmark.id)
-        else historyStore().removeBookmarkForUrl(key)
-        return if (deleted) BrowserActionResult(text = "Bookmark deleted: $key")
+        val store = historyStore()
+        val bookmark = store.findBookmark(key)
+        val outcome = if (bookmark != null) store.removeBookmark(bookmark.id)
+        else store.removeBookmarkForUrl(key)
+        if (outcome.failed) return BrowserActionResult.error("Bookmark not deleted: ${outcome.error}")
+        return if (outcome.value) BrowserActionResult(text = "Bookmark deleted: $key")
         else BrowserActionResult.error("Bookmark not found: $key")
     }
 
     private fun clearBookmarks(): BrowserActionResult {
-        historyStore().clearBookmarks()
-        return BrowserActionResult(text = "Bookmarks cleared")
+        val outcome = historyStore().clearBookmarks()
+        if (outcome.failed) return BrowserActionResult.error("Bookmarks not cleared: ${outcome.error}")
+        return BrowserActionResult(text = "Bookmarks cleared (${outcome.value} removed)")
     }
 
     private suspend fun openBookmark(input: BrowserActionInput, singleTab: Boolean): BrowserActionResult {
@@ -1328,6 +1699,19 @@ class BrowserTabPool(private val context: Context) {
         evictionScope.launch { applyViewportToAllTabs() }
     }
 
+    private fun destroyTab(tab: Tab) {
+        tab.inUseGraceJob?.cancel()
+        runCatching {
+            tab.manager.stopLoading()
+            tab.manager.webView.apply {
+                clearHistory()
+                clearCache(true)
+                removeAllViews()
+                destroy()
+            }
+        }.onFailure { Log.w(TAG, "Failed to destroy browser tab ${tab.id}", it) }
+    }
+
     // -- Release --
 
     fun releaseAllTabs() {
@@ -1341,12 +1725,30 @@ class BrowserTabPool(private val context: Context) {
         val now = System.currentTimeMillis()
         val currentTabs = _tabs.value.toMutableList()
         val timeoutMs = idleTimeoutMs
+        val viewingTabId = _userViewingTabId.value
+        // [T-browser-idle-eviction-conditions] Sleep is allowed only when
+        // nothing at all is happening to the page. Two conditions used to be
+        // missing entirely, so a tab could be destroyed while it was in use:
+        //
+        //  - The user is looking at it. `inUse` is only ever set by agent
+        //    actions, so the tab a person was reading had idleMs ticking up and
+        //    got destroyed under them; because the saved URL is keyed by a
+        //    runtime id the pool never reuses, that page never came back.
+        //  - A download is in flight. A blob:/data: download is fetched THROUGH
+        //    the page's WebView, so destroying the WebView silently drops the
+        //    transfer — and because the download entry is only registered once
+        //    the bytes arrive, it left no record at all: not in the download
+        //    centre, not in the logs. A user-visible file transfer must outlive
+        //    an idle timer.
+        val downloadInFlight = downloadJobs.isNotEmpty()
         val toRemove = currentTabs.filter { tab ->
-            BrowserIdleSleepStateMachine.state(
+            BrowserIdleSleepStateMachine.shouldSleep(
                 inUse = tab.inUse,
                 idleMs = now - tab.lastActivityDate.time,
                 timeoutMs = timeoutMs,
-            ) == BrowserIdleState.SLEEPING
+                isUserViewing = tab.id == viewingTabId,
+                anyDownloadInFlight = downloadInFlight,
+            )
         }
         for (tab in toRemove) {
             val url = tab.manager.currentURL.value
@@ -1354,9 +1756,15 @@ class BrowserTabPool(private val context: Context) {
             persistedPageIds[tab.id] = tab.pageId
             val title = tab.manager.pageTitle.value
             if (title.isNotEmpty()) savedTitles[tab.id] = title
-            persistedTabRecords[tab.id] = BrowserTabRecord(tab.pageId, title, url)
+            val record = BrowserTabRecord(tab.pageId, title, url)
+            persistedTabRecords[tab.id] = record
+            // [T-browser-sleeping-tabs-visible] File it under the PAGE identity,
+            // not the runtime handle, so it stays addressable and recoverable.
+            val kept = (_sleepingTabs.value.filterNot { it.pageId == record.pageId } + record)
+            _sleepingTabs.value = kept.takeLast(MAX_SLEEPING_TABS)
+            destroyTab(tab)
             currentTabs.remove(tab)
-            Log.i(TAG, "Evicted idle tab ${tab.id}")
+            Log.i(TAG, "Evicted idle tab ${tab.id} (page ${tab.pageId.take(8)})")
         }
         if (toRemove.isNotEmpty()) {
             _tabs.value = currentTabs
@@ -1570,4 +1978,41 @@ class BrowserTabPool(private val context: Context) {
     private fun updateTabs() {
         _tabs.value = _tabs.value.toList()
     }
+}
+/**
+ * [T-browser-download-handle] One agent-facing line per download entry.
+ *
+ * Pure so it is testable on the JVM: the pool itself needs a Context and live
+ * WebViews, which is why the download centre previously had no test coverage of
+ * its agent-facing shape at all. Unknown attribution is stated rather than
+ * omitted — an agent must be able to tell "no tab recorded" apart from "this
+ * download has no tab", and silently dropping the field would hide the
+ * attribution bug that left every entry unattributed.
+ */
+internal fun formatDownloadEntryLine(entry: BrowserTabPool.DownloadEntry): String {
+    val size = if (entry.totalBytes > 0) entry.totalBytes else entry.bytesDone
+    val tab = entry.tabId?.let { "tab $it" } ?: "tab unknown"
+    val page = entry.pageId?.take(8) ?: "page unknown"
+    return buildString {
+        append("Download ${entry.id}: ${entry.filename} — ${entry.state.name}")
+        append(" | $size bytes")
+        append(" | $tab, $page")
+        entry.sourceUrl?.let { append(" | from $it") }
+        entry.failureReason?.let { append(" | error: $it") }
+        entry.destination?.let { append(" | at ${it.absolutePath}") }
+    }
+}
+
+/**
+ * [T-browser-sleeping-tabs-visible] Agent-facing line for a slept page.
+ *
+ * Pure so it is testable without WebViews. The page id is shown in full-ish
+ * (first 8 chars match the tab chip's display) along with the restore hint, so
+ * the agent can tell the user how to get the page back instead of reporting it
+ * as gone.
+ */
+internal fun formatSleepingTabLine(record: BrowserTabRecord): String {
+    val title = record.title.ifEmpty { "(untitled)" }
+    val url = record.url.ifEmpty { "about:blank" }
+    return "  Sleeping page ${record.pageId.take(8)}: $title — $url (restore with restore_tab)"
 }

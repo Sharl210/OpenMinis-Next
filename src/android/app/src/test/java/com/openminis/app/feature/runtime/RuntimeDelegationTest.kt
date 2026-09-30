@@ -83,7 +83,15 @@ class RuntimeDelegationTest {
         val edge = tree.addTeamPeerEdge(a.id, b.id)
         assertTrue(edge.accepted)
         assertTrue(tree.send(a.id, b.id, "before", RuntimeDelivery.TEAM_PEER).accepted)
-        assertTrue(tree.revokeTopologyEdge(edge.edgeId!!).accepted)
+        // [team-peer-mesh] Joining a Team already links a member to its peers, so the
+        // explicit call above adds a SECOND grant for the same direction. Revoking one
+        // of two deliberate grants must not read as "revoked": the direction is blocked
+        // only once every active grant for it is gone.
+        val directionEdges = tree.topology().activeEdges.filter {
+            it.kind == RuntimeEdgeKind.TEAM_PEER && it.fromNodeId == a.id && it.toNodeId == b.id
+        }
+        assertTrue("expected the mesh grant plus the explicit one", directionEdges.size >= 2)
+        directionEdges.forEach { assertTrue(tree.revokeTopologyEdge(it.id).accepted) }
         val blocked = tree.send(a.id, b.id, "after", RuntimeDelivery.TEAM_PEER)
         assertFalse(blocked.accepted)
         assertTrue(tree.receipts().any { !it.accepted && it.reason?.contains("not authorized") == true })

@@ -703,8 +703,19 @@ object PRootKernel {
             }
         }
 
-        // Fallback: resolve relative to rootfs
-        if (!::rootfsManager.isInitialized) return null
+        // Fallback: resolve relative to rootfs.
+        //
+        // [T-android-resolvehostpath-unbooted] Require the kernel to have
+        // actually FINISHED booting. `boot()` assigns `rootfsManager` near its
+        // start and only flips `isBooted` at the very end, so every step in
+        // between that can throw (installIfNeeded, the mount overlay, DNS
+        // refresh) leaves `::rootfsManager.isInitialized` TRUE on a kernel that
+        // never booted. This function then mapped sandbox paths into a rootfs
+        // that was never installed — contradicting its documented contract
+        // ("returns null until proot boots", which DebugRPCHandler's pre-boot
+        // staging fallback depends on) and the on-device test that pins it.
+        // Answering null keeps the caller's own pre-boot fallback in charge.
+        if (!isBooted || !::rootfsManager.isInitialized) return null
         val stripped = linuxPath.removePrefix("/")
         return if (stripped.isEmpty()) rootfsManager.rootfsDir else File(rootfsManager.rootfsDir, stripped)
     }

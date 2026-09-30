@@ -21,8 +21,11 @@ class BrowserHistoryStoreTest {
             val context = TestContext(directory)
             val first = BrowserHistoryStore(context)
 
-            first.record("  EXAMPLE.com/  ", "Example")
-            val bookmark = first.addBookmark("https://Example.com/docs/", "Docs")
+            val recorded = first.record("  EXAMPLE.com/  ", "Example")
+            assertTrue("a write that reached disk reports itself as persisted", recorded.persisted)
+            val added = first.addBookmark("https://Example.com/docs/", "Docs")
+            assertTrue(added.persisted)
+            val bookmark = added.value
             assertNotNull(bookmark)
             assertEquals("https://example.com/docs", bookmark?.url)
             assertTrue(first.isBookmarked(" HTTPS://EXAMPLE.COM/docs/ "))
@@ -32,7 +35,9 @@ class BrowserHistoryStoreTest {
             assertEquals("https://example.com/docs", restored.getBookmarks().single().url)
             assertEquals(bookmark?.id, restored.findBookmark("https://example.com/docs/")?.id)
             assertFalse(restored.isBookmarked("https://example.com/other"))
-            assertTrue(restored.deleteHistoryForUrl(" HTTPS://EXAMPLE.COM/ "))
+            val deleted = restored.deleteHistoryForUrl(" HTTPS://EXAMPLE.COM/ ")
+            assertTrue(deleted.value)
+            assertTrue(deleted.persisted)
             assertTrue(restored.getEntries().isEmpty())
         } finally {
             directory.deleteRecursively()
@@ -60,6 +65,12 @@ class BrowserHistoryStoreTest {
             File(directory, "browser_history.json.bak").writeText(root.toString(), Charsets.UTF_8)
 
             val restored = BrowserHistoryStore(TestContext(directory))
+            assertEquals(
+                "recovering from the backup is reported, not hidden",
+                BrowserHistoryStore.LoadOutcome.RECOVERED,
+                restored.loadStatus.outcome,
+            )
+            assertEquals("browser_history.json.bak", restored.loadStatus.source)
             assertEquals("https://example.com/recovered", restored.getEntries().single().url)
             assertEquals("https://example.com/saved", restored.getBookmarks().single().url)
             assertNull(restored.findBookmark("missing-bookmark"))

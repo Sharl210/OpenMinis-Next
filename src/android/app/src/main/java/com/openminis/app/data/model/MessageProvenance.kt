@@ -76,6 +76,51 @@ object MessagePartsCodec {
         return found ?: MessageProvenance.UNKNOWN
     }
 
+    /**
+     * Does this row carry content a PERSON authored, i.e. is it a human turn?
+     *
+     * Both the UI transcript and the retry / delete / edit cut-offs ask "which
+     * human turn is this?" and then pair an index counted on ONE side with a
+     * `sort_order` found by counting on the OTHER. The two counts therefore have
+     * to use one rule; when they drifted apart the cut-off silently never
+     * matched and `deleteMessagesAfter` was skipped.
+     *
+     * The rule, and why each clause exists:
+     *  - a `mediaRef` part means the human attached an image/file. An
+     *    image-only message persists NO text part at all
+     *    (`buildUserPartsJson` adds one only when the text is non-empty or there
+     *    is no media), so a text-only test mis-classified it and desynchronised
+     *    the two counts.
+     *  - a non-blank text part counts, EXCEPT one that starts with
+     *    `<system-reminder>`: that is the app's own resume() re-entry, written
+     *    with the API's `user` role but standing for no human turn.
+     *  - `<user-attached-files>` XML is a real text part and counts, which is
+     *    what keeps an attachment-only turn aligned with its UI bubble.
+     *
+     * Deliberately NOT provenance-based: this answers "did a human put content
+     * here", while [provenanceOf] answers "how was the row classified". Legacy
+     * rows written before provenance existed have no marker at all.
+     */
+    fun hasHumanTurnContent(partsJson: String): Boolean {
+        val parts = runCatching { JSONArray(partsJson) }.getOrNull() ?: return true
+        for (index in 0 until parts.length()) {
+            val part = parts.optJSONObject(index) ?: continue
+            when (part.optString("type")) {
+                "mediaRef" -> return true
+                "text" -> {
+                    val value = part.optString("value", "")
+                    if (value.isNotBlank() && !value.trimStart().startsWith(SYSTEM_REMINDER_PREFIX)) {
+                        return true
+                    }
+                }
+            }
+        }
+        return false
+    }
+
+    /** Prefix of the app-authored reminder that must never count as a human turn. */
+    const val SYSTEM_REMINDER_PREFIX = "<system-reminder>"
+
     /** Remove source markers before passing serialized parts to any API boundary. */
     fun withoutProvenance(partsJson: String): String {
         val parts = runCatching { JSONArray(partsJson) }.getOrNull() ?: return partsJson

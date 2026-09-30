@@ -53,13 +53,14 @@ class SessionForkManager(
      *   - `lastMessage` (createSession seeds it; refreshed by appendMessage)
      *   - `id` / `createdAt` / `updatedAt` (new identity, current timestamps)
      */
-    suspend fun duplicateSession(sessionId: String): String? {
+    suspend fun duplicateSession(sessionId: String, titleOverride: String? = null): String? {
         val source = chatRepository.getSession(sessionId) ?: run {
             AppLogger.warning(TAG, "duplicateSession: $sessionId not found")
             return null
         }
         val messages = chatRepository.loadMessages(sessionId)
-        val dupTitle = "${source.title ?: "Chat"} (Copy)"
+        val dupTitle = titleOverride?.trim()?.takeIf { it.isNotEmpty() }
+            ?: "${source.title ?: "Chat"} (Copy)"
         val new = chatRepository.createSession(
             modelId = source.modelId,
             title = dupTitle,

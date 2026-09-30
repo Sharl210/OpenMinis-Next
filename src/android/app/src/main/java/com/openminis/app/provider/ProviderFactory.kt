@@ -31,6 +31,23 @@ object ProviderFactory {
         // completions endpoint suffix at OpenAIProvider.kt:710 then
         // produces a single-slash join.
         val basePath = instance.effectiveBaseURL
+
+        // [T-android-provider-type-parity] SINGLE SOURCE for "can this build
+        // drive this type": ProviderType.isUsable. The `when` below is NOT a
+        // second opinion — its antigravity/unsupported arm is the Kotlin
+        // exhaustiveness completion for the enum, and every other call site
+        // (ProviderRepository, the debug RPC surface, the UI tables) is an
+        // exhaustive `when` too, i.e. compiler-forced rather than free to
+        // drift. This guard is what makes the predicate load-bearing at
+        // runtime: before it, `isUsable` had no production reader at all and
+        // the verdict lived only in that arm.
+        //
+        // Evaluation order is unchanged: effectiveBaseURL is a pure getter and
+        // the arm threw from this same point.
+        if (!instance.providerType.isUsable) {
+            throw com.openminis.app.data.model.LLMError.InvalidApiKey()
+        }
+
         val provider: LLMProvider = when (instance.providerType) {
             ProviderType.anthropic -> {
                 val isOAuth = instance.credentialType == ProviderCredential.oauth
@@ -194,6 +211,12 @@ object ProviderFactory {
             // build) whose provider Android cannot speak. Fail with a clear
             // credential error rather than constructing a provider that would
             // emit malformed requests. iOS throws FactoryError here likewise.
+            //
+            // This arm is unreachable on purpose: the isUsable guard above
+            // already refused these types, and this list exists so that adding
+            // a ProviderType case stays a COMPILE error here (an `else` would
+            // absorb it silently). Do not "simplify" it into the arm above by
+            // checking isUsable — that would drop the exhaustiveness check.
             ProviderType.antigravity, ProviderType.unsupported -> {
                 throw com.openminis.app.data.model.LLMError.InvalidApiKey()
             }

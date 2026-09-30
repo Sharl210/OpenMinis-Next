@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">Minis</string>
+    <string name="app_name">Minis-Next</string>
     <string name="new_chat">New Chat</string>
     <string name="settings">Settings</string>
     <string name="providers">Providers</string>
@@ -179,6 +179,52 @@
     <string name="agent_behavior_retry_disabled">Disabled</string>
     <string name="agent_behavior_retry_bounded">Up to %1$d retries</string>
     <string name="agent_behavior_retry_max_attempts">Retry limit</string>
+    <string name="agent_behavior_work_step_hidden">Off</string>
+    <string name="agent_behavior_work_step_hidden_description">Do not show work-step updates.</string>
+    <string name="agent_behavior_work_step_summary">Summary</string>
+    <string name="agent_behavior_work_step_summary_description">Show phase changes and a brief progress summary.</string>
+    <string name="agent_behavior_work_step_current">Current step</string>
+    <string name="agent_behavior_work_step_current_description">Show the step being executed with its latest status.</string>
+    <string name="agent_behavior_work_step_detailed">Detailed</string>
+    <string name="agent_behavior_work_step_detailed_description">Show every step, with results where available.</string>
+    <string name="agent_behavior_send_queue">Queue</string>
+    <string name="agent_behavior_send_queue_description">Send at the next turn without interrupting current work.</string>
+    <string name="agent_behavior_send_steer">Steer</string>
+    <string name="agent_behavior_send_steer_description">Send as guidance for the agent\'s next step.</string>
+    <string name="agent_behavior_title">Agent behavior</string>
+    <string name="agent_behavior_back">Back</string>
+    <string name="agent_behavior_work_step_title">Work-step display</string>
+    <string name="agent_behavior_work_step_section_description">Choose how much progress information to show while the agent works.</string>
+    <string name="agent_behavior_recursion_depth_title">Recursion depth</string>
+    <string name="agent_behavior_recursion_depth_description">Limit how many levels a sub-agent may delegate further. Default is 2.</string>
+    <string name="agent_behavior_depth_zero">Depth 0: no delegation, work stays with the current agent.</string>
+    <string name="agent_behavior_depth_one">Depth 1: the current agent may delegate to a sub-agent.</string>
+    <string name="agent_behavior_depth_two">Depth 2: a sub-agent may delegate one more level.</string>
+    <string name="agent_behavior_depth_value">Depth %1$d</string>
+    <string name="agent_behavior_parallel_title">Parallel agent limit</string>
+    <string name="agent_behavior_parallel_description">How many sub-agents may run at once. Default is 5.</string>
+    <string name="agent_behavior_parallel_value">Concurrent sub-agents</string>
+    <string name="agent_behavior_send_strategy_title">Default send strategy</string>
+    <string name="agent_behavior_send_strategy_description">What the Send action does when a message or action is ready.</string>
+    <string name="agent_behavior_compact_title">Global compaction reserve</string>
+    <string name="agent_behavior_compact_description">Allow auto-compaction once this much of the context window is all that remains; a larger value compacts sooner. 0 disables.</string>
+    <string name="agent_behavior_compact_value">Reserve</string>
+    <string name="agent_behavior_off">Off</string>
+    <string name="agent_behavior_auto_retry_title">Automatic retry</string>
+    <string name="agent_behavior_save_failed">Could not save preferences; settings unchanged</string>
+    <string name="agent_behavior_runtime_save_failed">Could not save runtime config; settings unchanged</string>
+    <string name="agent_behavior_save_rolled_back">Could not save preferences; runtime config rolled back</string>
+    <string name="agent_behavior_save_failed_both">Could not save preferences or runtime config; reopen the app to check your settings</string>
+    <string name="chat_goal_interrupted">The goal run was interrupted. Send the next message to resume from the saved progress.</string>
+    <string name="chat_goal_auto_continuing">Goal auto-continuation %1$d/%2$d: the previous run stopped without completing the goal, so it continues automatically.</string>
+    <string name="chat_goal_auto_continuation_stopped">Goal auto-continuation stopped after %1$d/%2$d attempts. The goal is still unfinished and its saved progress is intact — send a message to decide what happens next.</string>
+    <string name="chat_subagent_usage">Usage: /subagent &lt;task>, or /team [--provider=… --model=… --note=… --share=all|0,7,9] &lt;task>. --share offers the child a reference to those messages of this conversation instead of copying their text.</string>
+    <string name="agent_behavior_web_search">Web search</string>
+    <string name="agent_behavior_web_search_description">Set the maximum number of results and request timeout.</string>
+    <string name="agent_behavior_web_search_max_results">Maximum results</string>
+    <string name="agent_behavior_web_search_max_results_value">%1$d results</string>
+    <string name="agent_behavior_web_request_timeout">Request timeout</string>
+    <string name="agent_behavior_web_request_timeout_value">%1$d s</string>
     <!-- [T-mcp-integration-android] MCP Integrations settings entry + management screen -->
     <string name="settings_mcp">MCP Integrations</string>
     <string name="settings_mcp_subtitle">Connect Model Context Protocol servers</string>
@@ -395,8 +441,18 @@
     <string name="token_usage_section_cache">Cache (Session Total)</string>
     <string name="token_usage_cache_read">Cache Read</string>
     <string name="token_usage_cache_write">Cache Write</string>
+    <string name="token_usage_cache_hit_rate">Cache Hit Rate</string>
+    <string name="token_usage_cache_hit_rate_unavailable">—</string>
     <string name="token_usage_section_agent_loop">Agent Loop</string>
     <string name="token_usage_total_loops">Total Loops</string>
+    <string name="token_usage_total_tokens">Total Tokens</string>
+    <string name="token_usage_section_runtime">Runtime</string>
+    <string name="token_usage_runtime_active">Active Time</string>
+    <string name="token_usage_runtime_hours_minutes">%1$d h %2$d min</string>
+    <string name="token_usage_runtime_minutes_seconds">%1$d min %2$d s</string>
+    <string name="token_usage_runtime_minutes">%1$d min</string>
+    <string name="token_usage_runtime_under_minute">Less than a minute</string>
+    <string name="token_usage_runtime_unavailable">—</string>
     <string name="common_on">On</string>
     <string name="common_off">Off</string>
     <string name="common_yes">Yes</string>
@@ -558,6 +614,7 @@
     <string name="export_progress_running">Exporting %1$d / %2$d…</string>
     <string name="export_progress_done">Export complete</string>
     <string name="export_progress_failed">Export failed</string>
+    <string name="sessionlist_export_incomplete">Incomplete export: %1$d of %2$d sub-sessions are missing. See export-degraded.json in the archive.</string>
     <string name="sessionlist_edit_title_category">Edit Title &amp; Category</string>
     <string name="sessionlist_regenerate_title">Regenerate Title</string>
     <string name="sessionlist_regenerating_title">Regenerating title…</string>
@@ -588,6 +645,10 @@
     <string name="chat_typing_indicator">%1$s is thinking</string>
     <string name="read_aloud_unavailable">Read aloud failed: no usable voice engine. Check Voice Output settings or install a system speech engine.</string>
     <string name="chat_error_stream_dropped_partial">The connection dropped — this reply may be incomplete. Tap Retry to continue.</string>
+    <!-- [T-android-auto-retry-progress] Status row shown ONLY while the automatic retry mechanism waits out its backoff between two attempts. %1$d = whole seconds left in the wait, %2$d = which retry this is (1-based), %3$d = the configured retry budget. -->
+    <string name="chat_auto_retry_progress">Connection failed — retrying automatically in %1$d s (attempt %2$d of %3$d)</string>
+    <!-- Same row when the retry budget is "unlimited" (-1), where "2 of 0" would be nonsense. %1$d = whole seconds left, %2$d = which retry this is (1-based). -->
+    <string name="chat_auto_retry_progress_unlimited">Connection failed — retrying automatically in %1$d s (attempt %2$d)</string>
     <!-- Composer placeholder. %1$s is the Soul-customized assistant name (default "Minis"). The parenthetical is an inline hint reminding the user that typing '@' opens the file-mention picker. T-android-placeholder-single-line collapses the prior two-row (title + hint) layout into a single line, matching iOS 19e1d61f. -->
     <string name="chat_input_placeholder">Message %1$s (@ to mention files)</string>
     <string name="chat_input_placeholder_hint_1">Try @ to mention files for %1$s to read</string>
@@ -629,6 +690,8 @@
     <string name="browser_bookmarks_empty">No bookmarks saved</string>
     <string name="browser_bookmark_delete">Delete bookmark</string>
     <string name="browser_bookmark_toggle">Toggle bookmark</string>
+    <string name="browser_library_write_failed">Couldn\'t save the change — browser history and bookmarks were left untouched.</string>
+    <string name="browser_library_load_failed">Saved history and bookmarks couldn\'t be read. This list may not be complete.</string>
     <string name="terminal_title">Minis Shell</string>
     <string name="terminal_clear">Clear</string>
     <string name="terminal_show_keyboard">Show</string>
@@ -1314,6 +1377,18 @@
 
     <!-- T184-chatmenu-i18n — ChatScreen overflow ⋮ menu, longpress, attach -->
     <string name="chat_menu_new_chat">New Chat</string>
+    <string name="chat_menu_conversation_map">Conversation map</string>
+    <string name="conversation_map_title">Conversation map</string>
+    <string name="conversation_map_close">Close conversation map</string>
+    <string name="conversation_map_search_messages">Search messages</string>
+    <string name="conversation_map_search">Search</string>
+    <string name="conversation_map_no_messages">No messages</string>
+    <string name="conversation_map_no_matches">No matching messages</string>
+    <string name="conversation_map_jump_to_message">Jump to message %1$d</string>
+    <string name="conversation_map_empty_message">(empty message)</string>
+    <string name="conversation_map_locate_failed">Couldn\'t find that message. It may have been deleted.</string>
+    <string name="conversation_map_expand_message">Expand message</string>
+    <string name="conversation_map_collapse_message">Collapse message</string>
     <string name="chat_new_chat_stop_dialog_body">A task is running in this chat. Starting a new chat will stop it.</string>
     <string name="chat_new_chat_stop_dialog_confirm">Stop &amp; New Chat</string>
     <string name="chat_scroll_to_top">Scroll to top</string>
@@ -1335,6 +1410,15 @@
     <string name="enhanced_cache_dialog_body">Enhanced Cache extends Anthropic\'s prompt cache from 5 minutes to 1 hour, keeping context warm for longer sessions. This may add extra cache-write charges. Enable it?</string>
     <string name="enhanced_cache_dialog_confirm">Enable</string>
     <string name="chat_longpress_copy">Copy</string>
+    <!-- [T-android-copy-conversation-id] request.md:136 — 「长按那一个会话…有一个复制消息ID，
+         或者叫做复制对话ID」 and 「在某个对话的右上角的三个点中增加这个功能条目，就是复制
+         对话ID」. Two entries because the requirement names two objects: a MESSAGE id
+         (locates one row) and a CONVERSATION id (what the runtime is queried with).
+         The conversation-id label is shared by the session-list long-press menu and the
+         chat overflow menu, so the same action cannot read as two different things. -->
+    <string name="chat_copy_message_id">Copy message ID</string>
+    <string name="chat_copy_conversation_id">Copy conversation ID</string>
+    <string name="chat_copy_id_failed_toast">Couldn\'t copy to the clipboard</string>
     <string name="chat_longpress_retry">Retry</string>
     <string name="tool_longpress_rerun_from_here">Re-run from here</string>
     <string name="tool_longpress_copy_details">Copy tool details</string>
@@ -1364,6 +1448,7 @@
         <item quantity="other">This message and everything after it will be deleted. %d messages in total. This cannot be undone.</item>
     </plurals>
     <string name="chat_edit_exit_button">Exit Edit Mode</string>
+    <string name="chat_edit_push_back">Push edit back to the message</string>
     <string name="chat_show_sidebar">Show session list</string>
     <string name="chat_hide_sidebar">Hide session list</string>
     <string name="chat_clear_dialog_body">Remove all messages from this session? Files in workspace, attachments, and offloads are kept.</string>
@@ -1613,6 +1698,8 @@
     <string name="slash_thinking_subtitle">Thinking %1$s — tap to toggle</string>
     <string name="slash_thinking_unsupported">Not supported by current model</string>
     <string name="slash_clear_subtitle">Clear all messages in this session</string>
+    <string name="slash_fork_subtitle">Branch this session into a new one</string>
+    <string name="slash_goal_subtitle">Set a goal this session keeps working toward</string>
     <string name="thinking_level_off">Off</string>
     <string name="thinking_level_low">Low</string>
     <string name="thinking_level_medium">Medium</string>
@@ -2006,13 +2093,38 @@
     <string name="agent_topology_zoom_description">Global zoom is shared across topology views. Pan resets when the map is reopened.</string>
     <string name="agent_topology_zoom_reset">Reset zoom</string>
     <string name="agent_topology_export">Export topology</string>
+    <string name="agent_topology_legend_parent">Delegation</string>
+    <string name="agent_topology_legend_peer">Team peer</string>
+    <string name="agent_topology_legend_subscription">Subscription</string>
+    <string name="agent_topology_level_main">Main agent</string>
+    <string name="agent_topology_level_sub">Level-%1$s sub-agent</string>
+    <string name="agent_topology_created_known">Created %1$s</string>
+    <string name="agent_topology_created_unknown">Creation time unknown</string>
+    <string name="agent_topology_order">Global order: %1$d</string>
+    <string-array name="agent_topology_level_numerals">
+        <item>1</item>
+        <item>2</item>
+        <item>3</item>
+        <item>4</item>
+        <item>5</item>
+        <item>6</item>
+        <item>7</item>
+        <item>8</item>
+        <item>9</item>
+        <item>10</item>
+    </string-array>
+    <string name="agent_topology_export_quality_label">Quality</string>
+    <string name="agent_topology_export_quality_standard">Standard</string>
+    <string name="agent_topology_export_quality_standard_description">Smaller file at 150 DPI — good for sharing on screen.</string>
+    <string name="agent_topology_export_quality_poster">Poster (default)</string>
+    <string name="agent_topology_export_quality_poster_description">Full detail at 350 DPI — print-quality poster.</string>
     <string name="agent_topology_export_png">Export PNG</string>
     <string name="agent_topology_export_poster">Poster quality</string>
     <string name="agent_topology_export_poster_default">Poster quality (default)</string>
     <string name="agent_topology_export_background">Background</string>
     <string name="agent_topology_export_transparent">Transparent background</string>
     <string name="agent_topology_export_solid">Solid background</string>
-    <string name="agent_topology_export_poster_description">Default export uses poster-grade PNG quality at 300 DPI.</string>
+    <string name="agent_topology_export_poster_description">Poster-grade PNG quality at 350 DPI (the default).</string>
     <string name="agent_topology_open">Agent topology</string>
     <string name="agent_topology_transparent">Transparent background</string>
     <string name="agent_topology_empty">No agent nodes yet</string>
@@ -2027,4 +2139,106 @@
     <string name="model_groups_default_sub">Default Sub</string>
     <string name="model_groups_use_current_default">Use current default</string>
     <string name="model_groups_model_note_child_agents">Model note for child agents</string>
+    <!-- [R14 i18n] labels that were hardcoded in Kotlin until they were moved into resources -->
+    <string name="common_more">More</string>
+    <string name="common_stop">Stop</string>
+    <string name="common_title">Title</string>
+    <string name="common_category">Category</string>
+    <string name="common_play">Play</string>
+    <string name="common_pause">Pause</string>
+    <string name="common_play_video">Play video</string>
+    <string name="common_copy_code">Copy code</string>
+    <string name="common_copied">Copied</string>
+    <string name="chat_attach_limit_items">Only the first %1$d items were attached.</string>
+    <string name="chat_attach_limit_files">Only the first %1$d files were attached.</string>
+    <string name="chat_attachment_no_app">No app available to open this attachment.</string>
+    <string name="chat_composer_attach">Attach</string>
+    <string name="chat_attachment_image">Image attachment</string>
+    <string name="md_image_unavailable">Image not available</string>
+    <string name="md_math_content_description">math: %1$s</string>
+    <string name="session_edit_title">Edit Session</string>
+    <string name="session_no_messages_yet">No messages yet</string>
+    <string name="model_groups_new_group_hint">Enter a name for the new model group.</string>
+    <string name="model_groups_summary_models">%1$s · %2$d models</string>
+    <string name="model_groups_summary_models_disabled">%1$s · %2$d models (%3$d disabled)</string>
+    <string name="model_group_detail_name_saved">Name saved</string>
+    <string name="model_group_detail_fallback_rate_limit">Fall back on rate limits (429) and server errors (5xx) only.</string>
+    <string name="model_group_detail_fallback_any_error">Fall back on any error, including network and auth failures.</string>
+    <string name="model_group_detail_model_unavailable">Model no longer available</string>
+    <string name="model_group_detail_provider_disabled"> · Provider disabled</string>
+    <string name="nav_mount_path_unavailable">Mount path unavailable</string>
+    <string name="nav_session_files">Session Files</string>
+    <string name="agent_behavior_compact_value_tokens">%1$dK tokens</string>
+    <string name="model_groups_badge_primary">Primary</string>
+    <string name="model_groups_badge_sub">Sub</string>
+    <string name="model_groups_section_defaults">Defaults</string>
+    <string name="common_expand">Expand</string>
+    <string name="common_collapse">Collapse</string>
+    <string name="session_category_code">Code</string>
+    <string name="session_category_writing">Writing</string>
+    <string name="session_category_research">Research</string>
+    <string name="session_category_analysis">Analysis</string>
+    <string name="session_category_creative">Creative</string>
+    <string name="session_category_chat">Chat</string>
+    <string name="session_category_math">Math</string>
+    <string name="session_category_translation">Translation</string>
+    <string name="session_category_health">Health</string>
+    <string name="session_category_finance">Finance</string>
+    <string name="session_category_travel">Travel</string>
+    <string name="session_category_education">Education</string>
+    <string name="session_category_design">Design</string>
+    <string name="session_category_productivity">Productivity</string>
+    <string name="session_category_support">Support</string>
+    <string name="session_category_other">Other</string>
+    <string name="common_previous">Previous</string>
+    <string name="common_browser_screenshot">Browser screenshot</string>
+    <string name="chat_compact_summary_title">Compact Summary</string>
+    <string name="chat_compact_summary_info">Show full summary</string>
+    <string name="chat_system_injection_label">System injection</string>
+    <string name="chat_system_injection_info">Show injected content</string>
+    <string name="chat_compact_revert">Revert Compact</string>
+    <string name="chat_compact_revert_confirm_title">Revert this compact?</string>
+    <string name="chat_compact_revert_confirm_text">The summary will be discarded and the messages it covered will become active again. This may push the conversation past the model\'s context window — if that happens, long-press a message to re-compact from that point.</string>
+    <string name="chat_compact_revert_confirm_action">Revert</string>
+    <string name="chat_tool_loading">Loading…</string>
+    <string name="chat_tool_running">Running…</string>
+    <string name="chat_tool_no_output">No output</string>
+    <string name="chat_tool_result">Result</string>
+    <string name="chat_tool_live">Live</string>
+    <string name="chat_tool_load_more">Load more (%1$d lines)</string>
+    <string name="chat_tool_load_all">Load all (~%1$d lines)</string>
+    <string name="chat_tool_open_in_terminal">Open in terminal</string>
+    <string name="chat_tool_open_in_browser">Open in session browser</string>
+    <string name="chat_tool_shell_command">Shell command</string>
+    <string name="common_reset">Reset</string>
+    <string name="common_media">Media</string>
+    <string name="chat_attachment_read_image">Read image</string>
+    <string name="chat_composer_switch_to_keyboard">Switch to keyboard</string>
+    <string name="chat_composer_stop_recording">Stop recording</string>
+    <string name="chat_composer_voice_input">Voice input</string>
+    <string name="chat_tool_write_file">Write file</string>
+    <string name="chat_tool_read_file">Read file</string>
+    <string name="chat_tool_edited">Edited</string>
+    <string name="provider_image_endpoint_auto">Auto</string>
+    <string name="provider_image_endpoint_images_api">Images API</string>
+    <string name="provider_image_endpoint_chat">Chat</string>
+    <string name="provider_oauth_title">OAuth</string>
+    <string name="provider_status_not_connected">Not connected</string>
+    <string name="provider_status_configured">Configured</string>
+    <string name="env_var_delete_title">Delete %1$s?</string>
+    <string name="memory_lines_full">%1$d lines (full)</string>
+    <string name="memory_lines_injected">%1$d/%2$d lines injected</string>
+    <string name="memory_op_failed_suffix">(failed)</string>
+    <string name="sessionlist_no_messages_yet">No messages yet</string>
+    <string name="md_inline_copied">Copied: %1$s</string>
+    <string name="session_copy_title">%1$s (Copy)</string>
+    <string name="session_untitled_title">Chat</string>
+    <string name="common_hide">Hide</string>
+    <string name="common_show">Show</string>
+    <string name="skill_edit_name_a11y">Edit name</string>
+    <string name="filepreview_open_with">Open with…</string>
+    <string name="filepreview_no_app">No app available to open this file.</string>
+    <string name="provider_import_success">Imported provider \"%1$s\"</string>
+    <string name="provider_import_invalid">Invalid provider configuration file</string>
+    <string name="provider_import_read_failed">Failed to read file</string>
 </resources>

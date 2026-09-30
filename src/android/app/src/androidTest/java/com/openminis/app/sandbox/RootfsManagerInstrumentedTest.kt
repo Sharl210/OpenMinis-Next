@@ -13,6 +13,7 @@ import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.util.zip.GZIPOutputStream
+import org.junit.Assume
 
 /**
  * On-device tests for RootfsManager.
@@ -79,10 +80,7 @@ class RootfsManagerInstrumentedTest {
     fun installIfNeededExtractsRootfsFromAssets() = runBlocking {
         // This test requires alpine-minirootfs.tar.gz in assets.
         // Skip if not present (CI or pre-asset-download)
-        if (!hasAsset("alpine-minirootfs.tar.gz")) {
-            println("SKIP: alpine-minirootfs.tar.gz not in assets")
-            return@runBlocking
-        }
+        Assume.assumeTrue("alpine-minirootfs.tar.gz unavailable in this build", hasAsset("alpine-minirootfs.tar.gz"))
 
         manager.installIfNeeded()
 
@@ -111,10 +109,7 @@ class RootfsManagerInstrumentedTest {
 
     @Test
     fun installIfNeededIsIdempotent() = runBlocking {
-        if (!hasAsset("alpine-minirootfs.tar.gz")) {
-            println("SKIP: alpine-minirootfs.tar.gz not in assets")
-            return@runBlocking
-        }
+        Assume.assumeTrue("alpine-minirootfs.tar.gz unavailable in this build", hasAsset("alpine-minirootfs.tar.gz"))
 
         manager.installIfNeeded()
         val firstModTime = File(manager.rootfsDir, ".arch").lastModified()
@@ -130,10 +125,7 @@ class RootfsManagerInstrumentedTest {
 
     @Test
     fun installIfNeededCleansPartialInstall() = runBlocking {
-        if (!hasAsset("alpine-minirootfs.tar.gz")) {
-            println("SKIP: alpine-minirootfs.tar.gz not in assets")
-            return@runBlocking
-        }
+        Assume.assumeTrue("alpine-minirootfs.tar.gz unavailable in this build", hasAsset("alpine-minirootfs.tar.gz"))
 
         // Create a partial install (dir exists but no .arch)
         manager.rootfsDir.mkdirs()
@@ -149,10 +141,7 @@ class RootfsManagerInstrumentedTest {
 
     @Test
     fun installProotIfNeededExtractsBinary() = runBlocking {
-        if (!hasAsset("proot-aarch64")) {
-            println("SKIP: proot-aarch64 not in assets")
-            return@runBlocking
-        }
+        Assume.assumeTrue("proot-aarch64 (aarch64 host asset) unavailable in this build", hasAsset("proot-aarch64"))
 
         manager.installProotIfNeeded()
 
@@ -163,10 +152,7 @@ class RootfsManagerInstrumentedTest {
 
     @Test
     fun installProotIfNeededIsIdempotent() = runBlocking {
-        if (!hasAsset("proot-aarch64")) {
-            println("SKIP: proot-aarch64 not in assets")
-            return@runBlocking
-        }
+        Assume.assumeTrue("proot-aarch64 (aarch64 host asset) unavailable in this build", hasAsset("proot-aarch64"))
 
         manager.installProotIfNeeded()
         val firstSize = manager.prootBinary.length()
@@ -213,10 +199,7 @@ class RootfsManagerInstrumentedTest {
 
     @Test
     fun resetDeletesAndReinstalls() = runBlocking {
-        if (!hasAsset("alpine-minirootfs.tar.gz")) {
-            println("SKIP: alpine-minirootfs.tar.gz not in assets")
-            return@runBlocking
-        }
+        Assume.assumeTrue("alpine-minirootfs.tar.gz unavailable in this build", hasAsset("alpine-minirootfs.tar.gz"))
 
         manager.installIfNeeded()
 
@@ -232,10 +215,7 @@ class RootfsManagerInstrumentedTest {
 
     @Test
     fun resetKeepsUserDataWhenRequested() = runBlocking {
-        if (!hasAsset("alpine-minirootfs.tar.gz")) {
-            println("SKIP: alpine-minirootfs.tar.gz not in assets")
-            return@runBlocking
-        }
+        Assume.assumeTrue("alpine-minirootfs.tar.gz unavailable in this build", hasAsset("alpine-minirootfs.tar.gz"))
 
         manager.installIfNeeded()
 

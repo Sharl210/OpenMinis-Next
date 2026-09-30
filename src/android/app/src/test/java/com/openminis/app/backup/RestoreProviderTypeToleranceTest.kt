@@ -1,6 +1,11 @@
 package com.openminis.app.backup
 
+import com.openminis.app.data.model.LLMError
+import com.openminis.app.data.model.LLMModel
+import com.openminis.app.data.model.ProviderCredential
+import com.openminis.app.data.model.ProviderInstance
 import com.openminis.app.data.model.ProviderType
+import com.openminis.app.provider.ProviderFactory
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
@@ -73,13 +78,100 @@ class RestoreProviderTypeToleranceTest {
         )
     }
 
+    private fun instanceOf(type: ProviderType) = ProviderInstance(
+        id = "p-${type.name}",
+        label = "P-${type.name}",
+        providerType = type,
+        credentialType = ProviderCredential.apiKey,
+        isEnabled = true,
+    )
+
+    /**
+     * [T-android-provider-type-parity] The whole classification, pinned at the
+     * place it is ENFORCED — `ProviderFactory.create` — instead of on the
+     * `isUsable` getter alone.
+     *
+     * What this replaces, and why it was not enough: the previous version of
+     * this test asserted only `openAIResponses.isUsable`, `!antigravity.isUsable`
+     * and `!unsupported.isUsable`. Those three lines are true statements about a
+     * getter that, at the time, had ZERO production readers — the real verdict
+     * lived in a `when` arm inside `ProviderFactory`. So the obvious mutation
+     * ("route antigravity through the OpenAI branch") left all three green while
+     * restoring a broken provider for a type Android cannot speak.
+     *
+     * Three things are asserted together, which is what makes a single-sided
+     * edit visible:
+     *   1. the enum is fully classified (a new case cannot inherit either
+     *      verdict by omission — `ProviderType.entries` must equal the two sets);
+     *   2. `isUsable` agrees with that classification;
+     *   3. the factory's actual outcome for a real instance agrees with both —
+     *      drivable types build a provider, undrivable ones raise
+     *      [LLMError.InvalidApiKey].
+     *
+     * The drivable set is spelled out rather than derived from `isUsable`:
+     * deriving it would make the test move with the bug it is supposed to catch.
+     */
     @Test
-    fun `openAIResponses is usable, antigravity is not`() {
-        // openAIResponses routes through the OpenAI provider with the Responses
-        // endpoint forced on, so a restored instance actually works.
-        assertTrue(ProviderType.openAIResponses.isUsable)
-        assertTrue(!ProviderType.antigravity.isUsable)
-        assertTrue(!ProviderType.unsupported.isUsable)
+    fun `every provider type is classified once and the factory enforces it`() {
+        val drivable = setOf(
+            ProviderType.anthropic,
+            ProviderType.gemini,
+            ProviderType.openAI,
+            ProviderType.openRouter,
+            ProviderType.xAI,
+            ProviderType.kimiCode,
+            ProviderType.openAIResponses,
+        )
+        val undrivable = setOf(ProviderType.antigravity, ProviderType.unsupported)
+
+        assertEquals(
+            "every enum case must be classified; an unclassified case must not inherit a verdict",
+            ProviderType.entries.toSet(),
+            drivable + undrivable,
+        )
+
+        val model = LLMModel.allOpenAI.first()
+        for (type in ProviderType.entries) {
+            assertEquals("isUsable($type)", type in drivable, type.isUsable)
+
+            val outcome = runCatching { ProviderFactory.create(instanceOf(type), "test-key", model) }
+            if (type in drivable) {
+                assertTrue(
+                    "$type is declared usable, so the factory must build a provider for it " +
+                        "(got ${outcome.exceptionOrNull()})",
+                    outcome.isSuccess,
+                )
+            } else {
+                val failure = outcome.exceptionOrNull()
+                assertTrue(
+                    "$type cannot be driven by this build, so selecting a restored instance of it " +
+                        "must fail with a credential error rather than build a provider that emits " +
+                        "malformed requests (got ${outcome.getOrNull() ?: failure})",
+                    failure is LLMError.InvalidApiKey,
+                )
+            }
+        }
+    }
+
+    /**
+     * The reason `openAIResponses` counts as drivable at all: it is a real
+     * OpenAI provider, not a placeholder that merely survives decoding.
+     */
+    @Test
+    fun `openAIResponses builds the OpenAI provider it claims to be`() {
+        // `ProviderFactory.create` is total for a USABLE type: it returns the
+        // provider or THROWS (LLMError.InvalidApiKey for a non-usable type), so
+        // there is no Result to unwrap. `.getOrNull()` here never compiled.
+        val built = ProviderFactory.create(
+            instanceOf(ProviderType.openAIResponses),
+            "test-key",
+            LLMModel.allOpenAI.first(),
+        )
+        assertTrue(
+            "openAIResponses must route through the OpenAI provider (Responses endpoint forced on), " +
+                "got ${built::class.qualifiedName}",
+            built is com.openminis.app.provider.openai.OpenAIProvider,
+        )
     }
 
     // ─── Layer 2: unknown types survive as `unsupported` ─────────────────

@@ -123,6 +123,7 @@ import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.CloseFullscreen
+import androidx.compose.material.icons.filled.Hub
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Lightbulb
 import androidx.compose.material.icons.filled.Psychology
@@ -521,7 +522,22 @@ private fun BorderedMarkdownTable(
 // notices, and model-switch fallback notices — no card, no attribution.
 
 @Composable
-internal fun FallbackInfoBlock(block: AssistantBlock, onRevert: (() -> Unit)? = null) {
+internal fun FallbackInfoBlock(
+    block: AssistantBlock,
+    onRevert: (() -> Unit)? = null,
+    // [T-android-r37-system-row] Optional overrides for the tap-through detail.
+    // Null keeps the original compact-summary wiring, so the two pre-existing
+    // call sites (the compact divider and slash / fallback notices) are
+    // untouched. A system row supplies its own wording because "Compact
+    // Summary"/"Show full summary" would misdescribe injected content.
+    detailTitle: String? = null,
+    detailInfoDescription: String? = null,
+    // [T-android-r37-system-row] When true the whole row opens the detail, not
+    // just the info icon — the same "tap the card to see inside" affordance the
+    // tool pills use. Off by default: making the compact divider fully
+    // clickable is a behaviour change its own call site never asked for.
+    detailOnRowClick: Boolean = false,
+) {
     val divider = ChatColors.separator
     val fg = ChatColors.secondaryText
     val icon = when (block.toolName) {
@@ -534,6 +550,9 @@ internal fun FallbackInfoBlock(block: AssistantBlock, onRevert: (() -> Unit)? = 
         "compact" -> Icons.Default.CloseFullscreen
         "memory" -> Icons.Default.Psychology
         "thinking" -> Icons.Default.Lightbulb
+        // [T-android-r37-system-row] Hub ≈ 「中枢层」: an app-injected row that
+        // belongs to the system layer, not to a human or an assistant turn.
+        "injection" -> Icons.Default.Hub
         else -> Icons.Default.Info
     }
     // Mirrors iOS systemDividerRow: HStack { Divider, label, Divider }.
@@ -546,6 +565,8 @@ internal fun FallbackInfoBlock(block: AssistantBlock, onRevert: (() -> Unit)? = 
     // compact summary). Tapping opens a bottom sheet showing the full text.
     // Mirrors iOS compactDividerRow's info.circle button.
     val hasDetail = block.toolArgs.isNotEmpty()
+    val sheetTitle = detailTitle ?: stringResource(R.string.chat_compact_summary_title)
+    val infoDescription = detailInfoDescription ?: stringResource(R.string.chat_compact_summary_info)
     var showDetail by remember(block.id) { mutableStateOf(false) }
 
     androidx.compose.ui.layout.SubcomposeLayout(
@@ -553,7 +574,14 @@ internal fun FallbackInfoBlock(block: AssistantBlock, onRevert: (() -> Unit)? = 
             .fillMaxWidth()
             // Mirror iOS: small horizontal inset, modest vertical breathing
             // room so consecutive rows don't stick together.
-            .padding(horizontal = 12.dp, vertical = 10.dp),
+            .padding(horizontal = 12.dp, vertical = 10.dp)
+            .then(
+                if (detailOnRowClick && hasDetail) {
+                    Modifier.clickable { showDetail = true }
+                } else {
+                    Modifier
+                },
+            ),
     ) { constraints ->
         val totalWidth = constraints.maxWidth
         val labelGap = 8.dp.roundToPx()
@@ -591,7 +619,7 @@ internal fun FallbackInfoBlock(block: AssistantBlock, onRevert: (() -> Unit)? = 
                 if (hasDetail) {
                     Icon(
                         imageVector = Icons.Default.Info,
-                        contentDescription = "Show full summary",
+                        contentDescription = infoDescription,
                         tint = fg,
                         modifier = Modifier
                             .size(14.dp)
@@ -636,8 +664,53 @@ internal fun FallbackInfoBlock(block: AssistantBlock, onRevert: (() -> Unit)? = 
             summary = block.toolArgs,
             onDismiss = { showDetail = false },
             onRevert = onRevert,
+            title = sheetTitle,
         )
     }
+}
+
+/**
+ * [T-android-r37-system-row] A row the app synthesised on the API's `user` role
+ * — an injected `<system-reminder>` — drawn as the app layer draws its SYSTEM
+ * class: a stand-alone centered divider row with no bubble, no speaker and no
+ * left/right alignment, exactly like the compact / slash / fallback notices.
+ * One visual language for "this is neither you nor the assistant", rather than a
+ * second card design.
+ *
+ * The injected text is shown VERBATIM behind a tap. That is deliberate: the
+ * payload is the same text the model received, so rewriting or summarizing it
+ * here would show the user a prompt the model never saw. Only the row label and
+ * the sheet title are user-facing prose.
+ *
+ * The label cannot be produced by [buildFlatChatItems] — that builder is a pure
+ * function with no resource access — so it is resolved here and the flat item
+ * carries only the payload.
+ */
+@Composable
+internal fun SystemInjectionRow(injectedText: String, stableKey: String) {
+    // One name for one thing: the row's centred label and the detail sheet's
+    // title are the same concept, so they share a single string. A separate
+    // "Injected content" title would be the same message phrased twice — the
+    // class of defect this codebase has already paid for more than once.
+    val label = stringResource(R.string.chat_system_injection_label)
+    FallbackInfoBlock(
+        block = AssistantBlock(
+            id = stableKey,
+            kind = "info",
+            content = label,
+            // Routes the row through the "injection" branch above for the
+            // system-layer glyph; carries no revert action.
+            toolName = "injection",
+            // Payload ⇒ hasDetail ⇒ the tap-through exists. Verbatim.
+            toolArgs = injectedText,
+        ),
+        detailTitle = label,
+        // An ACTION description for the trailing info-circle, not a name — the
+        // same role `chat_compact_summary_info` plays for the compact divider,
+        // which is why it stays a separate key rather than reusing the label.
+        detailInfoDescription = stringResource(R.string.chat_system_injection_info),
+        detailOnRowClick = true,
+    )
 }
 
 /**
@@ -650,6 +723,11 @@ private fun CompactSummarySheet(
     summary: String,
     onDismiss: () -> Unit,
     onRevert: (() -> Unit)? = null,
+    // [T-android-r37-system-row] The sheet shows whatever payload its opener
+    // carries — a compact summary today, an injected prompt from the system row
+    // — so the title comes from the opener instead of being hard-wired to
+    // "Compact Summary", which would misdescribe injected content.
+    title: String? = null,
 ) {
     val clipboard = androidx.compose.ui.platform.LocalClipboardManager.current
     var copied by remember { mutableStateOf(false) }
@@ -657,7 +735,7 @@ private fun CompactSummarySheet(
     val scope = rememberCoroutineScope()
 
     StandardChatSheet(
-        title = "Compact Summary",
+        title = title ?: stringResource(R.string.chat_compact_summary_title),
         onDismiss = onDismiss,
         leadingAction = {
             IconButton(onClick = {
@@ -670,7 +748,7 @@ private fun CompactSummarySheet(
             }) {
                 Icon(
                     imageVector = if (copied) Icons.Default.Check else Icons.Default.ContentCopy,
-                    contentDescription = "Copy",
+                    contentDescription = stringResource(R.string.common_copy),
                     tint = if (copied) Color(0xFF34C759) else ChatColors.secondaryText,
                 )
             }
@@ -704,7 +782,7 @@ private fun CompactSummarySheet(
                     )
                     Spacer(Modifier.width(6.dp))
                     Text(
-                        text = "Revert Compact",
+                        text = stringResource(R.string.chat_compact_revert),
                         color = MaterialTheme.colorScheme.error,
                         fontSize = 15.sp,
                         fontWeight = FontWeight.Medium,
@@ -717,12 +795,9 @@ private fun CompactSummarySheet(
     if (showRevertConfirm && onRevert != null) {
         MinisAlertDialog(
             onDismissRequest = { showRevertConfirm = false },
-            title = "Revert this compact?",
-            text = "The summary will be discarded and the messages it covered " +
-                "will become active again. This may push the conversation past " +
-                "the model's context window — if that happens, long-press a " +
-                "message to re-compact from that point.",
-            confirmText = "Revert",
+            title = stringResource(R.string.chat_compact_revert_confirm_title),
+            text = stringResource(R.string.chat_compact_revert_confirm_text),
+            confirmText = stringResource(R.string.chat_compact_revert_confirm_action),
             onConfirm = {
                 showRevertConfirm = false
                 onDismiss()

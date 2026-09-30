@@ -79,11 +79,31 @@ class CorrectionInstrumentedTest {
 
     @Test fun textInputEditLearnsAfterConsent() {
         VoiceCorrectionConsent.setEnabled(ctx, true)
-        recorder().recordTextInputEdit("石塘", "食堂")
+        // [T-android-correction-admission-multisignal] Edit inside a sentence, not
+        // a whole-string swap.
+        //
+        // This test used to pass "石塘" → "食堂" on its own. With no surrounding
+        // sentence the locality denominator falls back to
+        // `maxOf(before.length, after.length)` = 2, so the 2-char span scored
+        // locality 1.0 — above `MAX_EDIT_LOCALITY` (0.6) — and the edit was
+        // correctly rejected as a whole-sentence rewrite. The assertion "got []"
+        // was the product behaving as designed; the sample violated the rule the
+        // recorder is built on. Replacing one word inside a longer utterance is
+        // what a speech correction actually looks like.
+        recorder().recordTextInputEdit("我明天要去石塘吃饭", "我明天要去食堂吃饭")
         val rows = db().lookupConfusion(
             listOf(PinyinNormalizer.normalize("石塘")), "zh", 0.0, 10)
         assertTrue("got $rows", rows.isNotEmpty())
         assertEquals("食堂", rows[0].correctedTerm)
+    }
+
+    @Test fun wholeStringTextInputEditIsRejectedAsRewrite() {
+        VoiceCorrectionConsent.setEnabled(ctx, true)
+        // The behaviour the fixed sample above used to (accidentally) assert
+        // against: replacing the ENTIRE typed string is a rewrite, not a
+        // mis-hearing, and must not enter the confusion dictionary.
+        recorder().recordTextInputEdit("石塘", "食堂")
+        assertEquals(0, db().counts()["confusion_dictionary"])
     }
 
     @Test fun rewriteIsNotLearned() {

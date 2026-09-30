@@ -2,6 +2,7 @@ package com.openminis.app.agent
 
 import com.openminis.app.data.model.AgentContentPart
 import com.openminis.app.data.model.LLMMessage
+import com.openminis.app.data.model.MessagePartsCodec
 
 /**
  * Which "the agent loop stopped early" shape a session's tail matches.
@@ -11,6 +12,37 @@ import com.openminis.app.data.model.LLMMessage
  * a wrong answer is invisible in code review — either the banner never
  * appears (the GH#262/#263 report) or it appears over a turn that is simply
  * still waiting.
+ *
+ * ────────────────────────────────────────────────────────────────────────────
+ * [T-android-interrupted-tail-drift] THIS OBJECT IS CURRENTLY DORMANT, AND THE
+ * RULE IT HOLDS EXISTS IN TWO OTHER PLACES.
+ *
+ * As of this writing `classify()` has **zero callers in `main/`** — the live
+ * rule is still the inline `when` block in `ChatViewModel.loadSession`
+ * (search for `Case D`), and the log line there re-derives the shape label from
+ * a **third** copy of the same predicates. So the same rule has been written
+ * three times, and the copies had already drifted apart:
+ *
+ *   1. The inline version excludes app-authored reminders from the
+ *      "unanswered human turn" case (an app-written `<system-reminder>` row must
+ *      not light the Resume banner). **This object did not** — a tail written by
+ *      `resume()`'s re-entry or the delegated-child abnormal-end note would have
+ *      been reported as a reply-less human turn. Fixed here.
+ *   2. For an EMPTY user turn the two disagree by design: the inline version
+ *      treats it as unanswered (hence recoverable), while this object returns
+ *      [InterruptedTailShape.NONE] — see the reasoning below the `when`. This
+ *      object's answer is the deliberate one; if the object is ever wired in,
+ *      that difference is a real behaviour change (a strictly smaller set of
+ *      tails offers Resume) and must be called out in the change, not smuggled.
+ *
+ * WHY IT IS LEFT IN PLACE RATHER THAN DELETED. Wiring it in is the right end
+ * state — it collapses three copies into one and gives the live rule the 11
+ * tests that today guard a dormant object. That edit touches
+ * `ChatViewModel.loadSession` and was deliberately not made as part of a
+ * bug fix. Until it happens: **if you change the Case D logic in
+ * `ChatViewModel`, change it here too**, or the next person to wire this in will
+ * silently revert your fix.
+ * ────────────────────────────────────────────────────────────────────────────
  */
 enum class InterruptedTailShape {
     /** Tools completed, but the follow-up model call never fired. */
@@ -62,11 +94,30 @@ object InterruptedTailDetector {
                 val isContinueReminder = parts.size == 1 &&
                     (parts.first() as? AgentContentPart.Text)?.text
                         ?.contains(CONTINUE_REMINDER_MARKER) == true
+                // [T-android-interrupted-tail-drift] An app-authored
+                // `<system-reminder>` row is not an unanswered HUMAN turn, so it
+                // must not be offered as one. These rows are written by the app on
+                // the API's `user` role (`resume()`'s re-entry, and the
+                // delegated-child abnormal-end note), and `MessagePartsCodec`
+                // already treats this exact prefix as "no human put content here"
+                // (`hasHumanTurnContent`). Without this check a cold start would
+                // show a paused/Resume affordance over the app's own note.
+                //
+                // Kept SEPARATE from `isContinueReminder` on purpose, and checked
+                // AFTER it: `resume()`'s own reminder is also app-authored but its
+                // turn really was cut off, so it must KEEP reporting an
+                // interruption. Folding the two together would silently drop that
+                // recovery path — the ordering here is load-bearing.
+                val isAppReminder = parts.size == 1 &&
+                    (parts.first() as? AgentContentPart.Text)?.text
+                        ?.trimStart()
+                        ?.startsWith(MessagePartsCodec.SYSTEM_REMINDER_PREFIX) == true
                 when {
                     // Order matters: the first two describe a turn that was
-                    // mid-flight; the third describes one that never started.
+                    // mid-flight; the rest describe one that never started.
                     allToolResults -> InterruptedTailShape.TOOL_RESULT_TAIL
                     isContinueReminder -> InterruptedTailShape.CONTINUE_REMINDER
+                    isAppReminder -> InterruptedTailShape.NONE
                     // An EMPTY user turn is not a recoverable shape — there is
                     // nothing to answer, and re-sending it would post a
                     // content-less message the API rejects.

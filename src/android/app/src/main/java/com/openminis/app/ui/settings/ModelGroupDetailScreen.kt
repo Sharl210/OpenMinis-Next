@@ -123,6 +123,13 @@ fun ModelGroupDetailScreen(
     var entryToRemove by remember { mutableStateOf<String?>(null) }
 
     val lazyListState = rememberLazyListState()
+    // [R14 i18n] Snackbar/section copy is read here so the non-composable
+    // callbacks below can reuse it without a Context lookup.
+    val nameSavedText = stringResource(R.string.model_group_detail_name_saved)
+    val modelUnavailableText = stringResource(R.string.model_group_detail_model_unavailable)
+    val providerDisabledSuffix = stringResource(R.string.model_group_detail_provider_disabled)
+    val fallbackRateLimitText = stringResource(R.string.model_group_detail_fallback_rate_limit)
+    val fallbackAnyErrorText = stringResource(R.string.model_group_detail_fallback_any_error)
     val reorderState = rememberReorderableLazyListState(lazyListState) { from, to ->
         // from.index / to.index are LazyColumn global indices (include header items).
         // Use the item key (entryId string) to find the correct position in memberIds.
@@ -177,7 +184,7 @@ fun ModelGroupDetailScreen(
                                 if (!focusState.isFocused && name.isNotBlank() && name != group.name) {
                                     providerRepository.updateGroup(group.copy(name = name))
                                     coroutineScope.launch {
-                                        snackbarHostState.showSnackbar("Name saved")
+                                        snackbarHostState.showSnackbar(nameSavedText)
                                     }
                                 }
                             },
@@ -230,8 +237,8 @@ fun ModelGroupDetailScreen(
                     SettingsSection(
                         header = stringResource(R.string.model_group_detail_fallback_trigger),
                         footer = when (fallbackStrategy) {
-                            FallbackStrategy.default -> "Fall back on rate limits (429) and server errors (5xx) only."
-                            FallbackStrategy.always -> "Fall back on any error, including network and auth failures."
+                            FallbackStrategy.default -> fallbackRateLimitText
+                            FallbackStrategy.always -> fallbackAnyErrorText
                         },
                     ) {
                         SettingsChoiceRow(
@@ -297,7 +304,7 @@ fun ModelGroupDetailScreen(
                             ListItem(
                                 headlineContent = {
                                     Text(
-                                        "Model no longer available",
+                                        modelUnavailableText,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     )
                                 },
@@ -348,7 +355,7 @@ fun ModelGroupDetailScreen(
                                         Row(verticalAlignment = Alignment.CenterVertically) {
                                             Text(instanceLabel ?: "")
                                             Text(
-                                                " · Provider disabled",
+                                                providerDisabledSuffix,
                                                 color = MaterialTheme.colorScheme.error,
                                                 style = MaterialTheme.typography.bodySmall,
                                             )

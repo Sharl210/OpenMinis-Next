@@ -79,9 +79,6 @@ class ChatEditDraftStateTest {
         assertEquals("message-1", result.messageId)
         assertEquals("replacement changed", result.replacement.text)
         assertEquals(EditCommitMode.UPDATE_IN_PLACE, result.mode)
-        assertFalse(result.sendsAutomatically)
-        assertFalse(result.retriesAutomatically)
-        assertFalse(result.deletesFollowingMessages)
         assertFalse(state.isEditing)
         assertEquals(ordinary, state.currentDraft())
     }

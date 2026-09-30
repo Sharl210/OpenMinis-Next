@@ -605,7 +605,13 @@ class MinisApp : Application(), ImageLoaderFactory {
         // message tail is the durable source of truth — scan it off-main and
         // reconcile. Runs after init() so it merges with the restored queues.
         kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
-            val interrupted = runCatching { chatRepository.interruptedSessionIds() }.getOrElse { emptySet() }
+            // `null` = the DB read failed, so the interrupted set is UNKNOWN, not
+            // empty. Reconcile REMOVES PAUSED from every session absent from the
+            // set and persists that removal, so passing an empty set on a failed
+            // read would wipe every PAUSED badge and write the wipe to disk.
+            // Skipping leaves the badges exactly as they were — the safe direction,
+            // and the next successful scan will reconcile them properly.
+            val interrupted = chatRepository.interruptedSessionIds() ?: return@launch
             // Exclude any session that is already actively streaming (defensive;
             // at cold start this is empty, but keeps the rule "active ⇒ never
             // paused" uniform with the foreground reconcile path).
@@ -627,6 +633,25 @@ class MinisApp : Application(), ImageLoaderFactory {
         )
         SessionActivityTracker.setCompletionListener { sessionId, isError ->
             backgroundTaskNotifier.notifyTaskCompleted(sessionId, isError)
+            if (isError) {
+                runCatching {
+                    val store = com.openminis.app.feature.runtime.GoalRuntimeStore.open(this, sessionId)
+                    val snapshot = store.load()
+                    if (snapshot.status == com.openminis.app.feature.runtime.GoalStatus.ACTIVE) {
+                        val runtime = com.openminis.app.feature.runtime.ForkGoalRuntime(
+                            com.openminis.app.feature.runtime.ForkGoalNode(sessionId, sessionId),
+                            snapshot,
+                        )
+                        runtime.onStopped(
+                            com.openminis.app.feature.runtime.GoalStopReason.ABNORMAL,
+                            System.currentTimeMillis(),
+                        )
+                        store.save(runtime.snapshot)
+                    }
+                }.onFailure { error ->
+                    android.util.Log.w("MinisApp", "Failed to persist abnormal goal continuation", error)
+                }
+            }
         }
 
         // [T-android-config-confirm-timeout] Wire the config-confirm background
@@ -677,7 +702,11 @@ class MinisApp : Application(), ImageLoaderFactory {
                 // a mid-loop running session is never flagged.
                 if (wasBackgrounded) {
                     kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
-                        val interrupted = runCatching { chatRepository.interruptedSessionIds() }.getOrElse { emptySet() }
+                        // Same rule as the cold-start site above: a failed read is
+                        // UNKNOWN, not "nothing is interrupted". Reconcile removes
+                        // and persists PAUSED badges for every session missing from
+                        // the set, so an empty set here would wipe them all.
+                        val interrupted = chatRepository.interruptedSessionIds() ?: return@launch
                         val active = SessionActivityTracker.activeSessions.value
                         com.openminis.app.service.SessionBadgeStore.reconcileInterruptedSessions(interrupted - active)
                     }

@@ -42,13 +42,23 @@ class RuntimeTreeStore private constructor(
     fun persist(): Boolean = synchronized(lock) { persistLocked() }
 
     fun update(block: RuntimeSessionTree.() -> Unit): Boolean = synchronized(lock) {
+        val previous = tree.toJson()
         tree.block()
-        persistLocked()
+        if (persistLocked()) return@synchronized true
+        tree.restoreJson(previous)
+        false
     }
 
+    /**
+     * Node-lease reconciliation. Expired *message* claim leases are reconciled
+     * in the same pass so a message claimed by a claimant that died before
+     * consuming it is durably requeued, not just requeued in memory; the return
+     * value stays the stale node ids callers already expect.
+     */
     fun reconcile(nowMillis: Long = System.currentTimeMillis()): List<String> = synchronized(lock) {
         val stale = tree.reconcileLeases(nowMillis)
-        if (stale.isNotEmpty()) persistLocked()
+        val requeued = tree.reconcileMessageClaims(nowMillis)
+        if (stale.isNotEmpty() || requeued.isNotEmpty()) persistLocked()
         stale
     }
 
