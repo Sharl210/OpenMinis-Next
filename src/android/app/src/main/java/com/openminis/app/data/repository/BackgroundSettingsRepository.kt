@@ -22,13 +22,7 @@ class BackgroundSettingsRepository(context: Context) {
         context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
     private val _taskNotificationsEnabled =
-        MutableStateFlow(
-            if (prefs.contains("background_notifications_enabled")) {
-                prefs.getBoolean("background_notifications_enabled", DEFAULT_TASK_NOTIFICATIONS)
-            } else {
-                prefs.getBoolean(KEY_TASK_NOTIFICATIONS, DEFAULT_TASK_NOTIFICATIONS)
-            }
-        )
+        MutableStateFlow(prefs.getBoolean(KEY_TASK_NOTIFICATIONS, DEFAULT_TASK_NOTIFICATIONS))
 
     /**
      * Live state of the toggle. Compose surfaces collect this so flipping
