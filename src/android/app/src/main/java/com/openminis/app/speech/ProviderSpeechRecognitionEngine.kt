@@ -75,7 +75,7 @@ class ProviderSpeechRecognitionEngine(private val appContext: Context) : SpeechR
 
     /** Cheap check only: is a provider ASR selection resolvable right now? */
     override val isAvailable: Boolean
-        get() = !degraded && repository()?.resolveVoiceInputEntry() != null
+        get() = degradation.isAvailable
 
     /** Cloud ASR is language-agnostic (auto-detect); no fixed locale list. */
     override val supportedLocales: List<Locale> = emptyList()
@@ -88,7 +88,8 @@ class ProviderSpeechRecognitionEngine(private val appContext: Context) : SpeechR
     private var holdFlushJob: Job? = null
     private val recording = AtomicBoolean(false)
     private val cancelled = AtomicBoolean(false)
-    private var degraded = false
+    /** Session-scoped degradation; the probe asks whether a provider ASR selection resolves now. */
+    private val degradation = EngineDegradationState { repository()?.resolveVoiceInputEntry() != null }
 
     /**
      * [T-android-vad] Live Silero detector for the segmented path, null when
@@ -128,11 +129,11 @@ class ProviderSpeechRecognitionEngine(private val appContext: Context) : SpeechR
             ?.providerRepository
 
     override fun markDegraded() {
-        degraded = true
+        degradation.mark()
     }
 
     override fun clearDegraded() {
-        degraded = false
+        degradation.clear()
     }
 
     @SuppressLint("MissingPermission") // caller ensures RECORD_AUDIO per interface contract

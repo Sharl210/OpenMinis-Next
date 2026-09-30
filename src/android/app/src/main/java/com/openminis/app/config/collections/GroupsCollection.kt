@@ -14,6 +14,23 @@ import com.openminis.app.data.model.ThinkingLevel
 import com.openminis.app.data.repository.ProviderRepository
 
 /**
+ * [RoutingStrategy]'s wire values for `groups.<id>.strategy` — the value set the
+ * config surface enforces.
+ *
+ * Derived from the enum instead of a hand-kept list, so a renamed, added or
+ * removed constant cannot silently drift from what the schema accepts: the old
+ * inline `ConfigSchema.StrEnum(listOf("none", "fallback", "loadBalance"))` was
+ * true only as long as whoever edited the enum remembered to edit the list too,
+ * and the field's own writer (`RoutingStrategy.valueOf`) would have disagreed
+ * with the schema rather than with nothing.
+ *
+ * Top-level so the JVM test drives the shipped value set — `GroupsCollection`
+ * needs a live `ProviderRepository`.
+ */
+internal fun routingStrategySchema(): ConfigSchema =
+    ConfigSchema.StrEnum(RoutingStrategy.entries.map { it.name })
+
+/**
  * Exposes ModelGroup fields under `groups.<id>.…`. Mirrors iOS
  * `GroupsCollection`. Add/remove fully supported — users frequently
  * want to spin up named bundles for fallback.
@@ -138,7 +155,7 @@ class GroupsCollection(
             path = "groups.$id.strategy",
             displayName = "Routing strategy",
             description = "none (never switch to another group member) / fallback (try in order) / loadBalance (distribute).",
-            valueSchema = ConfigSchema.StrEnum(listOf("none", "fallback", "loadBalance")),
+            valueSchema = routingStrategySchema(),
             risk = ConfigRisk.SENSITIVE,
             revertable = true,
             reader = {

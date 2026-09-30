@@ -154,3 +154,54 @@ enum class RecognitionState {
      */
     FINISHING,
 }
+
+/**
+ * [T-android-voice-entry-always-available] Whether ANY engine can currently
+ * serve a capture — the aggregate [SpeechRecognitionManager.refreshAvailability]
+ * publishes.
+ *
+ * Extracted from the manager (which needs a Context) so the rule is reachable
+ * from a plain JVM test and has exactly one implementation: a second copy of
+ * `engines.any { it.isAvailable }` would decide voice-input availability on its
+ * own, and a degraded system engine masking a working provider engine is the
+ * defect this aggregation exists to prevent.
+ */
+internal fun anyEngineAvailable(engines: List<SpeechRecognitionEngine>): Boolean =
+    engines.any { it.isAvailable }
+
+/**
+ * [T-android-voice-entry-always-available] The per-engine degradation state both
+ * real engines ([SystemSpeechRecognitionEngine],
+ * [ProviderSpeechRecognitionEngine]) are built on.
+ *
+ * [isAvailable] is `!degraded && probe()`: degrading an engine suppresses the
+ * underlying (cheap) probe entirely, and [clear] restores it. Degradation used
+ * to be permanent for the process lifetime with no reset path, so one transient
+ * failure (mic held by another app, permission not yet granted, a provider that
+ * has since been configured) disabled voice input until the app restarted.
+ *
+ * [probe] is a lambda rather than a captured boolean so "a degraded engine runs
+ * no probe at all" is an observable property — it is what keeps a degraded
+ * engine from re-querying the package manager or the provider repository on
+ * every mic-button render. `degraded` is `@Volatile` because the UI thread reads
+ * it while an error path may degrade the engine from another.
+ */
+internal class EngineDegradationState(
+    private val probe: () -> Boolean,
+) {
+    @Volatile
+    private var degraded: Boolean = false
+
+    val isDegraded: Boolean get() = degraded
+
+    /** `!degraded && probe()` — short-circuits, so a degraded engine runs no probe. */
+    val isAvailable: Boolean get() = !degraded && probe()
+
+    fun mark() {
+        degraded = true
+    }
+
+    fun clear() {
+        degraded = false
+    }
+}

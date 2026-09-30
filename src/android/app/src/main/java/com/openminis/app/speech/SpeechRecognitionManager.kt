@@ -296,7 +296,7 @@ object SpeechRecognitionManager {
      * the active engine) takes effect.
      */
     fun refreshAvailability() {
-        _isAvailable.value = engines.any { it.isAvailable }
+        _isAvailable.value = anyEngineAvailable(engines)
     }
 
     private fun currentEngine(): SpeechRecognitionEngine? {

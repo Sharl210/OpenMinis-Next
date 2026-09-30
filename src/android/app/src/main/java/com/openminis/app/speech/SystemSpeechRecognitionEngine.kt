@@ -36,8 +36,26 @@ class SystemSpeechRecognitionEngine(private val appContext: Context) : SpeechRec
     override val displayName: String = "System recognizer"
     override val supportsPartialResults: Boolean = true
 
-    /** Session-scoped degraded flag — set once a runtime error proves the service unusable. */
-    @Volatile private var degraded: Boolean = false
+    /**
+     * Session-scoped degradation — set once a runtime error proves the service
+     * unusable. The lambda is the two-layer availability probe below.
+     */
+    private val degradation = EngineDegradationState {
+        // Two-layer probe. The first returns true on many Chinese ROMs
+        // that actually ship no real service — the intent query is the
+        // backstop. Both cheap.
+        val systemSaysYes = try { SpeechRecognizer.isRecognitionAvailable(appContext) }
+            catch (_: Throwable) { false }
+        if (!systemSaysYes) {
+            false
+        } else {
+            val intent = Intent(RecognitionService.SERVICE_INTERFACE)
+            val services = try {
+                appContext.packageManager.queryIntentServices(intent, 0)
+            } catch (_: Throwable) { emptyList() }
+            services.isNotEmpty()
+        }
+    }
 
     /** Cached supported locales (populated lazily on first request). */
     @Volatile private var cachedSupportedLocales: List<Locale>? = null
@@ -47,20 +65,7 @@ class SystemSpeechRecognitionEngine(private val appContext: Context) : SpeechRec
     private val mainHandler = Handler(Looper.getMainLooper())
 
     override val isAvailable: Boolean
-        get() {
-            if (degraded) return false
-            // Two-layer probe. The first returns true on many Chinese ROMs
-            // that actually ship no real service — the intent query is the
-            // backstop. Both cheap.
-            val systemSaysYes = try { SpeechRecognizer.isRecognitionAvailable(appContext) }
-                catch (_: Throwable) { false }
-            if (!systemSaysYes) return false
-            val intent = Intent(RecognitionService.SERVICE_INTERFACE)
-            val services = try {
-                appContext.packageManager.queryIntentServices(intent, 0)
-            } catch (_: Throwable) { emptyList() }
-            return services.isNotEmpty()
-        }
+        get() = degradation.isAvailable
 
     override val supportedLocales: List<Locale>
         get() = cachedSupportedLocales ?: fallbackLocales
@@ -624,11 +629,11 @@ class SystemSpeechRecognitionEngine(private val appContext: Context) : SpeechRec
     }
 
     override fun markDegraded() {
-        degraded = true
+        degradation.mark()
     }
 
     override fun clearDegraded() {
-        degraded = false
+        degradation.clear()
     }
 
     private fun tearDown() {

@@ -1043,13 +1043,21 @@ class ModelUseOffloadHandler(
         callWarnings: MutableList<String> = mutableListOf(),
     ): NativeOffloadResult? {
         val outputs = entry.model.outputModalities.orEmpty()
-        val wantsImageOutput = "image" in outputs
         val openAI = provider as? com.openminis.app.provider.openai.OpenAIProvider
+        // [T-android-image-edit-endpoint] The gate is `imagesRouteEndpoint`, the
+        // single implementation of these guards; the decision-table test drives
+        // THAT function rather than a transcription of the conditions below.
+        val imageRoute = imagesRouteEndpoint(
+            outputs = outputs,
+            isOpenAICompatibleProvider = openAI != null,
+            providerType = instance.providerType,
+            isOAuthCredential = instance.credentialType == com.openminis.app.data.model.ProviderCredential.oauth,
+            inputImageCount = inputImages.size,
+        )
         // Only OpenAI-compatible API-key instances with an image-output model.
-        if (!wantsImageOutput || openAI == null) return null
-        val pType = instance.providerType
-        if (pType != ProviderType.openAI && pType != ProviderType.openRouter && pType != ProviderType.xAI) return null
-        if (instance.credentialType == com.openminis.app.data.model.ProviderCredential.oauth) return null
+        // (openAI == null is already CHAT_FALLTHROUGH through the gate; the check is
+        // repeated so the compiler carries the non-null type into the calls below.)
+        if (openAI == null || imageRoute == ImageRouteEndpoint.CHAT_FALLTHROUGH) return null
 
         val cfg = parseImageGenConfig(inputJson)
         val prompt = cfg.prompt
@@ -1081,7 +1089,7 @@ class ModelUseOffloadHandler(
         // use the Images API — never let a stale cached chatCompletions pin it
         // to the chat endpoint (which 401s "Missing scopes"). Mixed text+image
         // models keep auto/probe/fallback.
-        val isPureImageGenerator = "image" in outputs && "text" !in outputs
+        val isPureImageGenerator = isPureImageGeneratorModel(outputs)
 
         // [T-android-image-edit-endpoint] Input-image requests now route to
         // /v1/images/edits via editImage, matching iOS ModelUseOffloadBridge —
@@ -1120,10 +1128,10 @@ class ModelUseOffloadHandler(
         if (effectiveMode == com.openminis.app.data.model.ImageEndpointMode.imagesGenerations) {
             val response = try {
                 runBlocking {
-                    if (inputImages.isEmpty()) {
-                        openAI.generateImage(prompt, cfg.n, cfg.size, cfg.quality)
-                    } else {
+                    if (imageRoute == ImageRouteEndpoint.EDITS) {
                         openAI.editImage(prompt, inputImages, cfg.n, cfg.size, cfg.quality)
+                    } else {
+                        openAI.generateImage(prompt, cfg.n, cfg.size, cfg.quality)
                     }
                 }
             } catch (e: Throwable) {
@@ -1144,10 +1152,10 @@ class ModelUseOffloadHandler(
         // route-missing 4xx, cache chatCompletions and fall through to chat.
         val response = try {
             runBlocking {
-                if (inputImages.isEmpty()) {
-                    openAI.generateImage(prompt, cfg.n, cfg.size, cfg.quality)
-                } else {
+                if (imageRoute == ImageRouteEndpoint.EDITS) {
                     openAI.editImage(prompt, inputImages, cfg.n, cfg.size, cfg.quality)
+                } else {
+                    openAI.generateImage(prompt, cfg.n, cfg.size, cfg.quality)
                 }
             }.also {
                 providerRepository.setImageEndpointResolved(
@@ -1821,3 +1829,57 @@ Examples:
 """
     }
 }
+
+/**
+ * [T-android-image-edit-endpoint] Which images route a `minis-model-use` call
+ * takes, decided by the gates [ModelUseOffloadHandler.tryImageGenerationRoute]
+ * applies before it builds any request:
+ *
+ *  1. image output modality + an OpenAI-compatible provider object;
+ *  2. providerType ∈ {openAI, openRouter, xAI};
+ *  3. credential != oauth — Codex OAuth tokens lack the images scope and the
+ *     request would 401;
+ *  4. input images on a NON-pure generator → decline, so chat forwards them;
+ *  5. otherwise the images route: EDITS when input images are present,
+ *     GENERATIONS when they are not.
+ *
+ * Pure, and the only implementation — the handler calls it, so the JVM
+ * decision-table test drives the shipped gate instead of a transcription of it.
+ */
+internal enum class ImageRouteEndpoint {
+    /** Decline the images route → the caller falls through to chat completions. */
+    CHAT_FALLTHROUGH,
+
+    /** Images API, text-to-image. */
+    GENERATIONS,
+
+    /** Images API, image-to-image. */
+    EDITS,
+}
+
+internal fun imagesRouteEndpoint(
+    outputs: Collection<String>,
+    isOpenAICompatibleProvider: Boolean,
+    providerType: ProviderType?,
+    isOAuthCredential: Boolean,
+    inputImageCount: Int,
+): ImageRouteEndpoint {
+    if ("image" !in outputs || !isOpenAICompatibleProvider) return ImageRouteEndpoint.CHAT_FALLTHROUGH
+    if (providerType != ProviderType.openAI &&
+        providerType != ProviderType.openRouter &&
+        providerType != ProviderType.xAI
+    ) {
+        return ImageRouteEndpoint.CHAT_FALLTHROUGH
+    }
+    if (isOAuthCredential) return ImageRouteEndpoint.CHAT_FALLTHROUGH
+    if (inputImageCount > 0 && !isPureImageGeneratorModel(outputs)) return ImageRouteEndpoint.CHAT_FALLTHROUGH
+    return if (inputImageCount > 0) ImageRouteEndpoint.EDITS else ImageRouteEndpoint.GENERATIONS
+}
+
+/**
+ * [T-android-image-edit-endpoint] `image` output without `text` output: only the
+ * Images API can serve this model, and a stale cached chatCompletions pin must
+ * not send it to the chat endpoint (which 401s "Missing scopes").
+ */
+internal fun isPureImageGeneratorModel(outputs: Collection<String>): Boolean =
+    "image" in outputs && "text" !in outputs

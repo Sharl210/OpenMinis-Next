@@ -1963,41 +1963,13 @@ class ProviderRepository(private val context: Context) {
      * and iOS VoiceProviderResolver.resolvedInputCandidates). An explicit
      * System override returns [] — the caller uses the System engine directly.
      * System sentinel group members are skipped: they never serve cloud ASR.
+     *
+     * The rule itself lives in [resolveVoiceInputCandidatesIn] — a pure function,
+     * so a JVM test drives the shipped ordering instead of a transcription of it.
      */
     fun resolveVoiceInputCandidates(loadBalanceSeed: Int = 0): List<Pair<ProviderInstance, ModelEntry>> {
         ensureConfigLoaded()
-        val config = _config.value
-
-        fun providerEntry(memberId: String): Pair<ProviderInstance, ModelEntry>? {
-            val entry = config.modelEntries.find { it.id == memberId } ?: return null
-            val inst = config.instances.find { it.id == entry.providerInstanceId } ?: return null
-            if (!inst.isEnabled || !entry.model.hasAudioInput) return null
-            return inst to entry
-        }
-
-        val out = mutableListOf<Pair<ProviderInstance, ModelEntry>>()
-        voiceInputOverrideEntryId?.let { override ->
-            // Explicit System override → System engine, no cloud candidates.
-            if (override.startsWith(SystemVoiceIds.BUILTIN_PROVIDER_ID)) return emptyList()
-            providerEntry(override)?.let { out.add(it) }
-            // Stale override (entry removed) — fall through to the group.
-        }
-        val gid = config.voiceInputGroupId
-        val group = gid?.let { g -> config.modelGroups.find { it.id == g } }
-        if (group != null) {
-            var members = group.memberEntryIds
-                .filter { !it.startsWith(SystemVoiceIds.BUILTIN_PROVIDER_ID) }
-                .mapNotNull { providerEntry(it) }
-            if (group.strategy == RoutingStrategy.loadBalance && members.size > 1) {
-                val offset = kotlin.math.abs(loadBalanceSeed) % members.size
-                members = members.drop(offset) + members.take(offset)
-            }
-            for (m in members) {
-                if (out.none { it.second.id == m.second.id }) out.add(m)
-            }
-        }
-        val groupStrategy = group?.strategy
-        return if (groupStrategy == RoutingStrategy.none) out.take(1) else out
+        return resolveVoiceInputCandidatesIn(_config.value, voiceInputOverrideEntryId, loadBalanceSeed)
     }
 
     // --- Voice OUTPUT resolution [T-android-voice-output-resolver] ---
@@ -3237,6 +3209,66 @@ internal fun resolveVisionCandidatesIn(
         if (out.none { it.second.id == m.second.id }) out.add(m)
     }
     return if (group.strategy == RoutingStrategy.none) out.take(1) else out
+}
+
+/**
+ * [T-voice-asr-group-failover] Pure core of
+ * [ProviderRepository.resolveVoiceInputCandidates] — extracted the same way
+ * [resolveVisionCandidatesIn] was, because "which member does this strategy
+ * walk first" is a decision that has to be drivable from a plain JVM test: the
+ * repository itself needs a Context, Room and EncryptedSharedPreferences, so a
+ * test could otherwise only ever assert a transcription of this rule.
+ *
+ * Order: the explicit override first (when usable and provider-backed), then
+ * every usable member of the Voice Input group, ordered per the group's routing
+ * strategy — `fallback` keeps group order, `loadBalance` rotates the start
+ * position by [loadBalanceSeed] so separate capture sessions spread across
+ * members. Under `none` the ladder collapses to its first entry: the member the
+ * user selected, never a rotated one.
+ *
+ * Pure: the rotation is computed on a local copy, so the group's own
+ * `memberEntryIds` comes out of this call in the order it went in, and the
+ * returned pairs carry the config's own [ModelEntry] / [ProviderInstance]
+ * objects instead of lookalikes rebuilt from their ids.
+ */
+internal fun resolveVoiceInputCandidatesIn(
+    config: ProviderConfig,
+    voiceInputOverrideEntryId: String?,
+    loadBalanceSeed: Int = 0,
+): List<Pair<ProviderInstance, ModelEntry>> {
+    fun providerEntry(memberId: String): Pair<ProviderInstance, ModelEntry>? {
+        val entry = config.modelEntries.find { it.id == memberId } ?: return null
+        val inst = config.instances.find { it.id == entry.providerInstanceId } ?: return null
+        if (!inst.isEnabled || !entry.model.hasAudioInput) return null
+        return inst to entry
+    }
+
+    val out = mutableListOf<Pair<ProviderInstance, ModelEntry>>()
+    voiceInputOverrideEntryId?.let { override ->
+        // Explicit System override → System engine, no cloud candidates.
+        if (override.startsWith(SystemVoiceIds.BUILTIN_PROVIDER_ID)) return emptyList()
+        providerEntry(override)?.let { out.add(it) }
+        // Stale override (entry removed) — fall through to the group.
+    }
+    val gid = config.voiceInputGroupId
+    val group = gid?.let { g -> config.modelGroups.find { it.id == g } }
+    if (group != null) {
+        // Rotation happens on a LOCAL copy: reordering the group's own
+        // memberEntryIds in place would reorder the user's group behind their
+        // back, and every later read of that list would see the rotated order.
+        var members = group.memberEntryIds
+            .filter { !it.startsWith(SystemVoiceIds.BUILTIN_PROVIDER_ID) }
+            .mapNotNull { providerEntry(it) }
+        if (group.strategy == RoutingStrategy.loadBalance && members.size > 1) {
+            val offset = kotlin.math.abs(loadBalanceSeed) % members.size
+            members = members.drop(offset) + members.take(offset)
+        }
+        for (m in members) {
+            if (out.none { it.second.id == m.second.id }) out.add(m)
+        }
+    }
+    val groupStrategy = group?.strategy
+    return if (groupStrategy == RoutingStrategy.none) out.take(1) else out
 }
 
 /**
