@@ -113,7 +113,19 @@ enum class ProviderType(val displayName: String) {
 @Serializable
 enum class ProviderCredential {
     apiKey,
-    oauth,
+    oauth;
+
+    companion object {
+        /**
+         * Decode a raw credential-type string, never throwing: an unrecognized
+         * value maps to [apiKey], the shape that carries its own secret.
+         *
+         * Same rule as [ProviderType.decoded] and [ThinkingLevel.decoded]: a value
+         * read from persisted data must not be able to fail the whole config load.
+         */
+        fun decoded(raw: String): ProviderCredential =
+            entries.firstOrNull { it.name == raw } ?: apiKey
+    }
 }
 
 @Serializable
@@ -162,7 +174,26 @@ enum class RoutingStrategy {
     /** Never rotate or fail over away from the selected member. */
     none,
     fallback,
-    loadBalance,
+    loadBalance;
+
+    companion object {
+        /**
+         * Decode a raw routing-strategy string, never throwing: an unrecognized
+         * value maps to [fallback].
+         *
+         * [fallback] rather than [none] is deliberate and load-bearing: it is what
+         * the JSON mirror already produces for the same input, because
+         * `ModelGroup.strategy` is non-nullable with `fallback` as its default and
+         * the mirror decodes with `coerceInputValues = true`. The DB reader used to
+         * call `valueOf` and throw instead, which dropped the whole DB load into
+         * that mirror — so the two paths disagreed about the same bytes, and a
+         * newer build's strategy silently became `fallback` with the rest of the
+         * row set fetched by a different route. Coercing here makes both readers
+         * answer the same thing.
+         */
+        fun decoded(raw: String): RoutingStrategy =
+            entries.firstOrNull { it.name == raw } ?: fallback
+    }
 }
 
 /**
@@ -193,7 +224,21 @@ enum class ImageEndpointMode {
 @Serializable
 enum class FallbackStrategy {
     default,
-    always,
+    always;
+
+    companion object {
+        /**
+         * Decode a raw fallback-strategy string, never throwing: an unrecognized
+         * value maps to [default] — the narrow rule (rate limiting and 5xx only).
+         *
+         * Widening an unknown value to [always] would retry on auth failures and
+         * other errors the user never agreed to, so the conservative direction is
+         * the only safe one. [default] is also what the JSON mirror produces for
+         * the same input.
+         */
+        fun decoded(raw: String): FallbackStrategy =
+            entries.firstOrNull { it.name == raw } ?: default
+    }
 }
 
 @Serializable

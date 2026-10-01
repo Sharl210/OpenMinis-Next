@@ -213,13 +213,21 @@ fun ProviderConfig.toSnapshot(
  * field is set to the composite-key id stored in DB — so once we round-trip,
  * group/agentLoop refs in the mirror JSON also point at the composite shape.
  */
+// [T-android-persisted-enum-decode] Every enum read below goes through a
+// `decoded()` helper rather than `valueOf`. A persisted value this build does not
+// recognise — written by a newer build, or by a backup from one — must not be
+// able to throw and drop the whole load into the JSON mirror. `ThinkingLevel` and
+// `ImageEndpointMode` already worked this way; `ProviderType`, `ProviderCredential`,
+// `RoutingStrategy` and `FallbackStrategy` did not, so the same file disagreed
+// with itself about the same hazard. Each helper's unknown-value target is the
+// value the JSON mirror already produces, so both readers answer identically.
 fun ProviderConfigSnapshot.toProviderConfig(jsonForBlobs: Json): ProviderConfig {
     val instances = this.instances.map { row ->
         ProviderInstance(
             id = row.id,
             label = row.label,
-            providerType = ProviderType.valueOf(row.providerType),
-            credentialType = ProviderCredential.valueOf(row.credentialType),
+            providerType = ProviderType.decoded(row.providerType),
+            credentialType = ProviderCredential.decoded(row.credentialType),
             isEnabled = row.isEnabled != 0,
             createdAt = row.createdAt,
             customBaseURL = row.customBaseURL,
@@ -263,8 +271,8 @@ fun ProviderConfigSnapshot.toProviderConfig(jsonForBlobs: Json): ProviderConfig 
             memberEntryIds = jsonForBlobs
                 .decodeFromString(stringListSerializer, row.memberEntryIdsJson)
                 .toMutableList(),
-            strategy = RoutingStrategy.valueOf(row.strategy),
-            fallbackStrategy = FallbackStrategy.valueOf(row.fallbackStrategy),
+            strategy = RoutingStrategy.decoded(row.strategy),
+            fallbackStrategy = FallbackStrategy.decoded(row.fallbackStrategy),
             // [T-android-thinking-level-arch] decoded() (not valueOf()) so a
             // level string a NEWER build persisted (e.g. "MAX"/"ULTRA") can't
             // throw and blow up the whole DB load — which would fall back to the
