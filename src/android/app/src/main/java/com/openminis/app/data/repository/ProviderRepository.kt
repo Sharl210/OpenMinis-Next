@@ -2025,39 +2025,7 @@ class ProviderRepository(private val context: Context) {
      */
     fun resolveVoiceOutputChoice(): VoiceOutputChoice {
         ensureConfigLoaded()
-        val config = _config.value
-
-        fun providerEntry(memberId: String): Pair<ProviderInstance, ModelEntry>? {
-            val entry = config.modelEntries.find { it.id == memberId } ?: return null
-            val inst = config.instances.find { it.id == entry.providerInstanceId } ?: return null
-            if (!inst.isEnabled || !entry.model.hasAudioOutput) return null
-            return inst to entry
-        }
-
-        voiceOutputOverrideEntryId?.let { override ->
-            if (override.startsWith(SystemVoiceIds.BUILTIN_PROVIDER_ID)) {
-                return VoiceOutputChoice(isSystemEngine = true, entry = null)
-            }
-            providerEntry(override)?.let { return VoiceOutputChoice(false, it, allowSystemFallback = false) }
-            // Stale override (entry removed) — fall through to the group.
-        }
-        val gid = config.voiceOutputGroupId
-        val group = gid?.let { g -> config.modelGroups.find { it.id == g } }
-        if (group != null) {
-            for (memberId in group.memberEntryIds) {
-                if (memberId.startsWith(SystemVoiceIds.BUILTIN_PROVIDER_ID)) {
-                    return VoiceOutputChoice(isSystemEngine = true, entry = null)
-                }
-                providerEntry(memberId)?.let {
-                    return VoiceOutputChoice(
-                        isSystemEngine = false,
-                        entry = it,
-                        allowSystemFallback = group.strategy != RoutingStrategy.none,
-                    )
-                }
-            }
-        }
-        return VoiceOutputChoice(isSystemEngine = true, entry = null)
+        return resolveVoiceOutputChoiceIn(_config.value, voiceOutputOverrideEntryId)
     }
 
     /**
@@ -3269,6 +3237,71 @@ internal fun resolveVoiceInputCandidatesIn(
     }
     val groupStrategy = group?.strategy
     return if (groupStrategy == RoutingStrategy.none) out.take(1) else out
+}
+
+/**
+ * [T-voice-output-fallback] Pure core of
+ * [ProviderRepository.resolveVoiceOutputChoice] — extracted the same way
+ * [resolveVoiceInputCandidatesIn] and [resolveVisionCandidatesIn] were, because
+ * "may a failed provider degrade to the device speech engine" is a decision that
+ * has to be drivable from a plain JVM test: the repository itself needs a
+ * Context, Room and EncryptedSharedPreferences, so a test could otherwise only
+ * ever assert a transcription of this rule. Before this extraction the function
+ * had **zero** test references while being the only place `RoutingStrategy.none`
+ * was interpreted for the output side.
+ *
+ * Resolution order mirrors [resolveVoiceInputCandidatesIn]: explicit override
+ * first, then the Voice Output group's members in fallback order (a System
+ * sentinel member selects the device engine), then the System default as the
+ * terminal fallback.
+ *
+ * `allowSystemFallback` is the part with no input-side counterpart. It is false
+ * when the user pinned ONE provider explicitly (an override means "use this, do
+ * not degrade"), and otherwise tracks the group's strategy: a `none` group must
+ * fail loudly rather than silently reading the reply aloud in a different voice,
+ * while `fallback`/`loadBalance` groups are already expressing a willingness to
+ * move off the selected member.
+ *
+ * The capability gate is `hasAudioOutput` (vs `hasAudioInput` on the input side)
+ * — a model that only *accepts* audio must never be picked to *produce* it.
+ */
+internal fun resolveVoiceOutputChoiceIn(
+    config: ProviderConfig,
+    voiceOutputOverrideEntryId: String?,
+): ProviderRepository.VoiceOutputChoice {
+    fun providerEntry(memberId: String): Pair<ProviderInstance, ModelEntry>? {
+        val entry = config.modelEntries.find { it.id == memberId } ?: return null
+        val inst = config.instances.find { it.id == entry.providerInstanceId } ?: return null
+        if (!inst.isEnabled || !entry.model.hasAudioOutput) return null
+        return inst to entry
+    }
+
+    voiceOutputOverrideEntryId?.let { override ->
+        if (override.startsWith(SystemVoiceIds.BUILTIN_PROVIDER_ID)) {
+            return ProviderRepository.VoiceOutputChoice(isSystemEngine = true, entry = null)
+        }
+        providerEntry(override)?.let {
+            return ProviderRepository.VoiceOutputChoice(false, it, allowSystemFallback = false)
+        }
+        // Stale override (entry removed) — fall through to the group.
+    }
+    val gid = config.voiceOutputGroupId
+    val group = gid?.let { g -> config.modelGroups.find { it.id == g } }
+    if (group != null) {
+        for (memberId in group.memberEntryIds) {
+            if (memberId.startsWith(SystemVoiceIds.BUILTIN_PROVIDER_ID)) {
+                return ProviderRepository.VoiceOutputChoice(isSystemEngine = true, entry = null)
+            }
+            providerEntry(memberId)?.let {
+                return ProviderRepository.VoiceOutputChoice(
+                    isSystemEngine = false,
+                    entry = it,
+                    allowSystemFallback = group.strategy != RoutingStrategy.none,
+                )
+            }
+        }
+    }
+    return ProviderRepository.VoiceOutputChoice(isSystemEngine = true, entry = null)
 }
 
 /**
