@@ -616,10 +616,32 @@ class RetrySettingGovernsTitleAndCompactionTest {
 
     @Test
     fun `no retry limit is hardcoded on the title path any more`() {
+        // WIRING PIN, and a weak one. Stated plainly so nobody mistakes it for a
+        // behavioural guard:
+        //
+        //  - It can only detect the recurrence of the NAME `TITLE_MAX_ATTEMPTS`.
+        //    A hardcoded limit reintroduced under any other spelling — or written
+        //    inline as `get() = 3` — satisfies it. So it does not actually defend
+        //    the claim in its own name.
+        //  - What it CAN do is keep the specific historical constant from coming
+        //    back verbatim, which is cheap and non-zero.
+        //  - It is not convertible to behaviour here: `titleMaxAttempts` is a
+        //    private member of `ChatViewModel`, and no test in this module
+        //    constructs a `ChatViewModel` (it needs the Android runtime), so there
+        //    is no seam to read the resolved limit from.
+        //
+        // The assertion that DOES have kill power for "the cap comes from the
+        // user's setting" is the sibling test above, `the title dispatch cap is
+        // read from the shared settings mapping`: it requires the declaration's
+        // body to call `retryBudgetTotalAttempts(` on
+        // `effectiveMaxRetryAttempts`, which a hardcoded limit cannot satisfy.
+        // That one is the guard; this one is a name-shaped tripwire behind it.
         val source = chatViewModelSource()
 
         assertFalse(
-            "TITLE_MAX_ATTEMPTS = 3 is the defect this change removes",
+            "TITLE_MAX_ATTEMPTS = 3 is the defect this change removes; this pin only " +
+                "notices that exact name returning, so a renamed hardcode would slip " +
+                "past it — the sibling declaration test is the real guard",
             source.contains("TITLE_MAX_ATTEMPTS"),
         )
     }
