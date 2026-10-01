@@ -15,12 +15,24 @@ class RuntimeCommunicationFileStore(
     /**
      * Where metadata that could not be read back is reported.
      *
-     * This read is all-or-nothing: [decode] uses `getString`/`getLong`/`enumValueOf`,
-     * all of which throw, and the loop runs inside one `buildList`, so **a single
-     * unreadable record discards every record in the file** — the caller gets the same
-     * `emptyList()` as a mailbox that was never written. Losing this file means runtime
-     * messages stop being deliverable across a restart, so that silence is worth a
-     * report even though the contract itself is not changing here.
+     * [decode] uses `getString`/`getLong`/`enumValueOf`, all of which throw on a value
+     * this build does not recognise — and a value can come from a NEWER build, since
+     * `enumValueOf` is the only reader for `direction`, `state`, `mode` and `routeKind`.
+     * A file whose schema version is not [SCHEMA_VERSION] is a different thing and is
+     * still refused whole: that IS a property of the file.
+     *
+     * [T-android-comm-store-per-record] An undecodable RECORD, though, is now skipped
+     * and the rest of the file is kept. It used to discard every record — the caller
+     * got the same `emptyList()` as a mailbox that was never written, so runtime
+     * messages silently stopped being deliverable across a restart.
+     *
+     * The all-or-nothing rule was not defensible: the consumer is
+     * `store.read().forEach(directory::append)`, which already accepts a short list;
+     * every record is self-contained (no sequence number, no cross-record invariant,
+     * no ordering dependency); and the only reason the old comment gave was that the
+     * silence deserved a report. `BackupImporter.parseProviderConfigLeniently` reached
+     * the same conclusion from a real incident, where one unknown provider type
+     * discarded eight providers along with their credentials.
      *
      * Injectable so a unit test can observe it; the default logs.
      */
@@ -34,37 +46,63 @@ class RuntimeCommunicationFileStore(
             reportCorruption("the communication metadata file exists but could not be read")
             return emptyList()
         }
-        return runCatching { parse(raw) }.getOrElse { error ->
+        val parsed = runCatching { parse(raw) }.getOrElse { error ->
             reportCorruption(
                 "the communication metadata file exists but could not be decoded, so every " +
                     "record in it is being ignored: ${error.message}",
             )
-            emptyList()
+            return emptyList()
         }
+        if (parsed.skipped > 0) {
+            reportCorruption(
+                "the communication metadata file could not decode record " +
+                    "${parsed.firstSkippedIndex} of ${parsed.total}, so that record was " +
+                    "skipped: ${parsed.firstSkippedReason}. ${parsed.skipped} of " +
+                    "${parsed.total} record(s) skipped, ${parsed.records.size} kept -- a " +
+                    "record this build cannot read must not cost the ones it can.",
+            )
+        }
+        return parsed.records
     }
 
-    private fun parse(raw: String): List<RuntimeCommunicationMetadata> {
+    /** [T-android-comm-store-per-record] A parse that reports what it could not keep. */
+    internal data class ParseResult(
+        val records: List<RuntimeCommunicationMetadata>,
+        val total: Int,
+        val skipped: Int,
+        val firstSkippedIndex: Int?,
+        val firstSkippedReason: String?,
+    )
+
+    internal fun parse(raw: String): ParseResult {
         val root = JSONObject(raw)
         val version = root.optInt("schemaVersion", -1)
         require(version == SCHEMA_VERSION) {
             "its schema version is $version, not the $SCHEMA_VERSION this build reads"
         }
         val rows = root.optJSONArray("records") ?: JSONArray()
-        return buildList(rows.length()) {
-            for (index in 0 until rows.length()) {
-                add(
-                    runCatching { decode(rows.getJSONObject(index)) }.getOrElse { error ->
-                        // Named so the report says which record, and out of how many --
-                        // without this the log would say "undecodable" and leave the
-                        // reader to guess whether one record or two hundred were lost.
-                        throw IllegalStateException(
-                            "record $index of ${rows.length()} could not be decoded: ${error.message}",
-                            error,
-                        )
-                    },
-                )
+        val kept = ArrayList<RuntimeCommunicationMetadata>(rows.length())
+        var skipped = 0
+        var firstIndex: Int? = null
+        var firstReason: String? = null
+        for (index in 0 until rows.length()) {
+            val decoded = runCatching { decode(rows.getJSONObject(index)) }
+            val record = decoded.getOrNull()
+            if (record == null) {
+                // Skipped, not fatal. The index and the count are kept so the report
+                // still says which record went and out of how many -- without those
+                // the log would say "undecodable" and leave the reader guessing
+                // whether one record or two hundred were lost.
+                skipped++
+                if (firstIndex == null) {
+                    firstIndex = index
+                    firstReason = decoded.exceptionOrNull()?.message
+                }
+            } else {
+                kept.add(record)
             }
         }
+        return ParseResult(kept, rows.length(), skipped, firstIndex, firstReason)
     }
 
     @Synchronized

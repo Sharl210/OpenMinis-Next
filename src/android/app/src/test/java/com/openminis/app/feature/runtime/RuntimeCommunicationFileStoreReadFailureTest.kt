@@ -136,8 +136,30 @@ class RuntimeCommunicationFileStoreReadFailureTest {
         }
     }
 
+    /**
+     * [T-android-comm-store-per-record] The test this replaces asserted the OPPOSITE of
+     * its own best feature: it required the report (good) *and* `read.size == 0` (bad),
+     * pinning "one unreadable record costs every record in the file" as the contract.
+     *
+     * That contract was not defensible, and the reasons are all outside this file:
+     * the consumer is `store.read().forEach(directory::append)`, which already accepts a
+     * short list; records are self-contained (no sequence number, no cross-record
+     * invariant); and the KDoc's only argument was that the silence deserved a report —
+     * it never said why the rest had to go. `BackupImporter.parseProviderConfigLeniently`
+     * settled the same question from a real incident, where one unknown provider type
+     * took eight providers and their credentials with it.
+     *
+     * The consequence was not academic: losing every record means runtime messages stop
+     * being deliverable across a restart, and the caller cannot tell that apart from a
+     * mailbox that was never written.
+     *
+     * So the report assertions are KEPT exactly as they were — the index and the total
+     * are still what makes the log useful — and the data assertion is inverted. A
+     * version mismatch is a property of the FILE and is still refused whole; that is
+     * covered by the test above.
+     */
     @Test
-    fun `one unreadable record is reported with its index and discards the whole file`() {
+    fun `one unreadable record is reported with its index and costs only itself`() {
         val dir = tempDir()
         try {
             val file = File(dir, "metadata.json")
@@ -171,10 +193,15 @@ class RuntimeCommunicationFileStoreReadFailureTest {
                 message.contains("of 2"),
             )
             assertEquals(
-                "the good record is discarded too -- this is the all-or-nothing " +
-                    "behaviour the report exists to make visible",
-                0,
+                "the good record must survive -- a record this build cannot read may " +
+                    "not cost the records it can",
+                1,
                 read.size,
+            )
+            assertEquals(
+                "…and it must be the good one, not a placeholder",
+                "good",
+                read.single().recordId,
             )
         } finally {
             dir.deleteRecursively()
