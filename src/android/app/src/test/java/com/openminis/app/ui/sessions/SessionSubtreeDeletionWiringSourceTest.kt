@@ -162,6 +162,28 @@ class SessionSubtreeDeletionWiringSourceTest {
         }.toList()
     }
 
+    /**
+     * (C) KEPT, NOT CONVERTIBLE — the call graph of the three entry points.
+     *
+     * `deleteSession`, `deleteSelected` and `deleteFolderWithSessions` are members
+     * of `SessionListViewModel`: constructing it needs a Room `ChatDao`, the
+     * Compose-driven session list and a live Android main dispatcher. This module's
+     * unit-test source set has no Robolectric, and no test in the repo builds a
+     * `SessionListViewModel` instance (only the companion's pure helpers are
+     * exercised, as in `GroupSuggestionParseTest`), so "this entry point routes
+     * through the recursive helper" cannot be observed — only read.
+     *
+     * Kept rather than dropped because it is the sole guard on the regression that
+     * started this feature: a *fourth* entry point added later deleting a single
+     * row instead of routing through `deleteSessionSubtrees`. The behaviour on the
+     * other side of that call is pinned by `SessionSubtreeDeletionPlanTest` and
+     * `SessionSubtreeDeletionPipelineTest`.
+     *
+     * This is the authoritative copy. `SessionDeletionCleanupSourceTest` used to
+     * assert a subset of these same six literals; that copy was removed and folded
+     * in here, because two copies of one rule count it twice — and, as that pair
+     * had already done, drift apart.
+     */
     @Test
     fun `every user delete entry point routes through the recursive helper`() {
         val text = viewModel()
@@ -277,6 +299,13 @@ class SessionSubtreeDeletionWiringSourceTest {
                 Regex("purgeSubtrees\\s*\\([^)]*\\)\\s*\\?:").containsMatchIn(codeOf(text)),
         )
         assertTrue("media cleanup missing", text.contains("deleteSessionMedia(sessionId)"))
+        // Read off the wiring file rather than driven: `OffloadPermissionManager`
+        // holds a session's grants in private in-memory maps and exposes no reader
+        // (`clearSessionGrants` removes from two maps and returns `Unit`), so a
+        // behavioural test could only assert that the call did not throw — which is
+        // not evidence. The other seven cleanup steps ARE behavioural; see
+        // `SessionDeletionCleanupSourceTest`'s `the wired cleanup deletes the
+        // subtree's chat rows, purges its runtime nodes and drops its artifacts`.
         assertTrue(
             "permission cleanup missing",
             text.contains("OffloadPermissionManager.clearSessionGrants(sessionId)"),

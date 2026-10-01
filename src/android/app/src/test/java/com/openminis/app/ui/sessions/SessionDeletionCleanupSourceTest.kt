@@ -85,6 +85,17 @@ import org.junit.Test
  * runs with a device attached; the JVM test below mirrors those three steps so
  * the routine unit suite keeps them, and adds the four artifact steps the
  * instrumented test does not touch at all (goal state, badge, communication
+ *
+ * This file is behavioural only. The source-text pins it once carried — the three
+ * delete entry points routing through the recursive helper, and the per-session
+ * permission-grant call — were exact duplicates of assertions in
+ * `SessionSubtreeDeletionWiringSourceTest` and were folded into that file, which
+ * declares this rule in its own KDoc. Two copies of one rule count it twice and,
+ * as that pair had already done, drift apart.
+ *
+ * The class name still says `SourceTest`, which no longer describes it. Left as-is
+ * deliberately: the audit ledger cites this file by name, and a rename is a
+ * separate change. `ChatExporterRuntimeTreeSourceTest` carries the same wart.
  * record, ViewModel store). Nothing here replaces the instrumented test.
  */
 class SessionDeletionCleanupSourceTest {
@@ -467,74 +478,22 @@ class SessionDeletionCleanupSourceTest {
 
     // ---------------------------------------- the retained structural checks (C)
 
-    /**
-     * (C) KEPT, NOT CONVERTIBLE — the call graph of the three entry points.
-     *
-     * `deleteSession`, `deleteSelected` and `deleteFolderWithSessions` are
-     * members of `SessionListViewModel`: constructing it needs a Room `ChatDao`,
-     * the Compose-driven session list and a live Android main dispatcher. This
-     * module's unit-test source set has no Robolectric, and no test in the repo
-     * builds a `SessionListViewModel` instance (only the companion's pure helpers
-     * are exercised, as in `GroupSuggestionParseTest`), so "this entry point
-     * routes through the recursive helper" cannot be observed — only read.
-     *
-     * Kept rather than dropped because it is the sole guard on the regression
-     * that started this feature: a *fourth* entry point added later deleting a
-     * single row instead of routing through `deleteSessionSubtrees`. The behaviour
-     * on the other side of that call is pinned by the two [A] tests above,
-     * `SessionSubtreeDeletionPlanTest` and `SessionSubtreeDeletionPipelineTest`;
-     * this is the wiring.
-     */
-    @Test
-    fun `user deletion routes through the recursive subtree helper`() {
-        val text = source("com/openminis/app/ui/sessions/SessionListViewModel.kt")
-        assertTrue("recursive cleanup helper missing", text.contains("deleteSessionSubtrees"))
-        assertTrue(
-            "single delete bypasses the recursive helper",
-            Regex("fun deleteSession\\(id: String\\).*?deleteSessionSubtrees\\(listOf\\(id\\)\\)", RegexOption.DOT_MATCHES_ALL)
-                .containsMatchIn(text),
-        )
-        assertTrue(
-            "bulk delete bypasses the recursive helper",
-            Regex("fun deleteSelected\\(\\).*?deleteSessionSubtrees\\(ids\\)", RegexOption.DOT_MATCHES_ALL)
-                .containsMatchIn(text),
-        )
-        assertTrue(
-            "group delete bypasses the recursive helper",
-            Regex("fun deleteFolderWithSessions\\(folderId: String\\).*?deleteSessionSubtrees\\(memberIds\\)", RegexOption.DOT_MATCHES_ALL)
-                .containsMatchIn(text),
-        )
-        assertTrue(
-            "delete set no longer resolved from the runtime topology",
-            text.contains("resolveSessionSubtreeDeletionPlan("),
-        )
-    }
+    // Two source-text pins used to live here. Both moved to their authoritative
+    // home, `SessionSubtreeDeletionWiringSourceTest` — that file's KDoc is what
+    // claims this rule ("every entry point must reach the one recursive helper"),
+    // and it asserts a strict superset: all six literals checked here are also
+    // checked there, and this file contributed no literal of its own.
+    //
+    // Keeping both copies counted one rule twice, which is worse than merely
+    // redundant — the two had already drifted. The sibling also pins
+    // `retryStore.ids()`, which this copy never did, so a reader of this file
+    // would have taken the routing guard for complete when it was not. One rule,
+    // one home.
+    //
+    // The per-session permission-grant pin travelled with them, together with its
+    // "not convertible" rationale: the grants live in `OffloadPermissionManager`'s
+    // private in-memory maps with no reader, so a behavioural test could only
+    // assert that the call did not throw — which is not evidence. This file is
+    // behavioural only now.
 
-    /**
-     * (C) KEPT, NOT CONVERTIBLE — the one wired step with no observable effect.
-     *
-     * [com.openminis.app.offload.OffloadPermissionManager] holds a session's
-     * grants in private in-memory maps and exposes no reader for them
-     * (`clearSessionGrants` removes from two maps and returns `Unit`), so a
-     * behavioural test could only assert that the call did not throw — which is
-     * not evidence. The step is therefore read off the wiring file instead. The
-     * other seven steps of the same wiring ARE behavioural now; see
-     * `the wired cleanup deletes the subtree's chat rows, purges its runtime
-     * nodes and drops its artifacts`.
-     */
-    @Test
-    fun `the wired cleanup clears the per-session permission grants`() {
-        val text = source("com/openminis/app/ui/sessions/SessionSubtreeDeletionWiring.kt")
-        assertTrue(
-            "permission cleanup missing",
-            text.contains("OffloadPermissionManager.clearSessionGrants(sessionId)"),
-        )
-    }
-
-    private fun source(relative: String): String {
-        val file = File("src/main/java/$relative").takeIf { it.isFile }
-            ?: File("app/src/main/java/$relative")
-        assertTrue("source file missing: $relative", file.isFile)
-        return file.readText()
-    }
 }
