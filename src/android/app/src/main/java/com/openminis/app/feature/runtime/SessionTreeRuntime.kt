@@ -2436,18 +2436,29 @@ class RuntimeSessionTree(
             rootIds.clear()
             val configJson = json.optJSONObject("config")
             if (configJson != null) {
-                val restoredMaxDepth = configJson.optInt("maxDepth", config.maxDepth)
-                val restoredMaxParallel = configJson.optInt("maxParallelSubagents", config.maxParallelSubagents)
-                val restoredLease = configJson.optLong("leaseMillis", config.leaseMillis)
-                val restoredMode = runCatching { DelegationMode.valueOf(configJson.optString("mode")) }
+                // [T-android-tree-restore-coerce] Coerced, not required — the same rule
+                // the eight budget keys below already follow, for the reason written out
+                // verbatim down there: a stored value outside the current bounds must not
+                // be what makes the tree unloadable.
+                //
+                // `require` here threw out of this body, so restoreJson returned false,
+                // and `RuntimeTreeStore.loadLocked` answers a false by restoring
+                // EMPTY_TREE_JSON and then persisting that empty tree over the file on the
+                // next write. So an out-of-range number cost the user their entire runtime
+                // tree — nodes, transcripts, inbox, control receipts — silently, with only
+                // an AppLogger line. A tree written by a build whose limits differed, or
+                // edited by hand, is exactly what this path exists to survive.
+                config.maxDepth = configJson
+                    .optInt("maxDepth", config.maxDepth)
+                    .coerceIn(0, RuntimeTreeConfig.MAX_DEPTH_LIMIT)
+                config.maxParallelSubagents = configJson
+                    .optInt("maxParallelSubagents", config.maxParallelSubagents)
+                    .coerceIn(1, RuntimeTreeConfig.MAX_PARALLEL_LIMIT)
+                config.leaseMillis = configJson
+                    .optLong("leaseMillis", config.leaseMillis)
+                    .coerceAtLeast(1L)
+                config.mode = runCatching { DelegationMode.valueOf(configJson.optString("mode")) }
                     .getOrDefault(config.mode)
-                require(restoredMaxDepth in 0..RuntimeTreeConfig.MAX_DEPTH_LIMIT)
-                require(restoredMaxParallel in 1..RuntimeTreeConfig.MAX_PARALLEL_LIMIT)
-                require(restoredLease > 0)
-                config.maxDepth = restoredMaxDepth
-                config.maxParallelSubagents = restoredMaxParallel
-                config.leaseMillis = restoredLease
-                config.mode = restoredMode
                 configRevision = configJson.optLong("configRevision", configRevision).coerceAtLeast(0L)
                 // Coerced rather than required: a config file written before
                 // these keys existed must keep restoring, and restoring must

@@ -591,17 +591,6 @@ internal object ProviderMutationMethods {
         }
     }
 
-    private fun parseStrategy(s: String): RoutingStrategy = when (s) {
-        "none", "noFallback", "no_fallback" -> RoutingStrategy.none
-        "loadBalance" -> RoutingStrategy.loadBalance
-        else -> RoutingStrategy.fallback
-    }
-
-    private fun parseFallback(s: String): FallbackStrategy = when (s) {
-        "always" -> FallbackStrategy.always
-        else -> FallbackStrategy.default
-    }
-
     private fun groupToJson(repo: ProviderRepository, group: ModelGroup): JSONObject {
         val cfg = repo.config.value
         return JSONObject().apply {

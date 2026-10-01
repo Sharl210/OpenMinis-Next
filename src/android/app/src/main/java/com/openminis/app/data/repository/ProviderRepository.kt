@@ -1907,34 +1907,7 @@ class ProviderRepository(private val context: Context) {
 
     fun resolveVoiceInputChoice(): VoiceInputChoice {
         ensureConfigLoaded()
-        val config = _config.value
-
-        fun systemChoice(memberId: String): VoiceInputChoice = VoiceInputChoice(
-            systemPreferOffline = memberId.endsWith("/${SystemVoiceIds.SYSTEM_ASR_OFFLINE}"),
-            entry = null,
-        )
-
-        fun providerEntry(memberId: String): Pair<ProviderInstance, ModelEntry>? {
-            val entry = config.modelEntries.find { it.id == memberId } ?: return null
-            val inst = config.instances.find { it.id == entry.providerInstanceId } ?: return null
-            if (!inst.isEnabled || !entry.model.hasAudioInput) return null
-            return inst to entry
-        }
-
-        voiceInputOverrideEntryId?.let { override ->
-            if (override.startsWith(SystemVoiceIds.BUILTIN_PROVIDER_ID)) return systemChoice(override)
-            providerEntry(override)?.let { return VoiceInputChoice(null, it) }
-            // Stale override (entry removed) — fall through to the group.
-        }
-        val gid = config.voiceInputGroupId
-        val group = gid?.let { g -> config.modelGroups.find { it.id == g } }
-        if (group != null) {
-            for (memberId in group.memberEntryIds) {
-                if (memberId.startsWith(SystemVoiceIds.BUILTIN_PROVIDER_ID)) return systemChoice(memberId)
-                providerEntry(memberId)?.let { return VoiceInputChoice(null, it) }
-            }
-        }
-        return VoiceInputChoice(systemPreferOffline = null, entry = null)
+        return resolveVoiceInputChoiceIn(_config.value, voiceInputOverrideEntryId)
     }
 
     /** Bound Voice Input group's display name, or null (chip's "Group · Model"). */
@@ -3237,6 +3210,67 @@ internal fun resolveVoiceInputCandidatesIn(
     }
     val groupStrategy = group?.strategy
     return if (groupStrategy == RoutingStrategy.none) out.take(1) else out
+}
+
+/**
+ * [T-voice-input-choice] Pure core of [ProviderRepository.resolveVoiceInputChoice]
+ * — extracted exactly the way its output-side sibling [resolveVoiceOutputChoiceIn]
+ * and [resolveVoiceInputCandidatesIn] were, for the same reason: "which model, or
+ * the device recogniser, actually serves the next utterance" has to be drivable
+ * from a plain JVM test, because the repository itself needs a Context, Room and
+ * EncryptedSharedPreferences. Before this extraction the function had **zero**
+ * test references.
+ *
+ * Resolution order mirrors iOS VoiceProviderResolver and the output side:
+ * explicit override first, then the Voice Input group's members in fallback
+ * order (a System sentinel member selects the device recogniser), then the
+ * System default as the terminal fallback.
+ *
+ * Two things here are NOT symmetric with the output side, and both are
+ * deliberate rather than oversights:
+ *
+ *  - The capability gate is `hasAudioInput`, not `hasAudioOutput`. A model that
+ *    can only *produce* audio must never be picked to *accept* it.
+ *  - There is no `allowSystemFallback` field at all. The output side needs one
+ *    because reading a reply aloud in the wrong voice is a silent, hard-to-notice
+ *    degradation; for input the device recogniser is the terminal answer the
+ *    whole resolution already falls back to, so there is nothing extra to gate.
+ *
+ * `systemPreferOffline` is derived from the sentinel MEMBER id, not from the
+ * group: the online and offline recognisers are two distinct sentinel members,
+ * so which one the walk reached is the whole answer.
+ */
+internal fun resolveVoiceInputChoiceIn(
+    config: ProviderConfig,
+    voiceInputOverrideEntryId: String?,
+): ProviderRepository.VoiceInputChoice {
+    fun systemChoice(memberId: String): ProviderRepository.VoiceInputChoice =
+        ProviderRepository.VoiceInputChoice(
+            systemPreferOffline = memberId.endsWith("/${SystemVoiceIds.SYSTEM_ASR_OFFLINE}"),
+            entry = null,
+        )
+
+    fun providerEntry(memberId: String): Pair<ProviderInstance, ModelEntry>? {
+        val entry = config.modelEntries.find { it.id == memberId } ?: return null
+        val inst = config.instances.find { it.id == entry.providerInstanceId } ?: return null
+        if (!inst.isEnabled || !entry.model.hasAudioInput) return null
+        return inst to entry
+    }
+
+    voiceInputOverrideEntryId?.let { override ->
+        if (override.startsWith(SystemVoiceIds.BUILTIN_PROVIDER_ID)) return systemChoice(override)
+        providerEntry(override)?.let { return ProviderRepository.VoiceInputChoice(null, it) }
+        // Stale override (entry removed) — fall through to the group.
+    }
+    val gid = config.voiceInputGroupId
+    val group = gid?.let { g -> config.modelGroups.find { it.id == g } }
+    if (group != null) {
+        for (memberId in group.memberEntryIds) {
+            if (memberId.startsWith(SystemVoiceIds.BUILTIN_PROVIDER_ID)) return systemChoice(memberId)
+            providerEntry(memberId)?.let { return ProviderRepository.VoiceInputChoice(null, it) }
+        }
+    }
+    return ProviderRepository.VoiceInputChoice(systemPreferOffline = null, entry = null)
 }
 
 /**

@@ -534,19 +534,53 @@ class RuntimeLedgerBoundsTest {
      * Distinguishes "an old JSON still restores" from "an out-of-range budget in
      * a stored file refuses to load", which would strand a user's existing tree
      * on an upgrade. `coerceIn`, never `require`.
+     *
+     * The three bound keys at the top of `config` appear here too, and that is not
+     * padding: they were the only `require`s left in `SessionTreeRuntime.restoreJson`'s
+     * config block while every other key in the same block coerced.
+     * `maxParallelSubagents = 0` threw, `restoreJson` returned false, and
+     * `RuntimeTreeStore.loadLocked` answers a false by restoring `EMPTY_TREE_JSON` —
+     * so a value some other build wrote cost the user the tree it belonged to. An
+     * earlier test in `SessionTreeRuntimeTest` had pinned that refusal as the
+     * intended contract; it is rewritten, and this test now holds all three keys to
+     * the doctrine its own comment already stated.
      */
     @Test
     fun outOfRangeBudgetsInStoredJsonAreCoercedNotRefused() {
         val tree = treeWith()
-        val legacy = """{"config":{"maxEvents":0,"maxEventChars":-5,"maxDeliveryReceipts":3000000,"maxDeliveryReceiptChars":1,"maxControlReceipts":-1,"maxControlReceiptChars":999999999}}"""
+        val legacy = """{"config":{"maxDepth":-1,"maxParallelSubagents":0,"leaseMillis":0,"maxEvents":0,"maxEventChars":-5,"maxDeliveryReceipts":3000000,"maxDeliveryReceiptChars":1,"maxControlReceipts":-1,"maxControlReceiptChars":999999999}}"""
         assertTrue("an old or corrupt config must not make the tree unloadable", tree.restoreJson(legacy))
 
+        assertEquals(0, tree.config.maxDepth)
+        assertEquals(1, tree.config.maxParallelSubagents)
+        assertEquals(1L, tree.config.leaseMillis)
         assertEquals(1, tree.config.maxEvents)
         assertEquals(1, tree.config.maxEventChars)
         assertEquals(RuntimeTreeConfig.MAX_DELIVERY_RECEIPTS_LIMIT, tree.config.maxDeliveryReceipts)
         assertEquals(1, tree.config.maxDeliveryReceiptChars)
         assertEquals(1, tree.config.maxControlReceipts)
         assertEquals(RuntimeTreeConfig.MAX_CONTROL_RECEIPT_CHARS_LIMIT, tree.config.maxControlReceiptChars)
+    }
+
+    /**
+     * The other direction for those three keys: a tree written by a build whose
+     * ceiling was HIGHER clamps down to this build's, rather than refusing.
+     *
+     * `updateConfig` still `require`s these bounds, and that stays — a live caller
+     * passing `maxDepth = -1` is a programming error and should hear about it. This
+     * is about values arriving from disk, where the writer is not the code doing the
+     * reading. The distinction is the one `SessionTreeRuntime` draws in its own
+     * comment: restoring "must never be the thing that decides a bad value becomes
+     * live".
+     */
+    @Test
+    fun boundsAboveTheCeilingInStoredJsonAreClampedNotRefused() {
+        val tree = treeWith()
+        val legacy = """{"config":{"maxDepth":${RuntimeTreeConfig.MAX_DEPTH_LIMIT + 1},"maxParallelSubagents":${RuntimeTreeConfig.MAX_PARALLEL_LIMIT + 1}}}"""
+
+        assertTrue("a higher ceiling in the file must not make the tree unloadable", tree.restoreJson(legacy))
+        assertEquals(RuntimeTreeConfig.MAX_DEPTH_LIMIT, tree.config.maxDepth)
+        assertEquals(RuntimeTreeConfig.MAX_PARALLEL_LIMIT, tree.config.maxParallelSubagents)
     }
 
     /**

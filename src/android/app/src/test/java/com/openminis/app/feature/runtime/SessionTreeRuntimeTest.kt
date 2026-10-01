@@ -160,13 +160,84 @@ class SessionTreeRuntimeTest {
         assertEquals(DelegationMode.TEAM, tree.config.mode)
     }
 
+    /**
+     * [T-android-tree-restore-coerce] A stored value outside the current bounds
+     * must not be what makes the tree unloadable.
+     *
+     * This test used to assert the opposite: `assertFalse(tree.restoreJson(...))`
+     * for `maxParallelSubagents = 0`, under the name "restore rejects invalid
+     * persisted config bounds". Read on its own that looks defensible — an
+     * out-of-range number *is* invalid. What made it wrong is what `false` costs:
+     * `RuntimeTreeStore.loadLocked` answers a false by restoring
+     * `EMPTY_TREE_JSON`, and the next persist writes that empty tree back over the
+     * file. So "reject" meant the user lost every node, transcript and receipt they
+     * had, with only an `AppLogger` line saying so.
+     *
+     * The context that settles it: the very same `if (configJson != null)` block
+     * coerces its eight OTHER budget keys with `coerceIn`, under a comment stating
+     * the rule outright — "Coerced rather than required: a config file written
+     * before these keys existed must keep restoring, and restoring must never be
+     * the thing that decides a bad value becomes live". `maxDepth`,
+     * `maxParallelSubagents` and `leaseMillis` were the only three `require`s left
+     * in that block, and `RuntimeLedgerBoundsTest` independently asserts the
+     * coerced behaviour for the other eight.
+     *
+     * The data assertion is the part that matters. Coercion is only worth anything
+     * if the tree the value belonged to is still intact afterwards.
+     */
     @Test
-    fun `restore rejects invalid persisted config bounds`() {
-        val tree = RuntimeSessionTree()
-        val json = JSONObject(tree.toJson())
-        json.getJSONObject("config").put("maxParallelSubagents", 0)
+    fun `out-of-range persisted bounds are coerced, and the tree keeps its data`() {
+        val tree = RuntimeSessionTree(clock = { 1_000L })
+        tree.createRoot("root", model)
+        tree.appendTranscript("root", "user", "hello")
 
-        assertFalse(tree.restoreJson(json.toString()))
+        val json = JSONObject(tree.toJson())
+        json.getJSONObject("config").apply {
+            put("maxParallelSubagents", 0)
+            put("maxDepth", -1)
+            put("leaseMillis", 0)
+        }
+
+        assertTrue(
+            "an out-of-range number must not make the tree unloadable",
+            tree.restoreJson(json.toString()),
+        )
+        assertEquals("maxParallelSubagents clamps up to its floor", 1, tree.config.maxParallelSubagents)
+        assertEquals("maxDepth clamps up to its floor", 0, tree.config.maxDepth)
+        assertEquals("leaseMillis clamps up to 1ms rather than to 0", 1L, tree.config.leaseMillis)
+        assertEquals(
+            "the tree is still there — the whole point of coercing rather than refusing",
+            setOf("root"),
+            tree.aggregate().rootIds,
+        )
+        assertEquals(
+            "…including its transcripts, which a refused restore would have discarded",
+            listOf("hello"),
+            tree.transcript("root").map { it.content },
+        )
+    }
+
+    @Test
+    fun `persisted bounds above the ceiling are clamped to the ceiling`() {
+        val tree = RuntimeSessionTree(clock = { 1_000L })
+        tree.createRoot("root", model)
+
+        val json = JSONObject(tree.toJson())
+        json.getJSONObject("config").apply {
+            put("maxDepth", RuntimeTreeConfig.MAX_DEPTH_LIMIT + 1)
+            put("maxParallelSubagents", RuntimeTreeConfig.MAX_PARALLEL_LIMIT + 1)
+        }
+
+        assertTrue(tree.restoreJson(json.toString()))
+        assertEquals(
+            "a tree written by a build with a higher ceiling must clamp down, not refuse",
+            RuntimeTreeConfig.MAX_DEPTH_LIMIT,
+            tree.config.maxDepth,
+        )
+        assertEquals(
+            RuntimeTreeConfig.MAX_PARALLEL_LIMIT,
+            tree.config.maxParallelSubagents,
+        )
     }
 }
 
